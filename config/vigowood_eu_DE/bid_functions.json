@@ -1,0 +1,245 @@
+{
+  "_aciklama": "Bid hesaplama parametreleri — Vigowood EU / DE",
+  "_versiyon": "2.0",
+  "_son_guncelleme": "2026-03-14",
+  "_hesap": "vigowood_eu",
+  "_marketplace": "DE",
+  "tanh_formulu": {
+    "_formul": "bid_degisim = -tanh(acos_fark_orani * hassasiyet) * max_degisim",
+    "hassasiyet": 0.6,
+    "max_degisim": 0.15
+  },
+  "segment_parametreleri": {
+    "GORUNMEZ": {
+      "fonksiyon": "sabit_artis",
+      "artis_orani": 0.1
+    },
+    "YETERSIZ_VERI": {
+      "fonksiyon": "dokunma"
+    },
+    "KAN_KAYBEDEN": {
+      "fonksiyon": "tiklama_bazli_dusus",
+      "min_dusus": 0.01,
+      "max_dusus": 0.25,
+      "referans_tiklama": 40
+    },
+    "SUPER_STAR": {
+      "fonksiyon": "tanh_korumali",
+      "max_artis": 0.1
+    },
+    "TUZAK": {
+      "fonksiyon": "dokunma"
+    },
+    "KAZANAN": {
+      "fonksiyon": "tanh"
+    },
+    "OPTIMIZE_ET": {
+      "fonksiyon": "tanh"
+    },
+    "ZARAR": {
+      "fonksiyon": "tanh"
+    }
+  },
+  "genel_limitler": {
+    "tek_seferde_max_artis": 0.3,
+    "tek_seferde_max_dusus": 0.35
+  },
+  "asin_parametreleri": {
+    "B09PDQJLM5": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "MKOS41"
+    },
+    "B09RBDLLPZ": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "IN-904J-FA2V"
+    },
+    "B08CZPT1H8": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "HO-GQQ6-5T4I"
+    },
+    "B08THYG5MD": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "FM-IHQ7-JK7A"
+    },
+    "B08CZ3ZN97": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "DJ-S2VD-VHVT"
+    },
+    "B0BVLZWDBR": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "DYKOS"
+    },
+    "B08WH4BMH5": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14"
+    },
+    "B08WHS3JJ1": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "LS021-00"
+    },
+    "B0CRBBG1TX": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "BT201"
+    },
+    "B0F1TLB8J4": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "DK50C"
+    },
+    "B0F1TL2KN3": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "DK50M"
+    },
+    "B0F6SXZ8FK": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "DK20C"
+    },
+    "B0F6V38XTV": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "DK20M"
+    },
+    "B0F1TMCCJT": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "DK30C"
+    },
+    "B0F1TNQ69S": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "DK30M"
+    },
+    "B0FF2JSKPV": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "LS025"
+    },
+    "B0FF2JFG17": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14"
+    },
+    "B0FF2MB1R1": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "LS024"
+    },
+    "B0DRYD6SZ2": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14"
+    },
+    "B0DRYH2TCT": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14"
+    },
+    "B0FF2HY277": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14"
+    },
+    "B0DRYD4DFH": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14"
+    },
+    "B0DNQ1XD7Q": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14"
+    },
+    "B0FF2LKM4X": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14",
+      "urun_adi": "LS023"
+    },
+    "B0FF2H1DC7": {
+      "hassasiyet": 0.6,
+      "max_degisim": 0.15,
+      "aktif": false,
+      "_kaynak": "auto_populate",
+      "_son_guncelleme": "2026-03-14"
+    }
+  },
+  "ogrenme_gecmisi": {
+    "_aciklama": "Learning Agent bu alani guncelleyecek.",
+    "degisiklikler": []
+  }
+}

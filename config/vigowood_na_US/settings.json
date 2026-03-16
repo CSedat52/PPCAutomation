@@ -1,0 +1,197 @@
+{
+  "_aciklama": "Amazon PPC Otomasyon Sistemi — Birlesik Ayar Dosyasi (Agent 2 + Agent 3)",
+  "_versiyon": "2.0",
+  "_son_guncelleme": "2026-03-14",
+  "genel_ayarlar": {
+    "analiz_periyodu_gun": 3,
+    "lookback_gun": 14,
+    "son_gun_haric": true,
+    "aktif_marketplace": "US",
+    "min_bid": 0.15,
+    "max_bid": 5.0
+  },
+  "esik_degerleri": {
+    "gosterim_esik": 250,
+    "tiklama_esik": 30,
+    "_aciklama_gosterim": "Bu degerden az impression alan hedeflemeler GORUNMEZ segmentine girer",
+    "_aciklama_tiklama": "Satis=0 durumunda bu degerden az tiklama alan hedeflemeler YETERSIZ VERI segmentine girer"
+  },
+  "asin_hedefleri": {
+    "_aciklama": "Her ASIN icin hedef ACoS belirleyin. Agent 2 her calistiginda bu degerleri size gosterir ve onay ister.",
+    "_ornek": "ASIN kodunu key olarak, hedef ACoS ve urun adini value olarak girin",
+    "_varsayilan_acos": 20,
+    "_varsayilan_aciklama": "Tanimlanmamis ASIN'ler icin varsayilan hedef ACoS",
+    "B09PDQJLM5": {
+      "urun_adi": "MKOS41",
+      "hedef_acos": 18
+    },
+    "B09RBDLLPZ": {
+      "urun_adi": "IN-904J-FA2V",
+      "hedef_acos": 18
+    },
+    "B0BVLZWDBR": {
+      "urun_adi": "DYKOS",
+      "hedef_acos": 20
+    },
+    "B08THYG5MD": {
+      "urun_adi": "FM-IHQ7-JK7A",
+      "hedef_acos": 20
+    },
+    "B08CZ3ZN97": {
+      "urun_adi": "DJ-S2VD-VHVT",
+      "hedef_acos": 18
+    },
+    "B08CZPT1H8": {
+      "urun_adi": "HO-GQQ6-5T4I",
+      "hedef_acos": 20
+    },
+    "B0CRBBG1TX": {
+      "urun_adi": "BT201",
+      "hedef_acos": 18
+    },
+    "B0BRSM52M2": {
+      "urun_adi": "MD08C",
+      "hedef_acos": 10
+    },
+    "B08WHS3JJ1": {
+      "urun_adi": "LS021-00",
+      "hedef_acos": 18
+    },
+    "B0F1TL2KN3": {
+      "urun_adi": "DK50M",
+      "hedef_acos": 20
+    },
+    "B0F1TLB8J4": {
+      "urun_adi": "DK50C",
+      "hedef_acos": 20
+    },
+    "B0FF2LKM4X": {
+      "urun_adi": "LS023",
+      "hedef_acos": 18
+    },
+    "B0FF2JSKPV": {
+      "urun_adi": "LS025",
+      "hedef_acos": 18
+    },
+    "B0FF2MB1R1": {
+      "urun_adi": "LS024",
+      "hedef_acos": 18
+    },
+    "B0F6V38XTV": {
+      "urun_adi": "DK20M",
+      "hedef_acos": 20
+    },
+    "B0F6SXZ8FK": {
+      "urun_adi": "DK20C",
+      "hedef_acos": 20
+    },
+    "B0F1TMCCJT": {
+      "urun_adi": "DK30C",
+      "hedef_acos": 20
+    },
+    "B0F1TNQ69S": {
+      "urun_adi": "DK30M",
+      "hedef_acos": 20
+    }
+  },
+  "negatif_keyword_kurali": {
+    "min_tiklama": 30,
+    "max_satis": 0,
+    "_aciklama": "30+ tiklama ve 0 satis yapan hedeflemeler negatif keyword adayi olarak isaretlenir"
+  },
+  "yeni_keyword_kurali": {
+    "min_satis": 3,
+    "max_acos": 20,
+    "lookback_gun": 30,
+    "_aciklama": "Auto/Broad kampanyalarda 3+ satis ve ACoS <%20 olan search term'ler exact keyword adayi olarak isaretlenir. Lookback 30 gun."
+  },
+  "harvesting_ayarlari": {
+    "lookback_gun": 30,
+    "_aciklama": "Harvest sadece izlenen kampanyalarda yapilir. Periyodu 30 gundur."
+  },
+  "segmentasyon_kurallari": {
+    "_aciklama": "Hedeflemeler su siraya gore segmentlere ayrilir. Siralama onemlidir - ilk eslesen segment uygulanir.",
+    "1_gorunmez": {
+      "kosul": "impression < gosterim_esik",
+      "aksiyon": "BID_ARTIR",
+      "aciklama": "Gosterim almayan hedefleme, bid artirarak hayata dondur"
+    },
+    "2_yetersiz_veri": {
+      "kosul": "satis = 0 VE tiklama < tiklama_esik",
+      "aksiyon": "DOKUNMA",
+      "aciklama": "Yeterli veri yok, karar vermek icin bekle"
+    },
+    "3_kan_kaybeden": {
+      "kosul": "tiklama >= tiklama_esik VE satis = 0",
+      "aksiyon": "BID_DUSUR + NEGATIF_ADAY",
+      "aciklama": "Yeterli tiklama var ama satis yok, bid dusur ve negatif keyword adayi olarak isaretle"
+    },
+    "4_super_star": {
+      "kosul": "acos < 10",
+      "aksiyon": "BID_ARTIR_KORUMALI",
+      "max_artis_yuzde": 10,
+      "aciklama": "ACoS cok dusuk, koruyarak buyut (max +%10)"
+    },
+    "5_tuzak": {
+      "kosul": "acos < hedef_acos VE cvr < 1",
+      "aksiyon": "DOKUNMA",
+      "aciklama": "ACoS iyi gorunuyor ama CVR cok dusuk, aldatici metrik"
+    },
+    "6_kazanan": {
+      "kosul": "acos < hedef_acos",
+      "aksiyon": "BID_ARTIR",
+      "aciklama": "ACoS hedefin altinda, bid artirarak olcekle"
+    },
+    "7_optimize_et": {
+      "kosul": "acos >= hedef_acos VE acos < hedef_acos * 3",
+      "aksiyon": "BID_DUSUR",
+      "aciklama": "ACoS hedefin biraz ustunde, bid dusurerek optimize et"
+    },
+    "8_zarar": {
+      "kosul": "acos >= hedef_acos * 3",
+      "aksiyon": "BID_DUSUR_SERT",
+      "aciklama": "ACoS hedefin cok ustunde, sert bid dusur"
+    }
+  },
+  "ozel_kurallar": {
+    "impression_takibi": {
+      "aktif": true,
+      "impression_dusus_esik_yuzde": 50,
+      "aciklama": "Onceki periyotta bid degistikten sonra impression %50+ dustuyse, yeni karar verme, 1 periyot bekle"
+    },
+    "dusuk_cvr_tuzagi": {
+      "aktif": true,
+      "cvr_esik": 1.0,
+      "aciklama": "CVR <%1 ise ACoS iyi olsa bile bid artirma"
+    },
+    "super_star_koruma": {
+      "aktif": true,
+      "acos_esik": 10,
+      "max_artis_yuzde": 10,
+      "aciklama": "ACoS <%10 ise artisi sinirla (max +%10)"
+    }
+  },
+  "agent3_ayarlari": {
+    "_aciklama": "Agent 3 (Executor) ayarlari. Onaylanmis kararlari Amazon API uzerinden uygular.",
+    "dry_run": true,
+    "dry_run_aciklama": "true = sadece rapor uretir, uygulamaz. false = gercekten uygular.",
+    "max_bid_limiti": 5.0,
+    "min_bid_limiti": 0.15,
+    "gunluk_max_islem": 1000,
+    "gunluk_max_islem_aciklama": "Tek calistirmada yapilabilecek max islem sayisi (bid + negatif + harvesting toplami)",
+    "yeni_kampanya_butcesi": 30.0,
+    "yeni_kampanya_butcesi_aciklama": "Harvesting sonucu olusturulan yeni Exact kampanyalarin gunluk butcesi ($)",
+    "negatif_match_type": "NEGATIVE_EXACT",
+    "negatif_match_type_aciklama": "Negatif keyword eklerken kullanilacak match type. NEGATIVE_EXACT = sadece o terimi engeller",
+    "portfolio_asin_target_kampanyalari": {
+      "_aciklama": "Her portfolio icin mevcut ASIN Target kampanya ID'si. Harvesting'den gelen ASIN'ler bu kampanyalara eklenir.",
+      "MKOS": "502289493343759",
+      "DK": "334894635400619",
+      "xKOS": "313205730929657",
+      "LS051": "533377368539168",
+      "LS021": "302158758499442",
+      "BT201": "562768099161880",
+      "DYKOS": "364678892812180"
+    }
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "_aciklama": "Bid hesaplama parametreleri — qmmp NA / CA",
+  "_versiyon": "2.0",
+  "_son_guncelleme": "2026-03-14",
+  "_hesap": "qmmp_na",
+  "_marketplace": "CA",
+  "tanh_formulu": {
+    "_formul": "bid_degisim = -tanh(acos_fark_orani * hassasiyet) * max_degisim",
+    "hassasiyet": 0.6,
+    "max_degisim": 0.15
+  },
+  "segment_parametreleri": {
+    "GORUNMEZ": {
+      "fonksiyon": "sabit_artis",
+      "artis_orani": 0.1
+    },
+    "YETERSIZ_VERI": {
+      "fonksiyon": "dokunma"
+    },
+    "KAN_KAYBEDEN": {
+      "fonksiyon": "tiklama_bazli_dusus",
+      "min_dusus": 0.01,
+      "max_dusus": 0.25,
+      "referans_tiklama": 40
+    },
+    "SUPER_STAR": {
+      "fonksiyon": "tanh_korumali",
+      "max_artis": 0.1
+    },
+    "TUZAK": {
+      "fonksiyon": "dokunma"
+    },
+    "KAZANAN": {
+      "fonksiyon": "tanh"
+    },
+    "OPTIMIZE_ET": {
+      "fonksiyon": "tanh"
+    },
+    "ZARAR": {
+      "fonksiyon": "tanh"
+    }
+  },
+  "genel_limitler": {
+    "tek_seferde_max_artis": 0.3,
+    "tek_seferde_max_dusus": 0.35
+  },
+  "asin_parametreleri": {},
+  "ogrenme_gecmisi": {
+    "_aciklama": "Learning Agent bu alani guncelleyecek.",
+    "degisiklikler": []
+  }
+}

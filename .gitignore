@@ -1,0 +1,63 @@
+# ============================================
+# Amazon PPC Otomasyon Sistemi — .gitignore
+# ============================================
+
+# Credentials & secrets
+.env
+.mcp.json
+accounts.json
+config/accounts.json
+credentials.json
+client_secrets.json
+token.json
+*.pem
+*.key
+
+# Error logs (structured JSON)
+agent1_errors.json
+agent2_errors.json
+agent3_errors.json
+agent4_errors.json
+
+# Maestro state ve loglar
+maestro/state/
+maestro/logs/
+maestro_log*.json
+maestro_state.json
+
+# ASIN-specific bid parameters
+bid_functions_v3.json
+
+# Python cache
+__pycache__/
+.venv/
+venv/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+logs/
+
+# Veri dosyalari (runtime data)
+data/
+
+# Archive
+archive/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude Code local settings
+.claude/
+
+# Yardimci scriptler
+asin_report.json
+profile_results.json
+accounts_result.json
