@@ -186,12 +186,76 @@ def _run_optimizer_impl(today, data_dir, config_dir, hesap_key, marketplace):
     # ---- 6. VERITABANI KAYDET ----
     db.save()
 
+    # ---- 7. SUPABASE SYNC ----
+    _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor, oneriler)
+
     logger.info("=" * 60)
     logger.info("AGENT 4 TAMAMLANDI — %s — Rapor: %s", account_label, rapor.get("rapor_dosyasi", ""))
     logger.info("Bekleyen oneri sayisi: %d", len(oneriler))
     logger.info("=" * 60)
 
     return rapor
+
+
+def _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor, oneriler):
+    """Agent 4 verilerini Supabase'e senkronize et."""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(BASE_DIR))
+        from supabase.db_client import SupabaseClient
+        sdb = SupabaseClient()
+    except Exception as e:
+        logger.warning("Supabase sync atlandi: %s", e)
+        return
+
+    try:
+        # Karar gecmisi
+        kararlar = db._data.get("karar_gecmisi", {}).get("kararlar", [])
+        if kararlar:
+            sdb.upsert_decision_history(hesap_key, marketplace, kararlar)
+
+        # ASIN profilleri
+        profiller = db._data.get("asin_profilleri", {}).get("profiller", {})
+        if profiller:
+            sdb.upsert_asin_profiles(hesap_key, marketplace, profiller)
+
+        # Segment istatistikleri
+        segmentler = db._data.get("segment_istatistikleri", {}).get("segmentler", {})
+        if segmentler:
+            sdb.upsert_segment_stats(hesap_key, marketplace, segmentler)
+
+        # Anomaliler
+        for anomali in db._data.get("anomali_gecmisi", {}).get("anomaliler", []):
+            sdb.insert_anomaly(hesap_key, marketplace, anomali)
+
+        # Kaliplar
+        for kalip in db._data.get("kalip_kutuphanesi", {}).get("kaliplar", []):
+            sdb.insert_pattern(hesap_key, marketplace, kalip)
+
+        # Oneriler
+        for oneri in oneriler:
+            sdb.upsert_proposal(hesap_key, marketplace, oneri)
+
+        # Durum raporu
+        rapor_data = rapor.get("rapor_data", rapor)
+        sdb.insert_status_report(hesap_key, marketplace, rapor_data)
+
+        logger.info("Supabase: Agent 4 verileri yazildi (%d karar, %d oneri)",
+                     len(kararlar), len(oneriler))
+
+    except Exception as e:
+        logger.error("Supabase sync hatasi (optimizer devam eder): %s", e)
+        save_error_log("InternalError", f"Supabase sync: {e}", data_dir,
+                       traceback.format_exc(), adim="supabase_sync",
+                       extra={"hesap": f"{hesap_key}/{marketplace}"})
+        try:
+            sdb.insert_error_log(hesap_key, marketplace, "agent4", {
+                "hata_tipi": "InternalError",
+                "hata_mesaji": f"Supabase sync hatasi: {e}"[:500],
+                "adim": "supabase_sync",
+            })
+        except Exception:
+            pass
 
 
 # ============================================================================

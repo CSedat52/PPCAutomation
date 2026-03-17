@@ -186,7 +186,12 @@ class AmazonAdsClient:
         return await self._request_with_retry("POST", endpoint, payload, content_type, accept,
                                               include_account_id=include_account_id)
 
-    async def download_report(self, payload):
+    # ------------------------------------------------------------------
+    # FIRE-ALL-THEN-POLL: Rapor islemini 3 fazaya ayir
+    # ------------------------------------------------------------------
+
+    async def create_report_request(self, payload):
+        """Faz 1: Rapor olusturma istegi gonder, reportId dondur."""
         import re
         try:
             data = await self.post("/reporting/reports", payload,
@@ -197,7 +202,7 @@ class AmazonAdsClient:
             if e.response and e.response.status_code == 425:
                 match = re.search(r'duplicate of\s*:\s*([0-9a-f-]{36})', error_body)
                 if match:
-                    data = {"reportId": match.group(1)}
+                    return {"reportId": match.group(1)}
                 else:
                     return {"error": f"HTTP 425", "details": error_body}
             else:
@@ -206,7 +211,10 @@ class AmazonAdsClient:
         report_id = data.get("reportId")
         if not report_id:
             return {"error": "Report ID yok"}
+        return {"reportId": report_id}
 
+    async def poll_and_download_report(self, report_id):
+        """Faz 2+3: Raporu poll et, hazir olunca indir."""
         elapsed = 0
         while elapsed < REPORT_MAX_WAIT:
             try:
@@ -239,6 +247,13 @@ class AmazonAdsClient:
             elapsed += REPORT_POLL_INTERVAL
 
         return {"error": f"Zaman asimi ({REPORT_MAX_WAIT}s)"}
+
+    async def download_report(self, payload):
+        """Eski uyumluluk: create + poll + download tek cagri (retry icin kullanilir)."""
+        result = await self.create_report_request(payload)
+        if is_error(result):
+            return result
+        return await self.poll_and_download_report(result["reportId"])
 
 
 # ============================================================================
@@ -299,6 +314,30 @@ SD_TARGETING_COLS = [
     "addToCartViews", "viewClickThroughRate", "startDate", "endDate",
 ]
 
+# Campaign raporlari — Dashboard KPI icin (timeUnit: DAILY → her satir 1 gun)
+SP_CAMPAIGN_COLS = [
+    "campaignId", "campaignName", "campaignStatus", "campaignBudgetAmount",
+    "impressions", "clicks", "cost", "costPerClick", "clickThroughRate",
+    "purchases14d", "sales14d", "unitsSoldClicks14d",
+    "acosClicks14d", "roasClicks14d",
+    "date",
+]
+SB_CAMPAIGN_COLS = [
+    "campaignId", "campaignName", "campaignStatus", "campaignBudgetAmount",
+    "impressions", "clicks", "cost",
+    "purchases", "purchasesClicks", "sales",
+    "unitsSold",
+    "date",
+]
+SD_CAMPAIGN_COLS = [
+    "campaignId", "campaignName", "campaignStatus", "campaignBudgetAmount",
+    "impressions", "clicks", "cost",
+    "purchases", "purchasesClicks", "sales",
+    "unitsSold",
+    "addToCartViews",
+    "date",
+]
+
 
 # ============================================================================
 # YARDIMCI FONKSIYONLAR
@@ -357,7 +396,8 @@ def save_error_log(data_dir, hata_tipi, hata_mesaji, adim=None, extra=None):
         json.dump(kayitlar, f, indent=2, ensure_ascii=False)
 
 
-def build_report_payload(ad_product, report_type, group_by, columns, days_back):
+def build_report_payload(ad_product, report_type, group_by, columns, days_back,
+                         time_unit="SUMMARY"):
     end = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
     start = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     return {
@@ -366,7 +406,7 @@ def build_report_payload(ad_product, report_type, group_by, columns, days_back):
         "configuration": {
             "adProduct": ad_product, "groupBy": group_by,
             "columns": columns, "reportTypeId": report_type,
-            "timeUnit": "SUMMARY", "format": "GZIP_JSON",
+            "timeUnit": time_unit, "format": "GZIP_JSON",
         },
     }
 
@@ -441,14 +481,15 @@ async def collect_marketplace(client, data_dir, label):
                            adim="collect_list", extra={"entity": name})
             return []
 
-    async def collect_report(name, ad_product_enum, report_type, group_by, columns, days):
+    async def collect_report(name, ad_product_enum, report_type, group_by, columns, days,
+                             time_unit="SUMMARY"):
         fname = f"{today}_{name}_{days}d.json"
         key = f"{name}_{days}d"
         if file_exists_today(fname, data_dir):
             R["atlanan"] += 1
             return key, "CACHE"
         try:
-            payload = build_report_payload(ad_product_enum, report_type, group_by, columns, days)
+            payload = build_report_payload(ad_product_enum, report_type, group_by, columns, days, time_unit)
             rows = await client.download_report(payload)
             if is_error(rows):
                 R["hatalar"].append(f"{key}: {rows.get('error', '?')}")
@@ -468,79 +509,168 @@ async def collect_marketplace(client, data_dir, label):
                            adim="collect_report", extra={"rapor": key})
             return key, "HATA"
 
-    logger.info("[%s] Entity toplama basliyor...", label)
+    logger.info("[%s] Entity toplama basliyor (paralel, max 4 esanli)...", label)
 
-    # Portfolios
-    await collect_list("portfolios", "/portfolios/list", ["ENABLED"], "portfolios",
-                       content_type=PORTFOLIO_CT, accept=PORTFOLIO_CT,
-                       custom_body={"stateFilter": {"include": ["ENABLED"]}})
+    # ---- OPTIMIZASYON 1: Entity'leri paralel topla (Semaphore ile max 4 esanli) ----
+    entity_sem = asyncio.Semaphore(4)
 
-    # SP Entities
-    await collect_list("sp_campaigns", "/sp/campaigns/list", ["ENABLED", "PAUSED"], "campaigns",
-                       content_type=SP_CT["campaigns"], accept=SP_CT["campaigns"])
-    await collect_list("sp_ad_groups", "/sp/adGroups/list", ["ENABLED", "PAUSED"], "adGroups",
-                       content_type=SP_CT["adGroups"], accept=SP_CT["adGroups"])
-    await collect_list("sp_product_ads", "/sp/productAds/list", ["ENABLED", "PAUSED"], "productAds",
-                       content_type=SP_CT["productAds"], accept=SP_CT["productAds"])
-    await collect_list("sp_keywords", "/sp/keywords/list", ["ENABLED", "PAUSED"], "keywords",
-                       content_type=SP_CT["keywords"], accept=SP_CT["keywords"])
-    await collect_list("sp_targets", "/sp/targets/list", ["ENABLED", "PAUSED"], "targetingClauses",
-                       content_type=SP_CT["targets"], accept=SP_CT["targets"])
-    await collect_list("sp_negative_keywords", "/sp/negativeKeywords/list", ["ENABLED"], "negativeKeywords",
-                       content_type=SP_CT["negativeKeywords"], accept=SP_CT["negativeKeywords"])
-    await collect_list("sp_campaign_negative_keywords", "/sp/campaignNegativeKeywords/list",
-                       ["ENABLED"], "campaignNegativeKeywords",
-                       content_type=SP_CT["campaignNegativeKeywords"], accept=SP_CT["campaignNegativeKeywords"])
-    await collect_list("sp_negative_targets", "/sp/negativeTargets/list", ["ENABLED"], "negativeTargetingClauses",
-                       content_type=SP_CT["negativeTargets"], accept=SP_CT["negativeTargets"])
+    async def collect_list_throttled(*args, **kwargs):
+        async with entity_sem:
+            return await collect_list(*args, **kwargs)
 
-    # SB Entities
-    await collect_list("sb_campaigns", "/sb/v4/campaigns/list", ["ENABLED", "PAUSED"], "campaigns",
-                       content_type=SB_CT["campaigns"], accept=SB_CT["campaigns"], max_count=100)
-    await collect_list("sb_ad_groups", "/sb/v4/adGroups/list", ["ENABLED", "PAUSED"], "adGroups",
-                       content_type=SB_CT["campaigns"], accept=SB_CT["campaigns"], max_count=100)
-    await collect_list("sb_keywords", "/sb/keywords", ["enabled", "paused"], "keywords",
-                       method="GET", accept=SB_CT["keywords"])
-    await collect_list("sb_targets", "/sb/targets/list", ["enabled", "paused"], "targets",
-                       content_type="application/json", accept=SB_CT["targets"],
-                       custom_body={"filters": [{"filterType": "TARGETING_STATE",
-                                                 "values": ["enabled", "paused"]}], "maxResults": 100})
-    await collect_list("sb_negative_keywords", "/sb/negativeKeywords", ["enabled"], "negativeKeywords",
-                       method="GET", accept="application/vnd.sbnegativekeyword.v3.2+json")
+    entity_coros = [
+        # Portfolios
+        collect_list_throttled("portfolios", "/portfolios/list", ["ENABLED"], "portfolios",
+                               content_type=PORTFOLIO_CT, accept=PORTFOLIO_CT,
+                               custom_body={"stateFilter": {"include": ["ENABLED"]}}),
+        # SP Entities (8)
+        collect_list_throttled("sp_campaigns", "/sp/campaigns/list", ["ENABLED", "PAUSED"], "campaigns",
+                               content_type=SP_CT["campaigns"], accept=SP_CT["campaigns"]),
+        collect_list_throttled("sp_ad_groups", "/sp/adGroups/list", ["ENABLED", "PAUSED"], "adGroups",
+                               content_type=SP_CT["adGroups"], accept=SP_CT["adGroups"]),
+        collect_list_throttled("sp_product_ads", "/sp/productAds/list", ["ENABLED", "PAUSED"], "productAds",
+                               content_type=SP_CT["productAds"], accept=SP_CT["productAds"]),
+        collect_list_throttled("sp_keywords", "/sp/keywords/list", ["ENABLED", "PAUSED"], "keywords",
+                               content_type=SP_CT["keywords"], accept=SP_CT["keywords"]),
+        collect_list_throttled("sp_targets", "/sp/targets/list", ["ENABLED", "PAUSED"], "targetingClauses",
+                               content_type=SP_CT["targets"], accept=SP_CT["targets"]),
+        collect_list_throttled("sp_negative_keywords", "/sp/negativeKeywords/list", ["ENABLED"], "negativeKeywords",
+                               content_type=SP_CT["negativeKeywords"], accept=SP_CT["negativeKeywords"]),
+        collect_list_throttled("sp_campaign_negative_keywords", "/sp/campaignNegativeKeywords/list",
+                               ["ENABLED"], "campaignNegativeKeywords",
+                               content_type=SP_CT["campaignNegativeKeywords"], accept=SP_CT["campaignNegativeKeywords"]),
+        collect_list_throttled("sp_negative_targets", "/sp/negativeTargets/list", ["ENABLED"], "negativeTargetingClauses",
+                               content_type=SP_CT["negativeTargets"], accept=SP_CT["negativeTargets"]),
+        # SB Entities (5)
+        collect_list_throttled("sb_campaigns", "/sb/v4/campaigns/list", ["ENABLED", "PAUSED"], "campaigns",
+                               content_type=SB_CT["campaigns"], accept=SB_CT["campaigns"], max_count=100),
+        collect_list_throttled("sb_ad_groups", "/sb/v4/adGroups/list", ["ENABLED", "PAUSED"], "adGroups",
+                               content_type=SB_CT["campaigns"], accept=SB_CT["campaigns"], max_count=100),
+        collect_list_throttled("sb_keywords", "/sb/keywords", ["enabled", "paused"], "keywords",
+                               method="GET", accept=SB_CT["keywords"]),
+        collect_list_throttled("sb_targets", "/sb/targets/list", ["enabled", "paused"], "targets",
+                               content_type="application/json", accept=SB_CT["targets"],
+                               custom_body={"filters": [{"filterType": "TARGETING_STATE",
+                                                         "values": ["enabled", "paused"]}], "maxResults": 100}),
+        collect_list_throttled("sb_negative_keywords", "/sb/negativeKeywords", ["enabled"], "negativeKeywords",
+                               method="GET", accept="application/vnd.sbnegativekeyword.v3.2+json"),
+        # SD Entities (3)
+        collect_list_throttled("sd_campaigns", "/sd/campaigns", ["enabled", "paused"], "campaigns", method="GET"),
+        collect_list_throttled("sd_ad_groups", "/sd/adGroups", ["enabled", "paused"], "adGroups", method="GET"),
+        collect_list_throttled("sd_targets", "/sd/targets", ["enabled", "paused"], "targets", method="GET"),
+    ]
 
-    # SD Entities
-    await collect_list("sd_campaigns", "/sd/campaigns", ["enabled", "paused"], "campaigns", method="GET")
-    await collect_list("sd_ad_groups", "/sd/adGroups", ["enabled", "paused"], "adGroups", method="GET")
-    await collect_list("sd_targets", "/sd/targets", ["enabled", "paused"], "targets", method="GET")
+    await asyncio.gather(*entity_coros)
 
-    logger.info("[%s] Entity tamamlandi. Raporlar basliyor...", label)
+    logger.info("[%s] Entity tamamlandi. Raporlar basliyor (fire-all-then-poll)...", label)
 
-    # Raporlar (sirayla, 2'li batch)
+    # ---- OPTIMIZASYON 2: FIRE-ALL-THEN-POLL ----
+    # Faz 1 (FIRE): Tum rapor isteklerini 2'li batch'ler halinde gonder
+    #   → Amazon hepsini AYNI ANDA uretmeye baslar
+    # Faz 2 (POLL): Tum raporlari birlikte poll et
+    #   → Toplam sure = max(9 rapor suresi), sum degil!
+
     report_tasks = [
-        ("sp_targeting_report", "SPONSORED_PRODUCTS", "spTargeting", ["targeting"], SP_TARGETING_COLS, 14),
-        ("sp_search_term_report", "SPONSORED_PRODUCTS", "spSearchTerm", ["searchTerm"], SP_SEARCH_TERM_COLS, 30),
-        ("sb_targeting_report", "SPONSORED_BRANDS", "sbTargeting", ["targeting"], SB_TARGETING_COLS, 14),
-        ("sb_search_term_report", "SPONSORED_BRANDS", "sbSearchTerm", ["searchTerm"], SB_SEARCH_TERM_COLS, 30),
-        ("sd_targeting_report", "SPONSORED_DISPLAY", "sdTargeting", ["targeting"], SD_TARGETING_COLS, 14),
-        ("sd_targeting_report", "SPONSORED_DISPLAY", "sdTargeting", ["targeting"], SD_TARGETING_COLS, 30),
+        # SP: targeting_14d + search_term_30d
+        ("sp_targeting_report", "SPONSORED_PRODUCTS", "spTargeting", ["targeting"], SP_TARGETING_COLS, 14, "SUMMARY"),
+        ("sp_search_term_report", "SPONSORED_PRODUCTS", "spSearchTerm", ["searchTerm"], SP_SEARCH_TERM_COLS, 30, "SUMMARY"),
+        # SB: targeting_14d + search_term_30d
+        ("sb_targeting_report", "SPONSORED_BRANDS", "sbTargeting", ["targeting"], SB_TARGETING_COLS, 14, "SUMMARY"),
+        ("sb_search_term_report", "SPONSORED_BRANDS", "sbSearchTerm", ["searchTerm"], SB_SEARCH_TERM_COLS, 30, "SUMMARY"),
+        # SD: targeting_14d + targeting_30d
+        ("sd_targeting_report", "SPONSORED_DISPLAY", "sdTargeting", ["targeting"], SD_TARGETING_COLS, 14, "SUMMARY"),
+        ("sd_targeting_report", "SPONSORED_DISPLAY", "sdTargeting", ["targeting"], SD_TARGETING_COLS, 30, "SUMMARY"),
+        # Campaign raporlari — Dashboard KPI (timeUnit: DAILY)
+        ("sp_campaign_report", "SPONSORED_PRODUCTS", "spCampaigns", ["campaign"], SP_CAMPAIGN_COLS, 14, "DAILY"),
+        ("sb_campaign_report", "SPONSORED_BRANDS", "sbCampaigns", ["campaign"], SB_CAMPAIGN_COLS, 14, "DAILY"),
+        ("sd_campaign_report", "SPONSORED_DISPLAY", "sdCampaigns", ["campaign"], SD_CAMPAIGN_COLS, 14, "DAILY"),
     ]
 
     failed_tasks = []
     empty_tasks = []
 
+    # --- FAZ 1: FIRE — rapor olusturma isteklerini gonder (2'li batch, rate limit koruma) ---
+    pending = {}   # key -> (report_id, task_tuple)
+    skipped = []   # cache'den gelen raporlar
+
     for i in range(0, len(report_tasks), 2):
         batch = report_tasks[i:i+2]
-        coros = [collect_report(name, ap, rt, gb, cols, days) for name, ap, rt, gb, cols, days in batch]
-        batch_results = await asyncio.gather(*coros)
+        fire_coros = []
+        fire_keys = []
 
-        for task, (key, status) in zip(batch, batch_results):
-            if status == "HATA":
-                failed_tasks.append(task)
-            elif status == "BOS":
-                empty_tasks.append(task)
+        for name, ap, rt, gb, cols, days, tunit in batch:
+            key = f"{name}_{days}d"
+            fname = f"{today}_{key}.json"
 
-        if i + 2 < len(report_tasks):
+            if file_exists_today(fname, data_dir):
+                R["atlanan"] += 1
+                skipped.append(key)
+                continue
+
+            payload = build_report_payload(ap, rt, gb, cols, days, tunit)
+            fire_coros.append(client.create_report_request(payload))
+            fire_keys.append((key, (name, ap, rt, gb, cols, days, tunit)))
+
+        if fire_coros:
+            results = await asyncio.gather(*fire_coros)
+            for (key, task_tuple), result in zip(fire_keys, results):
+                if is_error(result):
+                    logger.warning("[%s] Rapor olusturulamadi: %s — %s", label, key, result.get("error"))
+                    R["hatalar"].append(f"{key}: {result.get('error', '?')}")
+                    R["basarisiz"] += 1
+                    failed_tasks.append(task_tuple)
+                    save_error_log(data_dir, "ReportCreateFailed", result.get("error", "?"),
+                                   adim="fire_report", extra={"rapor": key})
+                else:
+                    report_id = result["reportId"]
+                    logger.info("[%s] Rapor istendi: %s → %s", label, key, report_id)
+                    pending[key] = (report_id, task_tuple)
+
+        # 2'li batch arasi bekleme (rate limit koruma — ayni BATCH_SIZE=2 kurali)
+        if i + 2 < len(report_tasks) and fire_coros:
             await asyncio.sleep(5)
+
+    if skipped:
+        logger.info("[%s] %d rapor cache'den (atlanildi): %s", label, len(skipped), ", ".join(skipped))
+
+    # --- FAZ 2: POLL — tum raporlari AYNI ANDA poll et ---
+    if pending:
+        logger.info("[%s] %d rapor poll ediliyor (paralel)...", label, len(pending))
+
+        async def poll_single(key, report_id, task_tuple):
+            """Tek bir raporu poll et, indir, kaydet."""
+            try:
+                rows = await client.poll_and_download_report(report_id)
+                if is_error(rows):
+                    R["hatalar"].append(f"{key}: {rows.get('error', '?')}")
+                    R["basarisiz"] += 1
+                    save_error_log(data_dir, "ReportPollFailed", rows.get("error", "?"),
+                                   adim="poll_report", extra={"rapor": key, "report_id": report_id})
+                    return key, "HATA", task_tuple
+                fname = f"{today}_{key}.json"
+                save_json(fname, rows, data_dir)
+                R["basarili"] += 1
+                if isinstance(rows, list) and len(rows) == 0:
+                    return key, "BOS", task_tuple
+                return key, "DOLU", task_tuple
+            except Exception as e:
+                R["hatalar"].append(f"{key}: {str(e)[:200]}")
+                R["basarisiz"] += 1
+                save_error_log(data_dir, type(e).__name__, str(e)[:300],
+                               adim="poll_report", extra={"rapor": key, "report_id": report_id})
+                return key, "HATA", task_tuple
+
+        poll_coros = [
+            poll_single(key, report_id, task_tuple)
+            for key, (report_id, task_tuple) in pending.items()
+        ]
+        poll_results = await asyncio.gather(*poll_coros)
+
+        for key, status, task_tuple in poll_results:
+            if status == "HATA":
+                failed_tasks.append(task_tuple)
+            elif status == "BOS":
+                empty_tasks.append(task_tuple)
 
     # ----- RETRY: Bos raporlar 1 kez, hatali raporlar 3 kez -----
     RETRY_DELAYS = [60, 120, 240]
@@ -548,14 +678,14 @@ async def collect_marketplace(client, data_dir, label):
     if empty_tasks:
         logger.info("[%s] BOS RETRY: %d rapor 1 kez tekrar deneniyor...", label, len(empty_tasks))
         await asyncio.sleep(60)
-        for name, ap, rt, gb, cols, days in empty_tasks:
+        for name, ap, rt, gb, cols, days, tunit in empty_tasks:
             key = f"{name}_{days}d"
             fname = f"{today}_{key}.json"
             old_file = data_dir / fname
             if old_file.exists():
                 old_file.unlink()
             R["basarili"] -= 1  # onceki bos kaydi duzelt
-            _, status = await collect_report(name, ap, rt, gb, cols, days)
+            _, status = await collect_report(name, ap, rt, gb, cols, days, tunit)
             if status == "DOLU":
                 logger.info("[%s] BOS RETRY BASARILI: %s", label, key)
             else:
@@ -563,7 +693,7 @@ async def collect_marketplace(client, data_dir, label):
 
     if failed_tasks:
         logger.info("[%s] HATA RETRY: %d rapor tekrar deneniyor (max 3)...", label, len(failed_tasks))
-        for name, ap, rt, gb, cols, days in failed_tasks:
+        for name, ap, rt, gb, cols, days, tunit in failed_tasks:
             key = f"{name}_{days}d"
             resolved = False
             for attempt in range(len(RETRY_DELAYS)):
@@ -579,7 +709,7 @@ async def collect_marketplace(client, data_dir, label):
                 R["basarisiz"] -= 1
                 R["hatalar"] = [h for h in R["hatalar"] if key not in h]
 
-                _, status = await collect_report(name, ap, rt, gb, cols, days)
+                _, status = await collect_report(name, ap, rt, gb, cols, days, tunit)
                 if status in ("DOLU", "BOS"):
                     logger.info("[%s] RETRY %d/3 BASARILI: %s", label, attempt+1, key)
                     resolved = True

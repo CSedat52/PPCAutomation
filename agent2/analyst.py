@@ -1518,7 +1518,7 @@ def run_analysis(hesap_key, marketplace):
     logger.info("=== AGENT 2 v5 ANALIZ BASLADI — %s/%s — %s ===", hesap_key, marketplace, today)
 
     try:
-        return _run_analysis_impl(today)
+        return _run_analysis_impl(today, hesap_key, marketplace)
     except Exception as e:
         tb = traceback.format_exc()
         hata_tipi = type(e).__name__
@@ -1529,7 +1529,7 @@ def run_analysis(hesap_key, marketplace):
         return {"tarih": today, "durum": "BASARISIZ", "hata": hata_mesaji}
 
 
-def _run_analysis_impl(today):
+def _run_analysis_impl(today, hesap_key="", marketplace=""):
 
     # 0. On kontrol
     gecti, mesaj, on_uyarilar = preflight_check(today)
@@ -1636,8 +1636,122 @@ def _run_analysis_impl(today):
         },
     }
 
+    # ---- Supabase Sync ----
+    _sync_agent2_to_supabase(hesap_key, marketplace, today,
+                              bid_results, neg_candidates, harvest_candidates)
+
     logger.info("=== AGENT 2 v5 ANALIZ TAMAMLANDI ===")
     return summary
+
+
+def _sync_agent2_to_supabase(hesap_key, marketplace, today,
+                              bid_results, neg_candidates, harvest_candidates):
+    """Agent 2 analiz sonuclarini Supabase'e yaz."""
+    try:
+        import sys as _sys
+        _project_root = str(BASE_DIR)
+        if _project_root not in _sys.path:
+            _sys.path.insert(0, _project_root)
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+    except Exception as e:
+        logger.error("Supabase sync import hatasi: %s", e)
+        save_error_log("InternalError", f"Supabase sync import: {e}",
+                       traceback.format_exc(), adim="supabase_sync_init",
+                       session_id=MAESTRO_SESSION_ID)
+        return
+
+    try:
+        # Bid tavsiyeleri
+        bid_data = []
+        for r in bid_results:
+            bid_data.append({
+                "reklam_tipi": r.get("reklam_tipi", "SP"),
+                "campaign_id": r.get("campaign_id"),
+                "kampanya": r.get("kampanya_adi"),
+                "ad_group_id": r.get("ad_group_id"),
+                "keyword_id": r.get("keyword_id"),
+                "target_id": r.get("target_id"),
+                "hedefleme": r.get("hedefleme"),
+                "match_type": r.get("match_type"),
+                "segment": r.get("segment"),
+                "bid": r.get("mevcut_bid"),
+                "tavsiye_bid": r.get("yeni_bid"),
+                "degisim_yuzde": r.get("degisim_yuzde"),
+                "impressions": r.get("impressions"),
+                "clicks": r.get("clicks"),
+                "spend": r.get("spend"),
+                "sales": r.get("sales"),
+                "orders": r.get("orders"),
+                "acos": r.get("acos"),
+                "cvr": r.get("cvr"),
+                "cpc": r.get("cpc"),
+                "karar_durumu": "PENDING",
+            })
+        if bid_data:
+            db.insert_bid_recommendations(hesap_key, marketplace, today, bid_data)
+            logger.info("Supabase: %d bid tavsiyesi yazildi", len(bid_data))
+
+        # Negatif adaylar
+        neg_data = []
+        for n in neg_candidates:
+            neg_data.append({
+                "reklam_tipi": n.get("reklam_tipi", "SP"),
+                "campaign_id": n.get("campaign_id"),
+                "kampanya": n.get("kampanya_adi") or n.get("kampanya"),
+                "ad_group_id": n.get("ad_group_id"),
+                "hedefleme": n.get("search_term") or n.get("hedefleme"),
+                "tip": n.get("tip", "KEYWORD"),
+                "sebep": n.get("sebep"),
+                "impressions": n.get("impressions"),
+                "clicks": n.get("clicks"),
+                "spend": n.get("spend") or n.get("cost"),
+                "sales": n.get("sales"),
+                "acos": n.get("acos"),
+                "karar_durumu": "PENDING",
+            })
+        if neg_data:
+            db.insert_negative_candidates(hesap_key, marketplace, today, neg_data)
+            logger.info("Supabase: %d negatif aday yazildi", len(neg_data))
+
+        # Harvesting adaylar
+        harv_data = []
+        for h in harvest_candidates:
+            harv_data.append({
+                "reklam_tipi": h.get("reklam_tipi", "SP"),
+                "campaign_id": h.get("campaign_id"),
+                "kaynak_kampanya": h.get("kampanya_adi") or h.get("kaynak_kampanya"),
+                "ad_group_id": h.get("ad_group_id"),
+                "search_term": h.get("search_term"),
+                "hedefleme": h.get("hedefleme"),
+                "tip": h.get("tip", "KEYWORD"),
+                "match_type": h.get("match_type"),
+                "suggested_bid": h.get("suggested_bid"),
+                "impressions": h.get("impressions"),
+                "clicks": h.get("clicks"),
+                "spend": h.get("spend") or h.get("cost"),
+                "sales": h.get("sales"),
+                "orders": h.get("orders"),
+                "acos": h.get("acos"),
+                "karar_durumu": "PENDING",
+            })
+        if harv_data:
+            db.insert_harvesting_candidates(hesap_key, marketplace, today, harv_data)
+            logger.info("Supabase: %d harvesting aday yazildi", len(harv_data))
+
+    except Exception as e:
+        logger.error("Supabase sync hatasi (analiz devam eder): %s", e)
+        save_error_log("InternalError", f"Supabase sync: {e}",
+                       traceback.format_exc(), adim="supabase_sync",
+                       session_id=MAESTRO_SESSION_ID)
+        try:
+            db.insert_error_log(hesap_key, marketplace, "agent2", {
+                "hata_tipi": "InternalError",
+                "hata_mesaji": f"Supabase sync hatasi: {e}"[:500],
+                "adim": "supabase_sync",
+            })
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

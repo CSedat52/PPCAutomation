@@ -2289,7 +2289,7 @@ def run_executor(hesap_key, marketplace, today=None, force_execute=False):
     logger.info("=== AGENT 3 v3 EXECUTOR BASLADI -- %s/%s -- %s ===", hesap_key, marketplace, today)
 
     try:
-        return _run_executor_impl(today, force_execute)
+        return _run_executor_impl(today, force_execute, hesap_key, marketplace)
     except Exception as e:
         tb = traceback.format_exc()
         hata_tipi = type(e).__name__
@@ -2305,7 +2305,7 @@ def run_executor(hesap_key, marketplace, today=None, force_execute=False):
         }
 
 
-def _run_executor_impl(today, force_execute=False):
+def _run_executor_impl(today, force_execute=False, hesap_key="", marketplace=""):
 
     # 0. On kontrol — Agent 2 raporlari mevcut mu?
     logger.info("--- On Kontrol ---")
@@ -2480,6 +2480,10 @@ def _run_executor_impl(today, force_execute=False):
             extra={"toplam_hata": toplam_hata, "detaylar": hata_detaylari[:10]}
         )
 
+    # ---- Supabase Sync ----
+    _sync_agent3_to_supabase(hesap_key, marketplace, today,
+                              execution_report, bid_ops, neg_ops, harvest_ops)
+
     execution_report["plan_dosyasi"] = str(exec_path)
     execution_report["dogrulama_talimati"] = {
         "bekleme_suresi_saniye": VERIFICATION_DELAY_SECONDS,
@@ -2492,6 +2496,99 @@ def _run_executor_impl(today, force_execute=False):
         "rollback_log": str(LOG_DIR / f"{today}_rollback.json"),
     }
     return execution_report
+
+
+def _sync_agent3_to_supabase(hesap_key, marketplace, today,
+                              execution_report, bid_ops, neg_ops, harvest_ops):
+    """Agent 3 execution plan'i Supabase'e yaz."""
+    try:
+        import sys as _sys
+        _project_root = str(Path(__file__).parent.parent)
+        if _project_root not in _sys.path:
+            _sys.path.insert(0, _project_root)
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+    except Exception as e:
+        logger.error("Supabase sync import hatasi: %s", e)
+        save_error_log("InternalError", f"Supabase sync import: {e}",
+                       traceback.format_exc(), adim="supabase_sync_init",
+                       session_id=MAESTRO_SESSION_ID)
+        return
+
+    try:
+        mode = execution_report.get("mod", "UYGULAMA")
+        plan_id = db.insert_execution_plan(
+            hesap_key, marketplace, today, mode,
+            execution_report.get("ozet", {}),
+            session_id=MAESTRO_SESSION_ID
+        )
+
+        items = []
+        for op in bid_ops:
+            a = op.get("action", {})
+            items.append({
+                "item_type": "BID_CHANGE",
+                "campaign_id": a.get("campaign_id"),
+                "kampanya": a.get("kampanya_adi"),
+                "ad_group_id": a.get("ad_group_id"),
+                "keyword_id": a.get("keyword_id"),
+                "target_id": a.get("target_id"),
+                "hedefleme": a.get("hedefleme"),
+                "eski_bid": a.get("eski_bid"),
+                "yeni_bid": a.get("yeni_bid"),
+                "api_endpoint": op.get("api_endpoint"),
+                "api_payload": op.get("api_payload"),
+                "status": op.get("status", "HAZIR"),
+                "error_message": "; ".join(op.get("hatalar", []))[:500] or None,
+            })
+        for op in neg_ops:
+            a = op.get("action", {})
+            items.append({
+                "item_type": "NEGATIVE_ADD",
+                "campaign_id": a.get("campaign_id"),
+                "kampanya": a.get("kampanya_adi"),
+                "ad_group_id": a.get("ad_group_id"),
+                "hedefleme": a.get("hedefleme"),
+                "negative_type": a.get("tip"),
+                "match_type": a.get("match_type"),
+                "api_endpoint": op.get("api_endpoint"),
+                "api_payload": op.get("api_payload"),
+                "status": op.get("status", "HAZIR"),
+                "error_message": "; ".join(op.get("hatalar", []))[:500] or None,
+            })
+        for op in harvest_ops:
+            a = op.get("action", {})
+            items.append({
+                "item_type": "HARVESTING",
+                "campaign_id": a.get("campaign_id"),
+                "kampanya": a.get("kampanya_adi"),
+                "hedefleme": a.get("hedefleme"),
+                "harvest_type": a.get("tip"),
+                "kaynak_kampanya": a.get("kaynak_kampanya"),
+                "api_endpoint": op.get("api_endpoint"),
+                "api_payload": op.get("api_payload"),
+                "status": op.get("status", "HAZIR"),
+                "error_message": "; ".join(op.get("hatalar", []))[:500] or None,
+            })
+
+        if items:
+            db.insert_execution_items(plan_id, hesap_key, marketplace, items)
+
+        logger.info("Supabase: execution plan yazildi (plan_id=%s, %d islem)", plan_id, len(items))
+
+    except Exception as e:
+        logger.error("Supabase sync hatasi (executor devam eder): %s", e)
+        save_error_log("InternalError", f"Supabase sync: {e}",
+                       traceback.format_exc(), adim="supabase_sync",
+                       session_id=MAESTRO_SESSION_ID)
+        try:
+            db.insert_error_log(hesap_key, marketplace, "agent3", {
+                "hata_tipi": "InternalError",
+                "hata_mesaji": f"Supabase sync hatasi: {e}"[:500],
+                "adim": "supabase_sync",
+            })
+        except Exception:
+            pass
 
 
 # ============================================================================

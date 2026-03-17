@@ -1,6 +1,24 @@
 """
-Amazon Advertising MCP Server — Data Collector Agent (v9 Multi-Account)
+Amazon Advertising MCP Server — Data Collector Agent (v11 Optimized)
 =========================================================================
+DEGISIKLIKLER (v10 -> v11):
+  1. Entity toplama: Sirayla await → paralel asyncio.gather + Semaphore(4)
+     17 entity ~50s yerine ~12s'de tamamlaniyor.
+  2. Rapor toplama: fire-all-then-poll mimarisi.
+     Rapor istekleri 2'li batch ile gonderilir (rate limit koruma),
+     sonra TUM raporlar ayni anda poll edilir.
+     Toplam sure: 3 × 15dk → 1 × 15dk (en yavas rapor kadar).
+  3. download_report() → create_report_request() + poll_and_download_report()
+     olarak ayrildi. Geriye uyumluluk icin download_report() korundu.
+
+DEGISIKLIKLER (v9 -> v10):
+  1. Campaign raporlari eklendi (SP, SB, SD) — timeUnit: DAILY
+     Dashboard KPI icin gunluk date etiketi olan veriler.
+  2. _build_report_payload() time_unit parametresi alir (SUMMARY/DAILY).
+  3. collect_report() time_unit destegi.
+  4. Supabase sync: campaign raporlari icin insert_campaign_reports().
+  5. Toplam rapor: 6 → 9, toplam islem: 23 → 26.
+
 DEGISIKLIKLER (v8 -> v9):
   1. Multi-account: accounts.json'dan hesap+marketplace bazli calisir.
   2. AmazonAdsClient config dict alir (env var okuma KALDIRILDI).
@@ -32,25 +50,25 @@ KRITIK METRIK FARKLARI:
   SB: sales, purchases, unitsSold (14 gun sabit, window eki YOK)
   SD: sales, purchases, unitsSold (14 gun sabit, window eki YOK)
 
-Cekilen Veriler (19 dosya):
-  Entity Listeleri (12+1):
+Cekilen Veriler (26 dosya):
+  Entity Listeleri (17):
     SP: campaigns, ad_groups, product_ads, keywords, targets,
         negative_keywords, campaign_negative_keywords, negative_targets
     SB: campaigns, ad_groups, keywords, targets, negative_keywords
     SD: campaigns, ad_groups, targets
     Portfolios: portfolios
 
-  Performans Raporlari (6):
-    SP: targeting_14d, search_term_30d
-    SB: targeting_14d, search_term_30d
-    SD: targeting_14d, targeting_30d
+  Performans Raporlari (9):
+    SP: targeting_14d, search_term_30d, campaign_report_14d (DAILY)
+    SB: targeting_14d, search_term_30d, campaign_report_14d (DAILY)
+    SD: targeting_14d, targeting_30d,   campaign_report_14d (DAILY)
 
-Kaldirilan Veriler (v6 → v7):
+Kaldirilan Veriler (v6 → v7, kismen geri eklendi v10):
   Entity: sp_negative_keywords, sp_negative_targets, sb_negative_keywords (Agent 2 kullanmiyor)
-  Raporlar: Tum campaign raporlari (targeting raporundan hesaplanabilir)
   Raporlar: Tum 1d raporlari (Agent 2 kullanmiyor)
   Raporlar: Tum 14d search_term (Agent 2 sadece 30d kullaniyor)
   Raporlar: sp/sb targeting_30d (search_term_30d daha detayli veriyor)
+  v10'da geri eklendi: Campaign raporlari (DAILY) — Dashboard KPI icin
 
 8 Teknik Koruma:
   1. Rate limit (429) → 30 sn bekle, 3 kez daha dene (artan bekleme)
@@ -59,7 +77,7 @@ Kaldirilan Veriler (v6 → v7):
   4. Bos rapor (0 satir) → Uyari olarak bildir
   5. Ayni gunun verisi varsa → Tekrar cekme
   6. Amazon-Ads-AccountId header'i (raporlama icin ZORUNLU)
-  7. Sirayla rapor cekme (2'li batch — kararlilik icin)
+  7. Fire-all-then-poll rapor cekme (2'li batch ile iste, hepsini birlikte poll et)
   8. Basarisiz raporlari sonunda tekrar dene (retry turu)
 """
 
@@ -295,6 +313,32 @@ SD_TARGETING_COLS = [
     "addToCart", "addToCartClicks", "addToCartViews",
     "viewClickThroughRate",
     "startDate", "endDate",
+]
+
+# Campaign raporlari — Dashboard KPI icin (timeUnit: DAILY → her satir 1 gun)
+SP_CAMPAIGN_COLS = [
+    "campaignId", "campaignName", "campaignStatus", "campaignBudgetAmount",
+    "impressions", "clicks", "cost", "costPerClick", "clickThroughRate",
+    "purchases14d", "sales14d", "unitsSoldClicks14d",
+    "acosClicks14d", "roasClicks14d",
+    "date",
+]
+
+SB_CAMPAIGN_COLS = [
+    "campaignId", "campaignName", "campaignStatus", "campaignBudgetAmount",
+    "impressions", "clicks", "cost",
+    "purchases", "purchasesClicks", "sales",
+    "unitsSold",
+    "date",
+]
+
+SD_CAMPAIGN_COLS = [
+    "campaignId", "campaignName", "campaignStatus", "campaignBudgetAmount",
+    "impressions", "clicks", "cost",
+    "purchases", "purchasesClicks", "sales",
+    "unitsSold",
+    "addToCartViews",
+    "date",
 ]
 
 BASE_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -568,8 +612,13 @@ class AmazonAdsClient:
                   accept="application/json"):
         return await self._request_with_retry("PUT", endpoint, payload, content_type, accept)
 
-    async def download_report(self, payload):
-        """Rapor olustur, bekle, indir. Amazon-Ads-AccountId header'i EKLENIR."""
+    # ------------------------------------------------------------------
+    # FIRE-ALL-THEN-POLL: Rapor islemini fazlara ayir
+    # ------------------------------------------------------------------
+
+    async def create_report_request(self, payload):
+        """Faz 1: Rapor olusturma istegi gonder, reportId dondur."""
+        import re
         try:
             data = await self.post(
                 "/reporting/reports", payload,
@@ -579,32 +628,27 @@ class AmazonAdsClient:
             )
         except httpx.HTTPStatusError as e:
             error_body = e.response.text[:500] if e.response else "N/A"
-            # HTTP 425: Amazon duplicate request — extract existing report ID and poll it
             if e.response and e.response.status_code == 425:
-                import re
                 match = re.search(r'duplicate of\s*:\s*([0-9a-f-]{36})', error_body)
                 if match:
                     dup_report_id = match.group(1)
                     logger.info("HTTP 425 duplike — mevcut rapor ID kullaniliyor: %s", dup_report_id)
-                    data = {"reportId": dup_report_id}
+                    return {"reportId": dup_report_id}
                 else:
-                    logger.error("HTTP 425 ama rapor ID parse edilemedi: %s", error_body)
-                    return {"error": f"HTTP {e.response.status_code}", "details": error_body}
+                    return {"error": f"HTTP 425", "details": error_body}
             else:
-                logger.error("Rapor olusturma hatasi (%d): %s | ReportType: %s",
-                            e.response.status_code, error_body,
-                            payload.get("configuration", {}).get("reportTypeId", "?"))
                 return {"error": f"HTTP {e.response.status_code}", "details": error_body}
 
         report_id = data.get("reportId")
         if not report_id:
-            logger.error("Report ID alinamadi: %s", data)
             return {"error": "Report ID yok", "details": str(data)[:500]}
-
         logger.info("Rapor olusturuldu: %s (%s)",
                     report_id,
                     payload.get("configuration", {}).get("reportTypeId", "?"))
+        return {"reportId": report_id}
 
+    async def poll_and_download_report(self, report_id):
+        """Faz 2+3: Raporu poll et, hazir olunca indir."""
         elapsed = 0
         while elapsed < REPORT_MAX_WAIT:
             try:
@@ -628,14 +672,6 @@ class AmazonAdsClient:
                     result = json.loads(decompressed)
                 except gzip.BadGzipFile:
                     result = resp.json()
-                # DEBUG: Ham rapor yapisini logla
-                if isinstance(result, dict):
-                    logger.info("DEBUG rapor yapisi: type=dict, keys=%s, ilk 500 char=%s",
-                                list(result.keys()), str(result)[:500])
-                else:
-                    logger.info("DEBUG rapor yapisi: type=%s, len=%s, ilk 500 char=%s",
-                                type(result).__name__, len(result) if hasattr(result, '__len__') else '?',
-                                str(result)[:500])
                 rows = result if isinstance(result, list) else result.get("rows", result.get("data", []))
                 logger.info("Rapor tamamlandi: %s (%d satir)", report_id, len(rows))
                 return rows
@@ -649,6 +685,13 @@ class AmazonAdsClient:
 
         logger.error("Rapor zaman asimi: %s", report_id)
         return {"error": f"Zaman asimi ({REPORT_MAX_WAIT}s)"}
+
+    async def download_report(self, payload):
+        """Eski uyumluluk: create + poll + download tek cagri (retry icin kullanilir)."""
+        result = await self.create_report_request(payload)
+        if _is_error(result):
+            return result
+        return await self.poll_and_download_report(result["reportId"])
 
 
 # ============================================================================
@@ -686,7 +729,8 @@ def _is_error(result):
     return isinstance(result, dict) and "error" in result
 
 
-def _build_report_payload(ad_product, report_type, group_by, columns, days_back):
+def _build_report_payload(ad_product, report_type, group_by, columns, days_back,
+                          time_unit="SUMMARY"):
     # Son gun (bugun) haric tutulur — Amazon'da bugunun verisi eksik/tamamlanmamis olur
     end = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")  # dun
     start = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -699,7 +743,7 @@ def _build_report_payload(ad_product, report_type, group_by, columns, days_back)
             "groupBy": group_by,
             "columns": columns,
             "reportTypeId": report_type,
-            "timeUnit": "SUMMARY",
+            "timeUnit": time_unit,
             "format": "GZIP_JSON",
         },
     }
@@ -717,7 +761,7 @@ async def app_lifespan(app):
         for m in h.get("marketplaces", {}).values()
         if m.get("aktif")
     )
-    logger.info("MCP Server v9 baslatildi — %d aktif marketplace", aktif)
+    logger.info("MCP Server v11 baslatildi — %d aktif marketplace", aktif)
     yield {"accounts": accounts}
 
 mcp = FastMCP("amazon_ads_mcp", lifespan=app_lifespan)
@@ -748,13 +792,13 @@ class EmptyInput(BaseModel):
 @mcp.tool(
     name="amazon_ads_collect_all_data",
     annotations={
-        "title": "Tum Verileri Topla (Agent 1 v9)",
+        "title": "Tum Verileri Topla (Agent 1 v11)",
         "readOnlyHint": True, "destructiveHint": False,
         "idempotentHint": False, "openWorldHint": True,
     },
 )
 async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None) -> str:
-    """Data Collector Agent v9 — SP + SB + SD reklam verilerini ceker ve kaydeder.
+    """Data Collector Agent v11 — SP + SB + SD reklam verilerini ceker ve kaydeder.
 
     Kullanim: amazon_ads_collect_all_data({"hesap_key": "vigowood_na", "marketplace": "US"})
     Veriler data/{hesap_key}_{marketplace}/ altina kaydedilir.
@@ -874,7 +918,7 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
             return []
 
     async def collect_report(name, ad_product_enum, report_type, group_by, columns,
-                             days, ad_product_label):
+                             days, ad_product_label, time_unit="SUMMARY"):
         fname = f"{today}_{name}_{days}d.json"
         key = f"{name}_{days}d"
         if _file_exists_today(fname, data_dir):
@@ -885,7 +929,7 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
             R["rapor_detay"][key] = {"durum": "CACHE", "satir": satir}
             return key, rows
         try:
-            payload = _build_report_payload(ad_product_enum, report_type, group_by, columns, days)
+            payload = _build_report_payload(ad_product_enum, report_type, group_by, columns, days, time_unit)
             rows = await client.download_report(payload)
             if _is_error(rows):
                 R["hatalar"].append({"rapor": key, "hata": rows.get("error", "?"),
@@ -918,196 +962,280 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
             return key, []
 
     # ==================================================================
-    # BOLUM 0: PORTFOLIO LISTESI (v3 API — tum reklam tipleri icin ortak)
+    # BOLUM 0-3: ENTITY LISTELERI (paralel, Semaphore(4) ile max 4 esanli)
     # ==================================================================
-    logger.info("=== PORTFOLYOLAR ===")
+    logger.info("=== ENTITY TOPLAMA (paralel, max 4 esanli) ===")
 
     PORTFOLIO_CT = "application/vnd.spPortfolio.v3+json"
-    portfolios = await collect_list(
-        "portfolios", "/portfolios/list",
-        state_filter=["ENABLED"], extract_key="portfolios",
-        content_type=PORTFOLIO_CT, accept=PORTFOLIO_CT,
-        custom_body={"stateFilter": {"include": ["ENABLED"]}}
-    )
-    R["portfolio_sayisi"] = len(portfolios)
+    entity_sem = asyncio.Semaphore(4)
 
-    # ==================================================================
-    # BOLUM 1: SPONSORED PRODUCTS (SP) — Entity Listeleri
-    # ==================================================================
-    logger.info("=== SPONSORED PRODUCTS ===")
+    async def collect_list_throttled(*args, **kwargs):
+        async with entity_sem:
+            return await collect_list(*args, **kwargs)
 
-    sp_camps = await collect_list("sp_campaigns", "/sp/campaigns/list",
-                                   ["ENABLED", "PAUSED"], "campaigns",
-                                   content_type=SP_CONTENT_TYPES["campaigns"],
-                                   accept=SP_CONTENT_TYPES["campaigns"])
+    entity_coros = [
+        # Portfolios
+        collect_list_throttled("portfolios", "/portfolios/list",
+                               state_filter=["ENABLED"], extract_key="portfolios",
+                               content_type=PORTFOLIO_CT, accept=PORTFOLIO_CT,
+                               custom_body={"stateFilter": {"include": ["ENABLED"]}}),
+        # SP Entities (8)
+        collect_list_throttled("sp_campaigns", "/sp/campaigns/list",
+                               ["ENABLED", "PAUSED"], "campaigns",
+                               content_type=SP_CONTENT_TYPES["campaigns"],
+                               accept=SP_CONTENT_TYPES["campaigns"]),
+        collect_list_throttled("sp_ad_groups", "/sp/adGroups/list",
+                               ["ENABLED", "PAUSED"], "adGroups",
+                               content_type=SP_CONTENT_TYPES["adGroups"],
+                               accept=SP_CONTENT_TYPES["adGroups"]),
+        collect_list_throttled("sp_product_ads", "/sp/productAds/list",
+                               ["ENABLED", "PAUSED"], "productAds",
+                               content_type=SP_CONTENT_TYPES["productAds"],
+                               accept=SP_CONTENT_TYPES["productAds"]),
+        collect_list_throttled("sp_keywords", "/sp/keywords/list",
+                               ["ENABLED", "PAUSED"], "keywords",
+                               content_type=SP_CONTENT_TYPES["keywords"],
+                               accept=SP_CONTENT_TYPES["keywords"]),
+        collect_list_throttled("sp_targets", "/sp/targets/list",
+                               ["ENABLED", "PAUSED"], "targetingClauses",
+                               content_type=SP_CONTENT_TYPES["targets"],
+                               accept=SP_CONTENT_TYPES["targets"]),
+        collect_list_throttled("sp_negative_keywords", "/sp/negativeKeywords/list",
+                               ["ENABLED"], "negativeKeywords",
+                               content_type=SP_CONTENT_TYPES["negativeKeywords"],
+                               accept=SP_CONTENT_TYPES["negativeKeywords"]),
+        collect_list_throttled("sp_campaign_negative_keywords",
+                               "/sp/campaignNegativeKeywords/list",
+                               ["ENABLED"], "campaignNegativeKeywords",
+                               content_type=SP_CONTENT_TYPES["campaignNegativeKeywords"],
+                               accept=SP_CONTENT_TYPES["campaignNegativeKeywords"]),
+        collect_list_throttled("sp_negative_targets", "/sp/negativeTargets/list",
+                               ["ENABLED"], "negativeTargetingClauses",
+                               content_type=SP_CONTENT_TYPES["negativeTargets"],
+                               accept=SP_CONTENT_TYPES["negativeTargets"]),
+        # SB Entities (5)
+        collect_list_throttled("sb_campaigns", "/sb/v4/campaigns/list",
+                               ["ENABLED", "PAUSED"], "campaigns",
+                               content_type=SB_CONTENT_TYPES["campaigns"],
+                               accept=SB_CONTENT_TYPES["campaigns"],
+                               max_count=100),
+        collect_list_throttled("sb_ad_groups", "/sb/v4/adGroups/list",
+                               ["ENABLED", "PAUSED"], "adGroups",
+                               content_type=SB_CONTENT_TYPES["campaigns"],
+                               accept=SB_CONTENT_TYPES["campaigns"],
+                               max_count=100),
+        collect_list_throttled("sb_keywords", "/sb/keywords",
+                               ["enabled", "paused"], "keywords",
+                               method="GET",
+                               accept=SB_CONTENT_TYPES["keywords"]),
+        collect_list_throttled("sb_targets", "/sb/targets/list",
+                               ["enabled", "paused"], "targets",
+                               content_type="application/json",
+                               accept=SB_CONTENT_TYPES["targets"],
+                               custom_body={
+                                   "filters": [{"filterType": "TARGETING_STATE",
+                                                "values": ["enabled", "paused"]}],
+                                   "maxResults": 100
+                               }),
+        collect_list_throttled("sb_negative_keywords", "/sb/negativeKeywords",
+                               ["enabled"], "negativeKeywords",
+                               method="GET",
+                               accept="application/vnd.sbnegativekeyword.v3.2+json"),
+        # SD Entities (3)
+        collect_list_throttled("sd_campaigns", "/sd/campaigns",
+                               ["enabled", "paused"], "campaigns",
+                               method="GET"),
+        collect_list_throttled("sd_ad_groups", "/sd/adGroups",
+                               ["enabled", "paused"], "adGroups",
+                               method="GET"),
+        collect_list_throttled("sd_targets", "/sd/targets",
+                               ["enabled", "paused"], "targets",
+                               method="GET"),
+    ]
+
+    entity_names = [
+        "portfolios",
+        "sp_campaigns", "sp_ad_groups", "sp_product_ads", "sp_keywords", "sp_targets",
+        "sp_negative_keywords", "sp_campaign_negative_keywords", "sp_negative_targets",
+        "sb_campaigns", "sb_ad_groups", "sb_keywords", "sb_targets", "sb_negative_keywords",
+        "sd_campaigns", "sd_ad_groups", "sd_targets",
+    ]
+
+    entity_results = await asyncio.gather(*entity_coros)
+
+    # Entity sayilarini R dict'e kaydet
+    entity_map = dict(zip(entity_names, entity_results))
+
+    R["portfolio_sayisi"] = len(entity_map.get("portfolios", []))
+
+    sp_camps = entity_map.get("sp_campaigns", [])
     R["sp_kampanya_sayisi"] = len(sp_camps)
     R["sp_kampanya_aktif"] = sum(1 for c in sp_camps if c.get("state", "").upper() == "ENABLED")
+    R["sp_ad_group_sayisi"] = len(entity_map.get("sp_ad_groups", []))
+    R["sp_product_ad_sayisi"] = len(entity_map.get("sp_product_ads", []))
+    R["sp_keyword_sayisi"] = len(entity_map.get("sp_keywords", []))
+    R["sp_target_sayisi"] = len(entity_map.get("sp_targets", []))
+    R["sp_negatif_keyword_sayisi"] = len(entity_map.get("sp_negative_keywords", []))
+    R["sp_kampanya_negatif_keyword_sayisi"] = len(entity_map.get("sp_campaign_negative_keywords", []))
+    R["sp_negatif_target_sayisi"] = len(entity_map.get("sp_negative_targets", []))
 
-    # SP Ad Group'lar (Agent 3 icin gerekli: kampanya → ad_group eslestirme)
-    sp_ad_groups = await collect_list("sp_ad_groups", "/sp/adGroups/list",
-                                      ["ENABLED", "PAUSED"], "adGroups",
-                                      content_type=SP_CONTENT_TYPES["adGroups"],
-                                      accept=SP_CONTENT_TYPES["adGroups"])
-    R["sp_ad_group_sayisi"] = len(sp_ad_groups)
-
-    # SP Product Ads (Agent 3 icin gerekli: hedeflenen ASIN bilgisi)
-    sp_product_ads = await collect_list("sp_product_ads", "/sp/productAds/list",
-                                        ["ENABLED", "PAUSED"], "productAds",
-                                        content_type=SP_CONTENT_TYPES["productAds"],
-                                        accept=SP_CONTENT_TYPES["productAds"])
-    R["sp_product_ad_sayisi"] = len(sp_product_ads)
-
-    sp_kws = await collect_list("sp_keywords", "/sp/keywords/list",
-                                 ["ENABLED", "PAUSED"], "keywords",
-                                 content_type=SP_CONTENT_TYPES["keywords"],
-                                 accept=SP_CONTENT_TYPES["keywords"])
-    R["sp_keyword_sayisi"] = len(sp_kws)
-
-    sp_targets = await collect_list("sp_targets", "/sp/targets/list",
-                                     ["ENABLED", "PAUSED"], "targetingClauses",
-                                     content_type=SP_CONTENT_TYPES["targets"],
-                                     accept=SP_CONTENT_TYPES["targets"])
-    R["sp_target_sayisi"] = len(sp_targets)
-
-    # SP Negatif Keyword'ler (ad group seviyesi)
-    sp_neg_kws = await collect_list("sp_negative_keywords", "/sp/negativeKeywords/list",
-                                     ["ENABLED"], "negativeKeywords",
-                                     content_type=SP_CONTENT_TYPES["negativeKeywords"],
-                                     accept=SP_CONTENT_TYPES["negativeKeywords"])
-    R["sp_negatif_keyword_sayisi"] = len(sp_neg_kws)
-
-    # SP Kampanya Negatif Keyword'ler (kampanya seviyesi)
-    sp_camp_neg_kws = await collect_list("sp_campaign_negative_keywords",
-                                          "/sp/campaignNegativeKeywords/list",
-                                          ["ENABLED"], "campaignNegativeKeywords",
-                                          content_type=SP_CONTENT_TYPES["campaignNegativeKeywords"],
-                                          accept=SP_CONTENT_TYPES["campaignNegativeKeywords"])
-    R["sp_kampanya_negatif_keyword_sayisi"] = len(sp_camp_neg_kws)
-
-    # SP Negatif Targeting (ASIN/kategori negatif)
-    sp_neg_targets = await collect_list("sp_negative_targets", "/sp/negativeTargets/list",
-                                         ["ENABLED"], "negativeTargetingClauses",
-                                         content_type=SP_CONTENT_TYPES["negativeTargets"],
-                                         accept=SP_CONTENT_TYPES["negativeTargets"])
-    R["sp_negatif_target_sayisi"] = len(sp_neg_targets)
-
-    # ==================================================================
-    # BOLUM 2: SPONSORED BRANDS (SB v4) — Entity Listeleri
-    # ==================================================================
-    logger.info("=== SPONSORED BRANDS ===")
-
-    sb_camps = await collect_list("sb_campaigns", "/sb/v4/campaigns/list",
-                                   ["ENABLED", "PAUSED"], "campaigns",
-                                   content_type=SB_CONTENT_TYPES["campaigns"],
-                                   accept=SB_CONTENT_TYPES["campaigns"],
-                                   max_count=100)  # SB v4: maxResults max 100
+    sb_camps = entity_map.get("sb_campaigns", [])
     R["sb_kampanya_sayisi"] = len(sb_camps)
     R["sb_kampanya_aktif"] = sum(1 for c in sb_camps if str(c.get("state", c.get("status", ""))).upper() == "ENABLED")
+    R["sb_ad_group_sayisi"] = len(entity_map.get("sb_ad_groups", []))
+    R["sb_keyword_sayisi"] = len(entity_map.get("sb_keywords", []))
+    R["sb_target_sayisi"] = len(entity_map.get("sb_targets", []))
+    R["sb_negatif_keyword_sayisi"] = len(entity_map.get("sb_negative_keywords", []))
 
-    # SB Ad Group'lar (Agent 3 icin gerekli)
-    sb_ad_groups = await collect_list("sb_ad_groups", "/sb/v4/adGroups/list",
-                                      ["ENABLED", "PAUSED"], "adGroups",
-                                      content_type=SB_CONTENT_TYPES["campaigns"],
-                                      accept=SB_CONTENT_TYPES["campaigns"],
-                                      max_count=100)  # SB v4: maxResults max 100
-    R["sb_ad_group_sayisi"] = len(sb_ad_groups)
+    R["sd_kampanya_sayisi"] = len(entity_map.get("sd_campaigns", []))
+    R["sd_ad_group_sayisi"] = len(entity_map.get("sd_ad_groups", []))
+    R["sd_target_sayisi"] = len(entity_map.get("sd_targets", []))
 
-    sb_kws = await collect_list("sb_keywords", "/sb/keywords",
-                                 ["enabled", "paused"], "keywords",
-                                 method="GET",
-                                 accept=SB_CONTENT_TYPES["keywords"])
-    R["sb_keyword_sayisi"] = len(sb_kws)
-
-    sb_targets = await collect_list("sb_targets", "/sb/targets/list",
-                                     ["enabled", "paused"], "targets",
-                                     content_type="application/json",
-                                     accept=SB_CONTENT_TYPES["targets"],
-                                     custom_body={
-                                         "filters": [{"filterType": "TARGETING_STATE",
-                                                      "values": ["enabled", "paused"]}],
-                                         "maxResults": 100  # SB: maxResults max 100
-                                     })
-    R["sb_target_sayisi"] = len(sb_targets)
-
-    # SB Negatif Keyword'ler
-    sb_neg_kws = await collect_list("sb_negative_keywords", "/sb/negativeKeywords",
-                                     ["enabled"], "negativeKeywords",
-                                     method="GET",
-                                     accept="application/vnd.sbnegativekeyword.v3.2+json")
-    R["sb_negatif_keyword_sayisi"] = len(sb_neg_kws)
+    logger.info("=== Entity tamamlandi. ===")
 
     # ==================================================================
-    # BOLUM 3: SPONSORED DISPLAY (SD) — Entity Listeleri
+    # BOLUM 4: PERFORMANS RAPORLARI (v11: fire-all-then-poll, 9 rapor)
     # ==================================================================
-    logger.info("=== SPONSORED DISPLAY ===")
-
-    sd_camps = await collect_list("sd_campaigns", "/sd/campaigns",
-                                   ["enabled", "paused"], "campaigns",
-                                   method="GET")
-    R["sd_kampanya_sayisi"] = len(sd_camps)
-
-    # SD Ad Group'lar (Agent 3 icin gerekli)
-    sd_ad_groups = await collect_list("sd_ad_groups", "/sd/adGroups",
-                                      ["enabled", "paused"], "adGroups",
-                                      method="GET")
-    R["sd_ad_group_sayisi"] = len(sd_ad_groups)
-
-    sd_targets = await collect_list("sd_targets", "/sd/targets",
-                                     ["enabled", "paused"], "targets",
-                                     method="GET")
-    R["sd_target_sayisi"] = len(sd_targets)
-
-    # ==================================================================
-    # BOLUM 4: PERFORMANS RAPORLARI (v7: 6 rapor, 2'li batch)
-    # ==================================================================
-    logger.info("=== PERFORMANS RAPORLARI (6 rapor) ===")
+    logger.info("=== PERFORMANS RAPORLARI (9 rapor, fire-all-then-poll) ===")
 
     report_tasks = [
         # SP: targeting_14d (bid tavsiyeleri) + search_term_30d (harvesting)
         ("sp_targeting_report", "SPONSORED_PRODUCTS", "spTargeting",
-         ["targeting"], SP_TARGETING_COLS, 14, "SP"),
+         ["targeting"], SP_TARGETING_COLS, 14, "SP", "SUMMARY"),
         ("sp_search_term_report", "SPONSORED_PRODUCTS", "spSearchTerm",
-         ["searchTerm"], SP_SEARCH_TERM_COLS, 30, "SP"),
+         ["searchTerm"], SP_SEARCH_TERM_COLS, 30, "SP", "SUMMARY"),
 
         # SB: targeting_14d (bid tavsiyeleri) + search_term_30d (harvesting)
         ("sb_targeting_report", "SPONSORED_BRANDS", "sbTargeting",
-         ["targeting"], SB_TARGETING_COLS, 14, "SB"),
+         ["targeting"], SB_TARGETING_COLS, 14, "SB", "SUMMARY"),
         ("sb_search_term_report", "SPONSORED_BRANDS", "sbSearchTerm",
-         ["searchTerm"], SB_SEARCH_TERM_COLS, 30, "SB"),
+         ["searchTerm"], SB_SEARCH_TERM_COLS, 30, "SB", "SUMMARY"),
 
         # SD: targeting_14d (bid tavsiyeleri) + targeting_30d (harvesting)
         ("sd_targeting_report", "SPONSORED_DISPLAY", "sdTargeting",
-         ["targeting"], SD_TARGETING_COLS, 14, "SD"),
+         ["targeting"], SD_TARGETING_COLS, 14, "SD", "SUMMARY"),
         ("sd_targeting_report", "SPONSORED_DISPLAY", "sdTargeting",
-         ["targeting"], SD_TARGETING_COLS, 30, "SD"),
+         ["targeting"], SD_TARGETING_COLS, 30, "SD", "SUMMARY"),
+
+        # Campaign raporlari — Dashboard KPI (timeUnit: DAILY → her satir 1 gun)
+        ("sp_campaign_report", "SPONSORED_PRODUCTS", "spCampaigns",
+         ["campaign"], SP_CAMPAIGN_COLS, 14, "SP", "DAILY"),
+        ("sb_campaign_report", "SPONSORED_BRANDS", "sbCampaigns",
+         ["campaign"], SB_CAMPAIGN_COLS, 14, "SB", "DAILY"),
+        ("sd_campaign_report", "SPONSORED_DISPLAY", "sdCampaigns",
+         ["campaign"], SD_CAMPAIGN_COLS, 14, "SD", "DAILY"),
     ]
 
-    # v7: 2'li batch + batch arasi bekleme
-    failed_tasks = []  # Hata alan raporlar
-    empty_tasks = []   # Bos donen raporlar
+    failed_tasks = []
+    empty_tasks = []
+
+    # --- FAZ 1: FIRE — rapor olusturma isteklerini gonder (2'li batch, rate limit koruma) ---
+    pending = {}   # key -> (report_id, task_tuple)
 
     for i in range(0, len(report_tasks), BATCH_SIZE):
         batch = report_tasks[i:i+BATCH_SIZE]
-        coros = []
-        for name, ad_prod_enum, rtype, gby, cols, days, ad_label in batch:
-            coros.append(collect_report(name, ad_prod_enum, rtype, gby, cols, days, ad_label))
+        fire_coros = []
+        fire_keys = []
 
-        batch_results = await asyncio.gather(*coros)
+        for name, ap, rt, gb, cols, days, ad_label, tunit in batch:
+            key = f"{name}_{days}d"
+            fname = f"{today}_{key}.json"
 
-        for idx, (name, ad_prod_enum, rtype, gby, cols, days, ad_label) in enumerate(batch):
-            key, rows = batch_results[idx]
-            if not rows:
-                # Hata mi bos mu ayir
-                detay = R["rapor_detay"].get(key, {})
-                if detay.get("durum") == "BOS":
-                    empty_tasks.append((name, ad_prod_enum, rtype, gby, cols, days, ad_label))
-                elif detay.get("durum") == "HATA":
-                    failed_tasks.append((name, ad_prod_enum, rtype, gby, cols, days, ad_label))
+            if _file_exists_today(fname, data_dir):
+                rows = _load_existing_json(fname, data_dir)
+                R["dosyalar"][key] = str(data_dir / fname)
+                R["atlanan"] += 1
+                satir = len(rows) if isinstance(rows, list) else 0
+                R["rapor_detay"][key] = {"durum": "CACHE", "satir": satir}
+                continue
 
-        # Batch arasi bekleme (son batch haric)
-        if i + BATCH_SIZE < len(report_tasks):
+            payload = _build_report_payload(ap, rt, gb, cols, days, tunit)
+            fire_coros.append(client.create_report_request(payload))
+            fire_keys.append((key, (name, ap, rt, gb, cols, days, ad_label, tunit)))
+
+        if fire_coros:
+            results_fire = await asyncio.gather(*fire_coros)
+            for (key, task_tuple), result in zip(fire_keys, results_fire):
+                if _is_error(result):
+                    logger.warning("Rapor olusturulamadi: %s — %s", key, result.get("error"))
+                    R["hatalar"].append({"rapor": key, "hata": result.get("error", "?"),
+                                         "detay": result.get("details", "")[:300]})
+                    R["basarisiz"] += 1
+                    R["rapor_detay"][key] = {"durum": "HATA", "hata": result.get("error", "?")}
+                    failed_tasks.append(task_tuple)
+                    save_error_log(
+                        hata_tipi=classify_error_from_message(result.get("error", "")),
+                        hata_mesaji=result.get("error", ""),
+                        data_dir=data_dir,
+                        adim="fire_report",
+                        extra={"rapor": key, "tarih": today, "hesap": account_label}
+                    )
+                else:
+                    report_id = result["reportId"]
+                    logger.info("Rapor istendi: %s → %s", key, report_id)
+                    pending[key] = (report_id, task_tuple)
+
+        # 2'li batch arasi bekleme (rate limit koruma)
+        if i + BATCH_SIZE < len(report_tasks) and fire_coros:
             logger.info("Batch arasi %ds bekleniyor...", BATCH_DELAY)
             await asyncio.sleep(BATCH_DELAY)
+
+    # --- FAZ 2: POLL — tum raporlari AYNI ANDA poll et ---
+    if pending:
+        logger.info("=== %d rapor poll ediliyor (paralel) ===", len(pending))
+
+        async def poll_single(key, report_id, task_tuple):
+            """Tek bir raporu poll et, indir, kaydet."""
+            name, ap, rt, gb, cols, days, ad_label, tunit = task_tuple
+            fname = f"{today}_{key}.json"
+            try:
+                rows = await client.poll_and_download_report(report_id)
+                if _is_error(rows):
+                    R["hatalar"].append({"rapor": key, "hata": rows.get("error", "?"),
+                                         "detay": rows.get("details", "")[:300]})
+                    R["basarisiz"] += 1
+                    R["rapor_detay"][key] = {"durum": "HATA", "hata": rows.get("error", "?")}
+                    save_error_log(
+                        hata_tipi=classify_error_from_message(rows.get("error", "")),
+                        hata_mesaji=rows.get("error", ""),
+                        data_dir=data_dir,
+                        adim="poll_report",
+                        extra={"rapor": key, "report_id": report_id, "tarih": today, "hesap": account_label}
+                    )
+                    return key, "HATA", task_tuple
+                R["dosyalar"][key] = _save_json(fname, rows, data_dir)
+                R["basarili"] += 1
+                satir = len(rows) if isinstance(rows, list) else 0
+                R["rapor_detay"][key] = {"durum": "DOLU" if satir > 0 else "BOS", "satir": satir}
+                if satir == 0:
+                    R["uyarilar"].append(f"{key}: Bos rapor (0 satir).")
+                    return key, "BOS", task_tuple
+                return key, "DOLU", task_tuple
+            except Exception as e:
+                hata = str(e)[:300]
+                R["hatalar"].append({"rapor": key, "hata": hata})
+                R["basarisiz"] += 1
+                R["rapor_detay"][key] = {"durum": "HATA", "hata": hata[:200]}
+                save_error_log(
+                    hata_tipi=classify_error_from_message(hata),
+                    hata_mesaji=hata,
+                    data_dir=data_dir,
+                    adim="poll_report",
+                    extra={"rapor": key, "report_id": report_id, "tarih": today, "hesap": account_label}
+                )
+                return key, "HATA", task_tuple
+
+        poll_coros = [
+            poll_single(key, report_id, task_tuple)
+            for key, (report_id, task_tuple) in pending.items()
+        ]
+        poll_results = await asyncio.gather(*poll_coros)
+
+        for key, status, task_tuple in poll_results:
+            if status == "HATA":
+                failed_tasks.append(task_tuple)
+            elif status == "BOS":
+                empty_tasks.append(task_tuple)
 
     # ==================================================================
     # BOLUM 5: RETRY TURU
@@ -1122,7 +1250,7 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
         logger.info("=== BOS RAPOR RETRY: %d rapor 1 kez tekrar deneniyor ===", len(empty_tasks))
         await asyncio.sleep(60)
 
-        for name, ad_prod_enum, rtype, gby, cols, days, ad_label in empty_tasks:
+        for name, ad_prod_enum, rtype, gby, cols, days, ad_label, tunit in empty_tasks:
             key_name = f"{name}_{days}d"
 
             # Onceki sayaclari duzelt
@@ -1135,7 +1263,7 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
             if old_file.exists():
                 old_file.unlink()
 
-            key, rows = await collect_report(name, ad_prod_enum, rtype, gby, cols, days, ad_label)
+            key, rows = await collect_report(name, ad_prod_enum, rtype, gby, cols, days, ad_label, tunit)
             detay = R["rapor_detay"].get(key, {})
 
             if detay.get("durum") == "DOLU":
@@ -1151,7 +1279,7 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
         logger.info("=== HATA RETRY: %d rapor tekrar deneniyor — max %d deneme ===",
                     len(failed_tasks), MAX_RETRIES)
 
-        for name, ad_prod_enum, rtype, gby, cols, days, ad_label in failed_tasks:
+        for name, ad_prod_enum, rtype, gby, cols, days, ad_label, tunit in failed_tasks:
             key_name = f"{name}_{days}d"
             resolved = False
 
@@ -1171,7 +1299,7 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
                 if old_file.exists():
                     old_file.unlink()
 
-                key, rows = await collect_report(name, ad_prod_enum, rtype, gby, cols, days, ad_label)
+                key, rows = await collect_report(name, ad_prod_enum, rtype, gby, cols, days, ad_label, tunit)
                 detay = R["rapor_detay"].get(key, {})
 
                 if detay.get("durum") in ("DOLU", "BOS"):
@@ -1241,7 +1369,7 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
     )
 
     R["teknik_ozet"] = {
-        "toplam_islem": f"{toplam}/23",
+        "toplam_islem": f"{toplam}/26",
         "basarili": R["basarili"],
         "basarisiz": R["basarisiz"],
         "cache_kullanildi": R["atlanan"],
@@ -1254,8 +1382,8 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
     }
 
     R["ozet_mesaj"] = (
-        f"Agent 1 v7 tamamlandi. "
-        f"Toplam: {toplam}/23 | Basarili: {R['basarili']} | Basarisiz: {R['basarisiz']} | Cache: {R['atlanan']}. "
+        f"Agent 1 v11 tamamlandi. "
+        f"Toplam: {toplam}/26 | Basarili: {R['basarili']} | Basarisiz: {R['basarisiz']} | Cache: {R['atlanan']}. "
         f"Dolu rapor: {len(dolu_raporlar)} | Bos rapor: {len(bos_raporlar)} | Hatali: {len(hatali_raporlar)} | "
         f"Retry yapilan: {len(retry_raporlar)}. "
         f"Entity: {entity_ozet}"
@@ -1281,7 +1409,144 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
             )
 
     await client.close()
+
+    # ---- Supabase Sync (dual mode: dosya + DB) ----
+    _sync_agent1_to_supabase(params.hesap_key, params.marketplace, today, data_dir, R)
+
     return json.dumps(R, indent=2, ensure_ascii=False)
+
+
+def _sync_agent1_to_supabase(hesap_key, marketplace, today, data_dir, R):
+    """Agent 1 verilerini Supabase'e senkronize et. Hata olursa error_logs'a yaz."""
+    account_label = f"{hesap_key}/{marketplace}"
+    logger.info("Supabase sync basliyor: %s", account_label)
+
+    # 1. Import ve baglanti
+    try:
+        import sys as _sys
+        _project_root = str(Path(__file__).parent.parent)
+        if _project_root not in _sys.path:
+            _sys.path.insert(0, _project_root)
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.error("Supabase import/baglanti hatasi: %s\n%s", e, tb)
+        save_error_log(
+            hata_tipi="InternalError",
+            hata_mesaji=f"Supabase sync import hatasi: {e}",
+            data_dir=data_dir, traceback_str=tb,
+            adim="supabase_sync_init",
+            extra={"hesap": account_label, "fase": "import"}
+        )
+        return
+
+    def _load(suffix):
+        fp = data_dir / f"{today}_{suffix}.json"
+        if fp.exists():
+            with open(fp, encoding="utf-8") as f:
+                return json.load(f)
+        return []
+
+    def _log_sync_error(adim, suffix, error, tb_str=None):
+        """Sync hatasini hem dosyaya hem Supabase error_logs'a yaz."""
+        error_msg = f"Supabase sync hatasi [{suffix}]: {error}"
+        logger.error(error_msg)
+        save_error_log(
+            hata_tipi="InternalError",
+            hata_mesaji=error_msg,
+            data_dir=data_dir, traceback_str=tb_str,
+            adim=adim,
+            extra={"hesap": account_label, "suffix": suffix}
+        )
+        try:
+            db.insert_error_log(hesap_key, marketplace, "agent1", {
+                "hata_tipi": "InternalError",
+                "hata_mesaji": error_msg[:500],
+                "adim": adim,
+                "extra": {"suffix": suffix},
+            })
+        except Exception:
+            pass  # DB'ye yazamiyorsak en azindan dosya logu var
+
+    # 2. Entity UPSERT
+    entity_ops = [
+        ("portfolios", lambda d: db.upsert_portfolios(hesap_key, marketplace, d)),
+        ("sp_campaigns", lambda d: db.upsert_campaigns(hesap_key, marketplace, "SP", d)),
+        ("sb_campaigns", lambda d: db.upsert_campaigns(hesap_key, marketplace, "SB", d)),
+        ("sd_campaigns", lambda d: db.upsert_campaigns(hesap_key, marketplace, "SD", d)),
+        ("sp_ad_groups", lambda d: db.upsert_ad_groups(hesap_key, marketplace, "SP", d)),
+        ("sb_ad_groups", lambda d: db.upsert_ad_groups(hesap_key, marketplace, "SB", d)),
+        ("sd_ad_groups", lambda d: db.upsert_ad_groups(hesap_key, marketplace, "SD", d)),
+        ("sp_keywords", lambda d: db.upsert_keywords(hesap_key, marketplace, "SP", d)),
+        ("sb_keywords", lambda d: db.upsert_keywords(hesap_key, marketplace, "SB", d)),
+        ("sp_targets", lambda d: db.upsert_targets(hesap_key, marketplace, "SP", d)),
+        ("sb_targets", lambda d: db.upsert_targets(hesap_key, marketplace, "SB", d)),
+        ("sd_targets", lambda d: db.upsert_targets(hesap_key, marketplace, "SD", d)),
+        ("sp_product_ads", lambda d: db.upsert_product_ads(hesap_key, marketplace, d)),
+        ("sp_negative_keywords", lambda d: db.upsert_negative_keywords(hesap_key, marketplace, "SP", d, "AD_GROUP")),
+        ("sp_campaign_negative_keywords", lambda d: db.upsert_negative_keywords(hesap_key, marketplace, "SP", d, "CAMPAIGN")),
+        ("sb_negative_keywords", lambda d: db.upsert_negative_keywords(hesap_key, marketplace, "SB", d, "AD_GROUP")),
+        ("sp_negative_targets", lambda d: db.upsert_negative_targets(hesap_key, marketplace, d)),
+    ]
+
+    entity_count = 0
+    entity_errors = 0
+    for suffix, fn in entity_ops:
+        data = _load(suffix)
+        if data:
+            try:
+                fn(data)
+                entity_count += len(data)
+            except Exception as e:
+                entity_errors += 1
+                _log_sync_error("supabase_sync_entity", suffix, e, traceback.format_exc())
+
+    # 3. Rapor INSERT (birikmeli)
+    report_ops = [
+        ("sp_targeting_report_14d", "SP", "14d", "targeting"),
+        ("sb_targeting_report_14d", "SB", "14d", "targeting"),
+        ("sd_targeting_report_14d", "SD", "14d", "targeting"),
+        ("sd_targeting_report_30d", "SD", "30d", "targeting"),
+        ("sp_search_term_report_30d", "SP", "30d", "search_term"),
+        ("sb_search_term_report_30d", "SB", "30d", "search_term"),
+        ("sp_campaign_report_14d", "SP", "14d", "campaign"),
+        ("sb_campaign_report_14d", "SB", "14d", "campaign"),
+        ("sd_campaign_report_14d", "SD", "14d", "campaign"),
+    ]
+
+    report_count = 0
+    report_errors = 0
+    for suffix, ad_type, period, rtype in report_ops:
+        data = _load(suffix)
+        if data:
+            try:
+                if rtype == "targeting":
+                    db.insert_targeting_reports(hesap_key, marketplace, ad_type, period, today, data)
+                elif rtype == "search_term":
+                    db.insert_search_term_reports(hesap_key, marketplace, ad_type, today, data)
+                elif rtype == "campaign":
+                    db.insert_campaign_reports(hesap_key, marketplace, ad_type, period, today, data)
+                report_count += len(data)
+            except Exception as e:
+                report_errors += 1
+                _log_sync_error("supabase_sync_report", suffix, e, traceback.format_exc())
+
+    # kpi_daily tablosunu guncelle (dashboard icin)
+    if report_count > 0:
+        try:
+            db.upsert_kpi_daily(hesap_key, marketplace, today)
+            logger.info("kpi_daily guncellendi: %s/%s/%s", hesap_key, marketplace, today)
+        except Exception as e:
+            logger.warning("kpi_daily guncellenemedi: %s — %s", account_label, e)
+
+    if entity_errors == 0 and report_errors == 0:
+        logger.info("Supabase sync BASARILI: %s — %d entity, %d rapor",
+                     account_label, entity_count, report_count)
+    else:
+        logger.warning("Supabase sync KISMI: %s — %d entity, %d rapor, %d hata",
+                        account_label, entity_count, report_count,
+                        entity_errors + report_errors)
 
 
 # ============================================================================
