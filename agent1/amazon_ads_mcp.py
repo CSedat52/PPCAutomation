@@ -143,12 +143,12 @@ MARKETPLACE_CONFIG = {
 }
 
 REPORT_MAX_WAIT = 900
-REPORT_POLL_INTERVAL = 15  # v7: 10 → 15 sn (Amazon server yukunu azaltir)
+REPORT_POLL_INTERVAL = 90     # v12: 15 → 90 sn (429 riskini %83 azaltir)
 RETRY_MAX = 3              # v7: 2 → 3 (daha fazla sans)
-RETRY_RATE_LIMIT_WAIT = 30
+RETRY_RATE_LIMIT_WAIT = 60
 RETRY_TIMEOUT_WAIT = 15    # v7: 10 → 15 sn
 BATCH_SIZE = 2             # v7: 3 → 2 (daha az paralel = daha az rate limit)
-BATCH_DELAY = 5            # v7: Batch arasi bekleme suresi (sn)
+BATCH_DELAY = 10           # v12: 5 → 10 sn (fire batch arasi)
 
 # ============================================================================
 # CONTENT-TYPE HARITASI
@@ -1091,14 +1091,24 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
     R["sd_ad_group_sayisi"] = len(entity_map.get("sd_ad_groups", []))
     R["sd_target_sayisi"] = len(entity_map.get("sd_targets", []))
 
-    logger.info("=== Entity tamamlandi. ===")
+    sp_count = R["sp_kampanya_sayisi"]
+    sb_count = R["sb_kampanya_sayisi"]
+    sd_count = R["sd_kampanya_sayisi"]
+
+    logger.info("=== Entity tamamlandi. Kampanya sayilari: SP=%d, SB=%d, SD=%d ===",
+                sp_count, sb_count, sd_count)
 
     # ==================================================================
-    # BOLUM 4: PERFORMANS RAPORLARI (v11: fire-all-then-poll, 9 rapor)
+    # BOLUM 4: PERFORMANS RAPORLARI (v11: fire-all-then-poll + smart-skip)
     # ==================================================================
-    logger.info("=== PERFORMANS RAPORLARI (9 rapor, fire-all-then-poll) ===")
 
-    report_tasks = [
+    # ---- SMART-SKIP ----
+    # Kampanyasi olmayan reklam tiplerinin raporlarini ATLA.
+    # sb_campaigns=0 → SB raporlari bosuna istenmesin.
+    # sd_campaigns=0 → SD raporlari bosuna istenmesin.
+    # Marketplace basina 30-60 dk tasarruf (bos rapor poll + retry suresi).
+
+    all_report_tasks = [
         # SP: targeting_14d (bid tavsiyeleri) + search_term_30d (harvesting)
         ("sp_targeting_report", "SPONSORED_PRODUCTS", "spTargeting",
          ["targeting"], SP_TARGETING_COLS, 14, "SP", "SUMMARY"),
@@ -1125,6 +1135,31 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
         ("sd_campaign_report", "SPONSORED_DISPLAY", "sdCampaigns",
          ["campaign"], SD_CAMPAIGN_COLS, 14, "SD", "DAILY"),
     ]
+
+    # Kampanyasi olmayan tiplerin raporlarini filtrele
+    skip_prefixes = []
+    if sp_count == 0:
+        skip_prefixes.append("sp_")
+        logger.info("SMART-SKIP: SP kampanya yok → SP raporlari atlaniyor")
+    if sb_count == 0:
+        skip_prefixes.append("sb_")
+        logger.info("SMART-SKIP: SB kampanya yok → SB raporlari atlaniyor")
+    if sd_count == 0:
+        skip_prefixes.append("sd_")
+        logger.info("SMART-SKIP: SD kampanya yok → SD raporlari atlaniyor")
+
+    if skip_prefixes:
+        report_tasks = [t for t in all_report_tasks if not any(t[0].startswith(p) for p in skip_prefixes)]
+        skipped_reports = [t[0] for t in all_report_tasks if any(t[0].startswith(p) for p in skip_prefixes)]
+        skipped_count = len(all_report_tasks) - len(report_tasks)
+        logger.info("SMART-SKIP: %d/%d rapor atlanacak, %d rapor cekilecek. Atlananlar: %s",
+                    skipped_count, len(all_report_tasks), len(report_tasks),
+                    ", ".join(skipped_reports))
+        R["uyarilar"].append(f"SMART-SKIP: {skipped_count} rapor atlandi (kampanya yok): {', '.join(skipped_reports)}")
+    else:
+        report_tasks = all_report_tasks
+
+    logger.info("=== PERFORMANS RAPORLARI (%d rapor, fire-all-then-poll) ===", len(report_tasks))
 
     failed_tasks = []
     empty_tasks = []
@@ -1242,13 +1277,13 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
     # Hatali raporlar: 3 deneme (artan bekleme)
     # Bos raporlar: 1 deneme (bossa gecerli kabul et)
     # ==================================================================
-    RETRY_DELAYS = [60, 120, 240]
+    RETRY_DELAYS = [120, 240, 300]
     MAX_RETRIES = len(RETRY_DELAYS)
 
     # --- 5a: Bos raporlari 1 kez tekrar dene ---
     if empty_tasks:
         logger.info("=== BOS RAPOR RETRY: %d rapor 1 kez tekrar deneniyor ===", len(empty_tasks))
-        await asyncio.sleep(60)
+        await asyncio.sleep(120)
 
         for name, ad_prod_enum, rtype, gby, cols, days, ad_label, tunit in empty_tasks:
             key_name = f"{name}_{days}d"
@@ -1369,7 +1404,7 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
     )
 
     R["teknik_ozet"] = {
-        "toplam_islem": f"{toplam}/26",
+        "toplam_islem": f"{toplam}/{17 + len(report_tasks)}",
         "basarili": R["basarili"],
         "basarisiz": R["basarisiz"],
         "cache_kullanildi": R["atlanan"],
@@ -1383,7 +1418,7 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
 
     R["ozet_mesaj"] = (
         f"Agent 1 v11 tamamlandi. "
-        f"Toplam: {toplam}/26 | Basarili: {R['basarili']} | Basarisiz: {R['basarisiz']} | Cache: {R['atlanan']}. "
+        f"Toplam: {toplam}/{17 + len(report_tasks)} | Basarili: {R['basarili']} | Basarisiz: {R['basarisiz']} | Cache: {R['atlanan']}. "
         f"Dolu rapor: {len(dolu_raporlar)} | Bos rapor: {len(bos_raporlar)} | Hatali: {len(hatali_raporlar)} | "
         f"Retry yapilan: {len(retry_raporlar)}. "
         f"Entity: {entity_ozet}"

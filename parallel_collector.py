@@ -63,10 +63,10 @@ def get_data_dir(hesap_key, marketplace):
 # ============================================================================
 
 RETRY_MAX = 3
-RETRY_RATE_LIMIT_WAIT = 30
+RETRY_RATE_LIMIT_WAIT = 60
 RETRY_TIMEOUT_WAIT = 15
 REPORT_MAX_WAIT = 900
-REPORT_POLL_INTERVAL = 15
+REPORT_POLL_INTERVAL = 90     # v12: 15 → 90 sn (429 riskini %83 azaltir)
 REPORTING_CONTENT_TYPE = "application/vnd.createasyncreportrequest.v3+json"
 
 
@@ -560,17 +560,37 @@ async def collect_marketplace(client, data_dir, label):
         collect_list_throttled("sd_targets", "/sd/targets", ["enabled", "paused"], "targets", method="GET"),
     ]
 
-    await asyncio.gather(*entity_coros)
+    entity_results = await asyncio.gather(*entity_coros)
 
-    logger.info("[%s] Entity tamamlandi. Raporlar basliyor (fire-all-then-poll)...", label)
+    # Entity sonuclarindan kampanya sayilarini cikar (smart-skip icin)
+    entity_names = [
+        "portfolios",
+        "sp_campaigns", "sp_ad_groups", "sp_product_ads", "sp_keywords", "sp_targets",
+        "sp_negative_keywords", "sp_campaign_negative_keywords", "sp_negative_targets",
+        "sb_campaigns", "sb_ad_groups", "sb_keywords", "sb_targets", "sb_negative_keywords",
+        "sd_campaigns", "sd_ad_groups", "sd_targets",
+    ]
+    entity_map = dict(zip(entity_names, entity_results))
+    sp_count = len(entity_map.get("sp_campaigns", []))
+    sb_count = len(entity_map.get("sb_campaigns", []))
+    sd_count = len(entity_map.get("sd_campaigns", []))
+
+    logger.info("[%s] Entity tamamlandi. Kampanya sayilari: SP=%d, SB=%d, SD=%d",
+                label, sp_count, sb_count, sd_count)
 
     # ---- OPTIMIZASYON 2: FIRE-ALL-THEN-POLL ----
     # Faz 1 (FIRE): Tum rapor isteklerini 2'li batch'ler halinde gonder
     #   → Amazon hepsini AYNI ANDA uretmeye baslar
     # Faz 2 (POLL): Tum raporlari birlikte poll et
-    #   → Toplam sure = max(9 rapor suresi), sum degil!
+    #   → Toplam sure = max(rapor suresi), sum degil!
 
-    report_tasks = [
+    # ---- OPTIMIZASYON 3: SMART-SKIP ----
+    # Kampanyasi olmayan reklam tiplerinin raporlarini ATLA.
+    # sb_campaigns=0 → SB raporlari bosuna istenmesin.
+    # sd_campaigns=0 → SD raporlari bosuna istenmesin.
+    # Marketplace basina 30-60 dk tasarruf (bos rapor poll + retry suresi).
+
+    all_report_tasks = [
         # SP: targeting_14d + search_term_30d
         ("sp_targeting_report", "SPONSORED_PRODUCTS", "spTargeting", ["targeting"], SP_TARGETING_COLS, 14, "SUMMARY"),
         ("sp_search_term_report", "SPONSORED_PRODUCTS", "spSearchTerm", ["searchTerm"], SP_SEARCH_TERM_COLS, 30, "SUMMARY"),
@@ -585,6 +605,28 @@ async def collect_marketplace(client, data_dir, label):
         ("sb_campaign_report", "SPONSORED_BRANDS", "sbCampaigns", ["campaign"], SB_CAMPAIGN_COLS, 14, "DAILY"),
         ("sd_campaign_report", "SPONSORED_DISPLAY", "sdCampaigns", ["campaign"], SD_CAMPAIGN_COLS, 14, "DAILY"),
     ]
+
+    # Kampanyasi olmayan tiplerin raporlarini filtrele
+    skip_prefixes = []
+    if sp_count == 0:
+        skip_prefixes.append("sp_")
+        logger.info("[%s] SMART-SKIP: SP kampanya yok → SP raporlari atlaniyor", label)
+    if sb_count == 0:
+        skip_prefixes.append("sb_")
+        logger.info("[%s] SMART-SKIP: SB kampanya yok → SB raporlari atlaniyor", label)
+    if sd_count == 0:
+        skip_prefixes.append("sd_")
+        logger.info("[%s] SMART-SKIP: SD kampanya yok → SD raporlari atlaniyor", label)
+
+    if skip_prefixes:
+        report_tasks = [t for t in all_report_tasks if not any(t[0].startswith(p) for p in skip_prefixes)]
+        skipped_count = len(all_report_tasks) - len(report_tasks)
+        logger.info("[%s] SMART-SKIP: %d/%d rapor atlanacak, %d rapor cekilecek",
+                    label, skipped_count, len(all_report_tasks), len(report_tasks))
+    else:
+        report_tasks = all_report_tasks
+
+    logger.info("[%s] Raporlar basliyor (fire-all-then-poll, %d rapor)...", label, len(report_tasks))
 
     failed_tasks = []
     empty_tasks = []
@@ -628,7 +670,7 @@ async def collect_marketplace(client, data_dir, label):
 
         # 2'li batch arasi bekleme (rate limit koruma — ayni BATCH_SIZE=2 kurali)
         if i + 2 < len(report_tasks) and fire_coros:
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
     if skipped:
         logger.info("[%s] %d rapor cache'den (atlanildi): %s", label, len(skipped), ", ".join(skipped))
@@ -673,11 +715,11 @@ async def collect_marketplace(client, data_dir, label):
                 empty_tasks.append(task_tuple)
 
     # ----- RETRY: Bos raporlar 1 kez, hatali raporlar 3 kez -----
-    RETRY_DELAYS = [60, 120, 240]
+    RETRY_DELAYS = [120, 240, 300]
 
     if empty_tasks:
         logger.info("[%s] BOS RETRY: %d rapor 1 kez tekrar deneniyor...", label, len(empty_tasks))
-        await asyncio.sleep(60)
+        await asyncio.sleep(120)
         for name, ap, rt, gb, cols, days, tunit in empty_tasks:
             key = f"{name}_{days}d"
             fname = f"{today}_{key}.json"
