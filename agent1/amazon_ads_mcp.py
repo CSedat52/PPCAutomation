@@ -142,8 +142,8 @@ MARKETPLACE_CONFIG = {
     },
 }
 
-REPORT_MAX_WAIT = 900
-REPORT_POLL_INTERVAL = 90     # v12: 15 → 90 sn (429 riskini %83 azaltir)
+REPORT_MAX_WAIT = 1200
+REPORT_POLL_INTERVAL = 45     # v12: 90 → 45 sn (1200s'de 27 poll, 429 riski dusuk)
 RETRY_MAX = 3              # v7: 2 → 3 (daha fazla sans)
 RETRY_RATE_LIMIT_WAIT = 60
 RETRY_TIMEOUT_WAIT = 15    # v7: 10 → 15 sn

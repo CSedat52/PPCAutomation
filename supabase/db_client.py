@@ -951,72 +951,288 @@ class SupabaseClient:
         )
 
     # ==========================================
-    # KPI DAILY — Dashboard ozet tablosu
+    # KPI DAILY — 13 KAMPANYA TIPI DESTEKLI
     # ==========================================
 
-    def upsert_kpi_daily(self, hesap_key: str, mp: str, collection_date: str):
-        """
-        Belirli hesap/marketplace icin campaign_reports'tan (DAILY)
-        kpi_daily tablosunu gunceller.
+    def upsert_kpi_daily(self, hesap_key, mp, date_str=None):
+        from collections import Counter
+        if not date_str:
+            date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        data_dir = _project_root / "data" / f"{hesap_key}_{mp}"
+        if not data_dir.exists():
+            logger.error("KPI: data klasoru yok: %s", data_dir)
+            return 0
 
-        campaign_reports'ta report_date = her gunun tarihi (timeUnit=DAILY).
-        Bu metod report_date bazinda gruplayarak kpi_daily'ye yazar.
-        14 gunluk rapor = 14 satir UPSERT.
-        """
-        sql = """
-            INSERT INTO kpi_daily (
-                hesap_key, marketplace, report_date,
-                spend, sales, clicks, impressions, orders,
-                acos, roas, ctr, cvr, campaign_count, updated_at
-            )
-            SELECT
-                hesap_key,
-                marketplace,
-                report_date,
-                COALESCE(SUM(cost), 0),
-                COALESCE(SUM(sales), 0),
-                COALESCE(SUM(clicks), 0),
-                COALESCE(SUM(impressions), 0),
-                COALESCE(SUM(purchases), 0),
-                CASE WHEN SUM(sales) > 0
-                     THEN ROUND((SUM(cost) / SUM(sales)) * 100, 2)
-                     ELSE 0
-                END,
-                CASE WHEN SUM(cost) > 0
-                     THEN ROUND(SUM(sales) / SUM(cost), 2)
-                     ELSE 0
-                END,
-                CASE WHEN SUM(impressions) > 0
-                     THEN ROUND((SUM(clicks)::numeric / SUM(impressions)) * 100, 4)
-                     ELSE 0
-                END,
-                CASE WHEN SUM(clicks) > 0
-                     THEN ROUND((SUM(purchases)::numeric / SUM(clicks)) * 100, 4)
-                     ELSE 0
-                END,
-                COUNT(DISTINCT campaign_id),
-                NOW()
-            FROM campaign_reports
-            WHERE hesap_key = %s
-              AND marketplace = %s
-              AND collection_date = %s
-              AND report_date IS NOT NULL
-            GROUP BY hesap_key, marketplace, report_date
-            ON CONFLICT (hesap_key, marketplace, report_date)
-            DO UPDATE SET
-                spend = EXCLUDED.spend,
-                sales = EXCLUDED.sales,
-                clicks = EXCLUDED.clicks,
-                impressions = EXCLUDED.impressions,
-                orders = EXCLUDED.orders,
-                acos = EXCLUDED.acos,
-                roas = EXCLUDED.roas,
-                ctr = EXCLUDED.ctr,
-                cvr = EXCLUDED.cvr,
-                campaign_count = EXCLUDED.campaign_count,
-                updated_at = NOW();
-        """
-        return self._execute(sql, (hesap_key, mp, collection_date))
+        def _load(fn):
+            fp = data_dir / fn
+            if not fp.exists():
+                return []
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                return d if isinstance(d, list) else []
+            except Exception:
+                return []
+
+        logger.info("KPI SYNC: %s/%s (%s)", hesap_key, mp, date_str)
+        sp_map = self._classify_sp(date_str, _load)
+        sb_map = self._classify_sb(date_str, _load)
+        sd_map = self._classify_sd(date_str, _load)
+
+        # Portfolio eslestirme
+        pf_names = {str(p.get("portfolioId", "")): p["name"]
+                    for p in _load(f"{date_str}_portfolios.json") if p.get("name")}
+        pf_map = {}
+        for pre in ("sp", "sb", "sd"):
+            for c in _load(f"{date_str}_{pre}_campaigns.json"):
+                cid = str(c.get("campaignId", ""))
+                pid = str(c.get("portfolioId", ""))
+                if cid and pid:
+                    pf_map[cid] = (pid, pf_names.get(pid))
+
+        rows = []
+        for r in _load(f"{date_str}_sp_campaign_report_14d.json"):
+            cid = str(r.get("campaignId", ""))
+            pid, pn = pf_map.get(cid, (None, None))
+            rows.append((
+                r.get("date"), hesap_key, mp,
+                sp_map.get(cid, "SP-Other"), pid, pn,
+                self._safe_numeric(r.get("cost")),
+                self._safe_numeric(r.get("sales14d")),
+                self._safe_int(r.get("clicks")),
+                self._safe_int(r.get("purchases14d")),
+                self._safe_int(r.get("impressions")),
+                self._safe_int(r.get("unitsSoldClicks14d")),
+            ))
+
+        for r in _load(f"{date_str}_sb_campaign_report_14d.json"):
+            cid = str(r.get("campaignId", ""))
+            pid, pn = pf_map.get(cid, (None, None))
+            rows.append((
+                r.get("date"), hesap_key, mp,
+                sb_map.get(cid, "SB-Other"), pid, pn,
+                self._safe_numeric(r.get("cost")),
+                self._safe_numeric(r.get("sales")),
+                self._safe_int(r.get("clicks")),
+                self._safe_int(r.get("purchases") or r.get("purchasesClicks")),
+                self._safe_int(r.get("impressions")),
+                self._safe_int(r.get("unitsSold")),
+            ))
+
+        for r in _load(f"{date_str}_sd_campaign_report_14d.json"):
+            cid = str(r.get("campaignId", ""))
+            pid, pn = pf_map.get(cid, (None, None))
+            rows.append((
+                r.get("date"), hesap_key, mp,
+                sd_map.get(cid, "SD-Other"), pid, pn,
+                self._safe_numeric(r.get("cost")),
+                self._safe_numeric(r.get("sales")),
+                self._safe_int(r.get("clicks")),
+                self._safe_int(r.get("purchases") or r.get("purchasesClicks")),
+                self._safe_int(r.get("impressions")),
+                self._safe_int(r.get("unitsSold")),
+            ))
+
+        if not rows:
+            logger.warning("KPI: veri yok")
+            return 0
+
+        agg = {}
+        for (rd, hk, m, ct, pid, pn, sp, sa, cl, od, im, un) in rows:
+            key = (rd, hk, m, ct, pid)
+            if key not in agg:
+                agg[key] = [rd, hk, m, ct, pid, pn, 0.0, 0.0, 0, 0, 0, 0]
+            a = agg[key]
+            a[6] += (sp or 0)
+            a[7] += (sa or 0)
+            a[8] += (cl or 0)
+            a[9] += (od or 0)
+            a[10] += (im or 0)
+            a[11] += (un or 0)
+            if not a[5] and pn:
+                a[5] = pn
+
+        agg_rows = []
+        for a in agg.values():
+            a[6] = round(a[6], 2)
+            a[7] = round(a[7], 2)
+            agg_rows.append(tuple(a))
+
+        logger.info("KPI: %d ham -> %d aggregate", len(rows), len(agg_rows))
+
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            sql = """
+                INSERT INTO kpi_daily (
+                    report_date, hesap_key, marketplace, campaign_type,
+                    portfolio_id, portfolio_name,
+                    spend, sales, clicks, orders, impressions, units_sold, updated_at
+                ) VALUES %s
+                ON CONFLICT (report_date, hesap_key, marketplace, campaign_type, portfolio_id)
+                DO UPDATE SET
+                    portfolio_name = EXCLUDED.portfolio_name,
+                    spend = EXCLUDED.spend, sales = EXCLUDED.sales,
+                    clicks = EXCLUDED.clicks, orders = EXCLUDED.orders,
+                    impressions = EXCLUDED.impressions, units_sold = EXCLUDED.units_sold,
+                    updated_at = NOW()
+            """
+            execute_values(cur, sql, agg_rows,
+                           template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
+                           page_size=500)
+            count = cur.rowcount
+            cur.close()
+            logger.info("KPI: %d satir upsert (%s/%s)", count, hesap_key, mp)
+            return count
+        except Exception as e:
+            logger.error("KPI upsert hatasi: %s", e)
+            return 0
+        finally:
+            conn.close()
+
+    def _classify_sp(self, date_str, _load):
+        from collections import Counter
+        SP_ASIN = {"ASIN_SAME_AS", "ASIN_EXPANDED_FROM"}
+        SP_CAT = {"ASIN_CATEGORY_SAME_AS"}
+        SP_AUTO = {"QUERY_HIGH_REL_MATCHES", "QUERY_BROAD_REL_MATCHES",
+                   "ASIN_ACCESSORY_RELATED", "ASIN_SUBSTITUTE_RELATED"}
+        camp_tt = {str(c["campaignId"]): c.get("targetingType", "MANUAL")
+                   for c in _load(f"{date_str}_sp_campaigns.json") if c.get("campaignId")}
+        camp_kw = {}
+        for k in _load(f"{date_str}_sp_keywords.json"):
+            cid = str(k.get("campaignId", ""))
+            mt = k.get("matchType", "")
+            if cid and mt:
+                camp_kw.setdefault(cid, Counter())[mt] += 1
+        camp_tgt = {}
+        for t in _load(f"{date_str}_sp_targets.json"):
+            cid = str(t.get("campaignId", ""))
+            for e in (t.get("expression") or []):
+                if not isinstance(e, dict):
+                    continue
+                et = e.get("type", "")
+                if et in SP_ASIN:
+                    camp_tgt.setdefault(cid, set()).add("ASIN")
+                elif et in SP_CAT:
+                    camp_tgt.setdefault(cid, set()).add("CATEGORY")
+                elif et in SP_AUTO:
+                    camp_tgt.setdefault(cid, set()).add("AUTO")
+        result = {}
+        for cid, tt in camp_tt.items():
+            if tt == "AUTO":
+                result[cid] = "SP-Auto"
+                continue
+            kw = camp_kw.get(cid)
+            tg = camp_tgt.get(cid, set())
+            has_kw = kw and sum(kw.values()) > 0
+            if has_kw and "ASIN" not in tg and "CATEGORY" not in tg:
+                result[cid] = f"SP-{kw.most_common(1)[0][0].capitalize()}"
+            elif "ASIN" in tg and not has_kw and "CATEGORY" not in tg:
+                result[cid] = "SP-ASIN"
+            elif "CATEGORY" in tg and not has_kw and "ASIN" not in tg:
+                result[cid] = "SP-Category"
+            elif "ASIN" in tg and "CATEGORY" in tg:
+                result[cid] = "SP-ASIN"
+            elif has_kw:
+                result[cid] = f"SP-{kw.most_common(1)[0][0].capitalize()}"
+            elif "AUTO" in tg:
+                result[cid] = "SP-Auto"
+            else:
+                result[cid] = "SP-Other"
+        return result
+
+    def _classify_sb(self, date_str, _load):
+        kw_cids = {str(k["campaignId"]) for k in _load(f"{date_str}_sb_keywords.json")
+                   if k.get("campaignId")}
+        camp_tgt = {}
+        for t in _load(f"{date_str}_sb_targets.json"):
+            cid = str(t.get("campaignId", ""))
+            for e in (t.get("expressions") or t.get("expression") or []):
+                if not isinstance(e, dict):
+                    continue
+                et = e.get("type", "").lower()
+                if "asinsameas" in et:
+                    camp_tgt.setdefault(cid, set()).add("ASIN")
+                elif "asincategorysameas" in et:
+                    camp_tgt.setdefault(cid, set()).add("CATEGORY")
+        all_cids = {str(c["campaignId"]) for c in _load(f"{date_str}_sb_campaigns.json")
+                    if c.get("campaignId")}
+        all_cids.update(kw_cids)
+        all_cids.update(camp_tgt.keys())
+        result = {}
+        for cid in all_cids:
+            tg = camp_tgt.get(cid, set())
+            if cid in kw_cids:
+                result[cid] = "SB-Keyword"
+            elif "ASIN" in tg:
+                result[cid] = "SB-ASIN"
+            elif "CATEGORY" in tg:
+                result[cid] = "SB-Category"
+            else:
+                result[cid] = "SB-Other"
+        return result
+
+    def _classify_sd(self, date_str, _load):
+        all_cids = {str(c["campaignId"]) for c in _load(f"{date_str}_sd_campaigns.json")
+                    if c.get("campaignId")}
+        camp_types = {}
+        for t in _load(f"{date_str}_sd_targets.json"):
+            cid = str(t.get("campaignId", ""))
+            all_cids.add(cid)
+            exprs = t.get("expression") or []
+            if not exprs or not isinstance(exprs[0], dict):
+                continue
+            main = exprs[0].get("type", "")
+            vals = exprs[0].get("value", [])
+            subs = set()
+            if isinstance(vals, list):
+                for v in vals:
+                    if isinstance(v, dict):
+                        subs.add(v.get("type", ""))
+            if main == "audience":
+                camp_types.setdefault(cid, set()).add("AUDIENCE")
+            elif main == "similarProduct":
+                camp_types.setdefault(cid, set()).add("PRODUCT")
+            elif main == "asinCategorySameAs":
+                camp_types.setdefault(cid, set()).add("CONTEXTUAL")
+            elif main in ("purchases", "views"):
+                if "asinCategorySameAs" in subs:
+                    camp_types.setdefault(cid, set()).add("CONTEXTUAL")
+                elif "exactProduct" in subs or "relatedProduct" in subs:
+                    camp_types.setdefault(cid, set()).add("RETARGETING")
+                elif "similarProduct" in subs:
+                    camp_types.setdefault(cid, set()).add("PRODUCT")
+                else:
+                    camp_types.setdefault(cid, set()).add("RETARGETING")
+        result = {}
+        for cid in all_cids:
+            tg = camp_types.get(cid, set())
+            if "AUDIENCE" in tg:
+                result[cid] = "SD-Audience"
+            elif "RETARGETING" in tg:
+                result[cid] = "SD-Retargeting"
+            elif "CONTEXTUAL" in tg:
+                result[cid] = "SD-Contextual"
+            elif "PRODUCT" in tg:
+                result[cid] = "SD-Product"
+            else:
+                result[cid] = "SD-Other"
+        return result
+
+    def upsert_kpi_daily_all(self, date_str=None):
+        accounts_path = _project_root / "config" / "accounts.json"
+        if not accounts_path.exists():
+            logger.error("accounts.json bulunamadi")
+            return 0
+        with open(accounts_path) as f:
+            accounts = json.load(f)
+        total = 0
+        for hk, h in accounts.get("hesaplar", {}).items():
+            for mp, cfg in h.get("marketplaces", {}).items():
+                if cfg.get("aktif"):
+                    total += (self.upsert_kpi_daily(hk, mp, date_str) or 0)
+        logger.info("KPI TOPLAM: %d satir", total)
+        return total
 
     # ==========================================
     # HESAP YONETIMI

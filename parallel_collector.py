@@ -5,9 +5,9 @@ Tum hesaplarin Agent 1 verilerini paralel toplar.
 
 Strateji:
   - Farkli hesaplar (vigowood_na, vigowood_eu, qmmp_na) TAMAMEN PARALEL
-  - Ayni hesaptaki marketplace'ler BATCH halinde (rate limit koruma)
+  - Ayni hesaptaki marketplace'ler de TAMAMEN PARALEL (batch YOK)
     vigowood_na: US + CA ayni anda
-    vigowood_eu: (UK,SE) → (DE,PL) → (FR,NL) → (ES,IT) yogun+hafif eslestirme
+    vigowood_eu: UK, DE, FR, ES, IT, SE, PL, NL hepsi ayni anda
     qmmp_na: US + CA ayni anda
 
 Kullanim:
@@ -65,8 +65,8 @@ def get_data_dir(hesap_key, marketplace):
 RETRY_MAX = 3
 RETRY_RATE_LIMIT_WAIT = 60
 RETRY_TIMEOUT_WAIT = 15
-REPORT_MAX_WAIT = 900
-REPORT_POLL_INTERVAL = 90     # v12: 15 → 90 sn (429 riskini %83 azaltir)
+REPORT_MAX_WAIT = 1200
+REPORT_POLL_INTERVAL = 45     # v12: 90 → 45 sn (1200s'de 27 poll, 429 riski dusuk)
 REPORTING_CONTENT_TYPE = "application/vnd.createasyncreportrequest.v3+json"
 
 
@@ -778,41 +778,38 @@ async def collect_marketplace(client, data_dir, label):
 # HESAP BAZLI PARALEL CALISTIRMA
 # ============================================================================
 
-async def run_account(hesap_key, hesap, lwa, marketplace_batch):
-    """Bir hesabin marketplace batch'ini sirayla calistirir."""
+async def run_account(hesap_key, hesap, lwa, mp_list):
+    """Bir hesabin TUM marketplace'lerini PARALEL calistirir (batch YOK)."""
     results = {}
-    for batch in marketplace_batch:
-        coros = []
-        for mp_code in batch:
-            mp_config = hesap["marketplaces"][mp_code]
-            config = {
-                "client_id": lwa["client_id"],
-                "client_secret": lwa["client_secret"],
-                "refresh_token": hesap["refresh_token"],
-                "marketplace": mp_code,
-                "profile_id": mp_config["profile_id"],
-                "account_id": hesap["account_id"],
-                "api_endpoint": hesap["api_endpoint"],
-                "token_endpoint": hesap["token_endpoint"],
-            }
-            client = AmazonAdsClient(config)
-            data_dir = get_data_dir(hesap_key, mp_code)
-            label = f"{hesap_key}/{mp_code}"
-            coros.append(collect_marketplace(client, data_dir, label))
+    coros = []
+    mp_codes = []
 
-        batch_results = await asyncio.gather(*coros, return_exceptions=True)
+    for mp_code in mp_list:
+        mp_config = hesap["marketplaces"][mp_code]
+        config = {
+            "client_id": lwa["client_id"],
+            "client_secret": lwa["client_secret"],
+            "refresh_token": hesap["refresh_token"],
+            "marketplace": mp_code,
+            "profile_id": mp_config["profile_id"],
+            "account_id": hesap["account_id"],
+            "api_endpoint": hesap["api_endpoint"],
+            "token_endpoint": hesap["token_endpoint"],
+        }
+        client = AmazonAdsClient(config)
+        data_dir = get_data_dir(hesap_key, mp_code)
+        label = f"{hesap_key}/{mp_code}"
+        coros.append(collect_marketplace(client, data_dir, label))
+        mp_codes.append(mp_code)
 
-        for mp_code, result in zip(batch, batch_results):
-            if isinstance(result, Exception):
-                logger.error("[%s/%s] EXCEPTION: %s", hesap_key, mp_code, result)
-                results[mp_code] = {"basarisiz": 1, "hata": str(result)}
-            else:
-                results[mp_code] = result
+    all_results = await asyncio.gather(*coros, return_exceptions=True)
 
-        # Batch arasi bekleme (ayni hesap, rate limit koruma)
-        if batch != marketplace_batch[-1]:
-            logger.info("[%s] Batch arasi 10s bekleniyor (rate limit)...", hesap_key)
-            await asyncio.sleep(10)
+    for mp_code, result in zip(mp_codes, all_results):
+        if isinstance(result, Exception):
+            logger.error("[%s/%s] EXCEPTION: %s", hesap_key, mp_code, result)
+            results[mp_code] = {"basarisiz": 1, "hata": str(result)}
+        else:
+            results[mp_code] = result
 
     return results
 
@@ -855,15 +852,7 @@ async def run_all(targets=None):
         logger.info("Calistirilacak hesap yok.")
         return
 
-    # Hesap bazli marketplace batch'leri olustur
-    # EU: yogun+hafif eslestirme (rate limit dengeli dagilim)
-    EU_BATCHES = [
-        ["UK", "SE"],   # 1. + 8. (en yogun + en hafif)
-        ["DE", "PL"],   # 2. + 7.
-        ["FR", "NL"],   # 3. + 6.
-        ["ES", "IT"],   # 4. + 5.
-    ]
-
+    # Hesap bazli marketplace listesi (batch YOK — tum marketplace'ler paralel)
     account_tasks = {}
 
     for hesap_key, mp_list in target_map.items():
@@ -871,19 +860,7 @@ async def run_all(targets=None):
         if not hesap:
             logger.warning("Hesap bulunamadi: %s", hesap_key)
             continue
-
-        if hesap_key == "vigowood_eu":
-            batches = []
-            for pair in EU_BATCHES:
-                active_pair = [mp for mp in pair if mp in mp_list]
-                if active_pair:
-                    batches.append(active_pair)
-        else:
-            batches = []
-            for i in range(0, len(mp_list), 2):
-                batches.append(mp_list[i:i+2])
-
-        account_tasks[hesap_key] = (hesap, batches)
+        account_tasks[hesap_key] = (hesap, mp_list)
 
     if not account_tasks:
         logger.info("Calistirilacak hesap yok.")
@@ -893,9 +870,8 @@ async def run_all(targets=None):
     logger.info("  PARALEL VERI TOPLAYICI")
     logger.info("=" * 60)
     logger.info("  %d hesap, toplam marketplace'ler:", len(account_tasks))
-    for hk, (hesap, batches) in account_tasks.items():
-        flat = [mp for b in batches for mp in b]
-        logger.info("    %s: %s (%d batch)", hk, ", ".join(flat), len(batches))
+    for hk, (hesap, mp_list) in account_tasks.items():
+        logger.info("    %s: %s (tumu paralel)", hk, ", ".join(mp_list))
     logger.info("=" * 60)
 
     start_time = time.time()
@@ -903,8 +879,8 @@ async def run_all(targets=None):
     # Her hesap icin paralel task olustur
     coros = []
     hesap_keys = []
-    for hesap_key, (hesap, batches) in account_tasks.items():
-        coros.append(run_account(hesap_key, hesap, lwa, batches))
+    for hesap_key, (hesap, mp_list) in account_tasks.items():
+        coros.append(run_account(hesap_key, hesap, lwa, mp_list))
         hesap_keys.append(hesap_key)
 
     all_results = await asyncio.gather(*coros, return_exceptions=True)
