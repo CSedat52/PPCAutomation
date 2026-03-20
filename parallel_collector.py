@@ -791,23 +791,61 @@ async def collect_marketplace(client, data_dir, label):
         for h in R["hatalar"]:
             logger.warning("[%s] Hata: %s", label, h)
 
-    # Supabase sync: KPI daily + targeting reports + search term reports
+    # Supabase sync: Entity upsert + rapor insert + KPI daily
     try:
         import sys as _sys
         _base = str(BASE_DIR)
         if _base not in _sys.path:
             _sys.path.insert(0, _base)
         from supabase.db_client import SupabaseClient
+        import json as _json
         db = SupabaseClient()
         hesap_mp = label.split("/")  # label = "vigowood_eu/UK"
         if len(hesap_mp) == 2:
             hesap_key, marketplace = hesap_mp[0], hesap_mp[1]
 
-            # KPI daily
-            db.upsert_kpi_daily(hesap_key, marketplace, today)
-            logger.info("[%s] KPI daily sync tamamlandi", label)
+            def _load_local(suffix):
+                fp = data_dir / f"{today}_{suffix}.json"
+                if fp.exists():
+                    with open(fp, "r", encoding="utf-8") as _f:
+                        d = _json.load(_f)
+                    return d if isinstance(d, list) else []
+                return []
 
-            # Targeting reports + search term reports
+            # --- Entity UPSERT (kampanya, ad group, keyword, target, product_ads, portfolio, negatifler) ---
+            entity_ops = [
+                ("portfolios", lambda d: db.upsert_portfolios(hesap_key, marketplace, d)),
+                ("sp_campaigns", lambda d: db.upsert_campaigns(hesap_key, marketplace, "SP", d)),
+                ("sb_campaigns", lambda d: db.upsert_campaigns(hesap_key, marketplace, "SB", d)),
+                ("sd_campaigns", lambda d: db.upsert_campaigns(hesap_key, marketplace, "SD", d)),
+                ("sp_ad_groups", lambda d: db.upsert_ad_groups(hesap_key, marketplace, "SP", d)),
+                ("sb_ad_groups", lambda d: db.upsert_ad_groups(hesap_key, marketplace, "SB", d)),
+                ("sd_ad_groups", lambda d: db.upsert_ad_groups(hesap_key, marketplace, "SD", d)),
+                ("sp_keywords", lambda d: db.upsert_keywords(hesap_key, marketplace, "SP", d)),
+                ("sb_keywords", lambda d: db.upsert_keywords(hesap_key, marketplace, "SB", d)),
+                ("sp_targets", lambda d: db.upsert_targets(hesap_key, marketplace, "SP", d)),
+                ("sb_targets", lambda d: db.upsert_targets(hesap_key, marketplace, "SB", d)),
+                ("sd_targets", lambda d: db.upsert_targets(hesap_key, marketplace, "SD", d)),
+                ("sp_product_ads", lambda d: db.upsert_product_ads(hesap_key, marketplace, d)),
+                ("sp_negative_keywords", lambda d: db.upsert_negative_keywords(hesap_key, marketplace, "SP", d, "AD_GROUP")),
+                ("sp_campaign_negative_keywords", lambda d: db.upsert_negative_keywords(hesap_key, marketplace, "SP", d, "CAMPAIGN")),
+                ("sb_negative_keywords", lambda d: db.upsert_negative_keywords(hesap_key, marketplace, "SB", d, "AD_GROUP")),
+                ("sp_negative_targets", lambda d: db.upsert_negative_targets(hesap_key, marketplace, d)),
+            ]
+            entity_count = 0
+            for suffix, fn in entity_ops:
+                data = _load_local(suffix)
+                if data:
+                    try:
+                        fn(data)
+                        entity_count += len(data)
+                    except Exception as ee:
+                        logger.warning("[%s] Entity sync hatasi [%s]: %s", label, suffix, ee)
+
+            if entity_count > 0:
+                logger.info("[%s] Entity sync: %d kayit", label, entity_count)
+
+            # --- Rapor INSERT (targeting + search_term + campaign raporlari) ---
             report_sync_map = [
                 (f"{today}_sp_targeting_report_14d.json", "SP", "14d", "targeting"),
                 (f"{today}_sb_targeting_report_14d.json", "SB", "14d", "targeting"),
@@ -815,23 +853,34 @@ async def collect_marketplace(client, data_dir, label):
                 (f"{today}_sd_targeting_report_30d.json", "SD", "30d", "targeting"),
                 (f"{today}_sp_search_term_report_30d.json", "SP", "30d", "search_term"),
                 (f"{today}_sb_search_term_report_30d.json", "SB", "30d", "search_term"),
+                (f"{today}_sp_campaign_report_14d.json", "SP", "14d", "campaign"),
+                (f"{today}_sb_campaign_report_14d.json", "SB", "14d", "campaign"),
+                (f"{today}_sd_campaign_report_14d.json", "SD", "14d", "campaign"),
             ]
+            report_count = 0
             for fname, ad_type, period, rtype in report_sync_map:
                 fpath = data_dir / fname
                 if fpath.exists():
                     try:
-                        import json as _json
                         with open(fpath, "r", encoding="utf-8") as _f:
                             rdata = _json.load(_f)
                         if isinstance(rdata, list) and len(rdata) > 0:
                             if rtype == "targeting":
                                 db.insert_targeting_reports(hesap_key, marketplace, ad_type, period, today, rdata)
-                            else:
+                            elif rtype == "search_term":
                                 db.insert_search_term_reports(hesap_key, marketplace, ad_type, today, rdata)
-                            logger.info("[%s] %s sync: %d satir", label, fname, len(rdata))
+                            elif rtype == "campaign":
+                                db.insert_campaign_reports(hesap_key, marketplace, ad_type, period, today, rdata)
+                            report_count += len(rdata)
                     except Exception as re:
-                        logger.warning("[%s] %s sync hatasi: %s", label, fname, re)
-            logger.info("[%s] Rapor sync tamamlandi", label)
+                        logger.warning("[%s] Rapor sync hatasi [%s]: %s", label, fname, re)
+
+            if report_count > 0:
+                logger.info("[%s] Rapor sync: %d satir", label, report_count)
+
+            # --- KPI daily agrega ---
+            db.upsert_kpi_daily(hesap_key, marketplace, today)
+            logger.info("[%s] Supabase sync tamamlandi (entity=%d, rapor=%d)", label, entity_count, report_count)
     except Exception as e:
         logger.warning("[%s] Supabase sync hatasi (collector devam eder): %s", label, e)
 
