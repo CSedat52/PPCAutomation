@@ -542,10 +542,9 @@ class SupabaseClient:
     def insert_negative_candidates(self, hesap_key: str, mp: str, analysis_date: str,
                                     data: list) -> int:
         cols = ["hesap_key", "marketplace", "analysis_date", "ad_type",
-                "campaign_id", "campaign_name", "ad_group_id",
-                "keyword_text", "targeting", "candidate_type",
-                "portfolio", "reason",
-                "impressions", "clicks", "cost", "sales", "acos",
+                "campaign_name", "portfolio", "search_term", "match_type",
+                "source", "reason",
+                "impressions", "clicks", "cost", "sales",
                 "cvr", "cpc",
                 "decision"]
         rows = []
@@ -553,19 +552,16 @@ class SupabaseClient:
             rows.append((
                 hesap_key, mp, analysis_date,
                 d.get("reklam_tipi", "SP"),
-                self._safe_str(d.get("campaign_id")),
                 d.get("kampanya"),
-                self._safe_str(d.get("ad_group_id")),
-                d.get("hedefleme"),
-                d.get("targeting"),
-                d.get("tip", "KEYWORD"),
                 d.get("portfolio"),
+                d.get("hedefleme") or d.get("search_term"),
+                d.get("match_type"),
+                d.get("tip", "KEYWORD"),
                 d.get("sebep") or d.get("reason"),
                 self._safe_int(d.get("impressions")),
                 self._safe_int(d.get("clicks")),
                 self._safe_numeric(d.get("spend") or d.get("cost")),
                 self._safe_numeric(d.get("sales")),
-                self._safe_numeric(d.get("acos")),
                 self._safe_numeric(d.get("cvr")),
                 self._safe_numeric(d.get("cpc")),
                 d.get("karar_durumu", "PENDING")
