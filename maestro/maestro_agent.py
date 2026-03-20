@@ -44,7 +44,7 @@ logger = logging.getLogger("maestro.agent")
 _maestro_base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _maestro_base not in sys.path:
     sys.path.insert(0, _maestro_base)
-from log_utils import save_error_log as _central_save_error_log
+from log_utils import save_error_log as _central_save_error_log, save_log as _save_log
 
 
 def _get_sdb():
@@ -136,6 +136,8 @@ def start_pipeline(hesap_key, marketplace, force=False):
             sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "starting", "running")
         except Exception:
             pass
+    _save_log("info", f"Pipeline basladi: {hesap_key}/{marketplace}",
+              "maestro", hesap_key, marketplace, session_id)
 
     # 3. Agent 1 calistir
     success = _run_agent1(state, session_id, hesap_key, marketplace)
@@ -150,10 +152,20 @@ def start_pipeline(hesap_key, marketplace, force=False):
     # 5. Onay bekleme
     logger.info("Agent 2 tamamlandi. Onay bekleme fazina geciliyor...")
     state_manager.update_session_status(state, "waiting_approval")
+    _save_log("info", "Excel onay bekleniyor — e-posta gonderildi",
+              "maestro", hesap_key, marketplace, session_id)
+    if sdb:
+        try:
+            sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "waiting_approval", "running")
+        except Exception:
+            pass
 
     approval_result = _wait_for_approval(state, session_id)
     if not approval_result:
         return _build_waiting_result(state, session_id, account_label)
+
+    _save_log("info", "Excel onayi alindi — Agent 3 basliyor",
+              "maestro", hesap_key, marketplace, session_id)
 
     # 6. Agent 3 calistir
     success = _run_agent3(state, session_id, hesap_key, marketplace)
@@ -171,6 +183,8 @@ def start_pipeline(hesap_key, marketplace, force=False):
             sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "completed", "completed")
         except Exception:
             pass
+    _save_log("info", f"Pipeline tamamlandi: {hesap_key}/{marketplace}",
+              "maestro", hesap_key, marketplace, session_id)
 
     _send_completion_email(state, session_id)
     state_manager.archive_session(state)
@@ -294,6 +308,8 @@ def _run_agent1(state, session_id, hesap_key, marketplace):
     logger.info("--- AGENT 1: Veri Toplama (%s/%s) ---", hesap_key, marketplace)
     state_manager.update_agent_status(state, "agent1", "running")
 
+    _save_log("info", f"Agent 1 basliyor: {hesap_key}/{marketplace}",
+              "agent1", hesap_key, marketplace, session_id)
     sdb = _get_sdb()
     if sdb:
         try:
@@ -312,13 +328,12 @@ def _run_agent1(state, session_id, hesap_key, marketplace):
             state, "agent1", "completed",
             summary=f"Veriler mevcut (tarih: {today})"
         )
+        _save_log("info", f"Agent 1 tamamlandi (cached, tarih: {today})",
+                  "agent1", hesap_key, marketplace, session_id)
         if sdb:
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "completed")
                 sdb.update_agent_status_detail("agent1", "completed", {"tasks": 0, "duration": "cached"})
-                sdb.insert_agent_log(hesap_key, marketplace, "agent1", {
-                    "level": "info", "message": f"Agent 1 cached (tarih: {today})", "session_id": session_id,
-                })
             except Exception:
                 pass
         return True
@@ -341,14 +356,12 @@ def _run_agent1(state, session_id, hesap_key, marketplace):
                 state, "agent1", "completed",
                 summary=f"{len(files)} dosya toplandi"
             )
+            _save_log("info", f"Agent 1 tamamlandi: {len(files)} dosya toplandi",
+                      "agent1", hesap_key, marketplace, session_id)
             if sdb:
                 try:
                     sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "completed")
                     sdb.update_agent_status_detail("agent1", "completed", {"tasks": len(files)})
-                    sdb.insert_agent_log(hesap_key, marketplace, "agent1", {
-                        "level": "info", "message": f"Agent 1 tamamlandi: {len(files)} dosya",
-                        "session_id": session_id,
-                    })
                 except Exception:
                     pass
             return True
@@ -366,14 +379,12 @@ def _run_agent1(state, session_id, hesap_key, marketplace):
                    adim="run_agent1",
                    extra={"agent": "agent1", "sebep": "timeout",
                           "bekleme_dk": max_wait_minutes})
+    _save_log("error", f"Agent 1 hatasi: {error_msg[:200]}",
+              "agent1", hesap_key, marketplace, session_id, error_type="AgentFailure")
     if sdb:
         try:
             sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "failed", error_msg=error_msg)
             sdb.update_agent_status_detail("agent1", "failed")
-            sdb.insert_agent_log(hesap_key, marketplace, "agent1", {
-                "level": "error", "message": error_msg[:200],
-                "error_type": "AgentFailure", "session_id": session_id,
-            })
         except Exception:
             pass
     email_handler.send_error(
@@ -388,6 +399,8 @@ def _run_agent2(state, session_id, hesap_key, marketplace):
     logger.info("--- AGENT 2: Analiz (%s/%s) ---", hesap_key, marketplace)
     state_manager.update_agent_status(state, "agent2", "running")
 
+    _save_log("info", f"Agent 2 basliyor: {hesap_key}/{marketplace}",
+              "agent2", hesap_key, marketplace, session_id)
     sdb = _get_sdb()
     if sdb:
         try:
@@ -429,16 +442,13 @@ def _run_agent2(state, session_id, hesap_key, marketplace):
         session["_agent2_full_summary"] = summary
 
         logger.info("Agent 2 tamamlandi: %s", state["current_session"]["agent2"]["summary"])
+        _save_log("info", f"Agent 2 tamamlandi: {summary.get('toplam_hedef', 0)} hedef analiz edildi",
+                  "agent2", hesap_key, marketplace, session_id)
         if sdb:
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent2", "completed")
                 sdb.update_agent_status_detail("agent2", "completed", {
                     "tasks": summary.get("toplam_hedef", 0) if isinstance(summary, dict) else 0,
-                })
-                sdb.insert_agent_log(hesap_key, marketplace, "agent2", {
-                    "level": "info",
-                    "message": f"Agent 2 tamamlandi",
-                    "session_id": session_id,
                 })
             except Exception:
                 pass
@@ -454,14 +464,12 @@ def _run_agent2(state, session_id, hesap_key, marketplace):
                        extra={"agent": "agent2", "error_type": error_type,
                               "attempts": attempts})
 
+        _save_log("error", f"Agent 2 hatasi: {error_msg[:200]}",
+                  "agent2", hesap_key, marketplace, session_id, error_type=error_type)
         if sdb:
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent2", "failed", error_msg=error_msg)
                 sdb.update_agent_status_detail("agent2", "failed")
-                sdb.insert_agent_log(hesap_key, marketplace, "agent2", {
-                    "level": "error", "message": error_msg[:200],
-                    "error_type": error_type, "session_id": session_id,
-                })
             except Exception:
                 pass
 
@@ -475,6 +483,8 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
     logger.info("--- AGENT 3: Execution (%s/%s) ---", hesap_key, marketplace)
     state_manager.update_agent_status(state, "agent3", "running")
 
+    _save_log("info", f"Agent 3 basliyor: {hesap_key}/{marketplace}",
+              "agent3", hesap_key, marketplace, session_id)
     sdb = _get_sdb()
     if sdb:
         try:
@@ -512,14 +522,12 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
                        extra={"agent": "agent3", "phase": "dry-run",
                               "error_type": error_type,
                               "attempts": error_info.get("attempts", 0) if error_info else 0})
+        _save_log("error", f"Agent 3 dry-run hatasi: {error_msg[:200]}",
+                  "agent3", hesap_key, marketplace, session_id, error_type=error_type)
         if sdb:
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", "failed", error_msg=error_msg)
                 sdb.update_agent_status_detail("agent3", "failed")
-                sdb.insert_agent_log(hesap_key, marketplace, "agent3", {
-                    "level": "error", "message": f"Agent 3 dry-run hatasi: {error_msg[:200]}",
-                    "error_type": error_type, "session_id": session_id,
-                })
             except Exception:
                 pass
         suggestion = retry_handler.get_error_suggestion(error_type)
@@ -574,14 +582,12 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
                        extra={"agent": "agent3", "phase": "execute",
                               "error_type": error_type,
                               "attempts": error_info.get("attempts", 0) if error_info else 0})
+        _save_log("error", f"Agent 3 execute hatasi: {error_msg[:200]}",
+                  "agent3", hesap_key, marketplace, session_id, error_type=error_type)
         if sdb:
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", "failed", error_msg=error_msg)
                 sdb.update_agent_status_detail("agent3", "failed")
-                sdb.insert_agent_log(hesap_key, marketplace, "agent3", {
-                    "level": "error", "message": f"Agent 3 execute hatasi: {error_msg[:200]}",
-                    "error_type": error_type, "session_id": session_id,
-                })
             except Exception:
                 pass
         email_handler.send_error(session_id, "Agent 3 (execute)", error_msg,
@@ -626,15 +632,13 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
     session["_agent3_verify_result"] = verify_result
     state_manager.save_state(state)
 
+    _save_log("info", f"Agent 3 tamamlandi: {exec_summary[:100]}",
+              "agent3", hesap_key, marketplace, session_id)
     if sdb:
         try:
             sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_verify", "completed")
             sdb.update_agent_status_detail("agent3", "completed", {
                 "tasks": exec_result.get("ozet", {}).get("toplam", 0) if isinstance(exec_result, dict) else 0,
-            })
-            sdb.insert_agent_log(hesap_key, marketplace, "agent3", {
-                "level": "info", "message": f"Agent 3 tamamlandi: {exec_summary[:100]}",
-                "session_id": session_id,
             })
         except Exception:
             pass

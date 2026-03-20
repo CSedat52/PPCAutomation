@@ -242,6 +242,37 @@ def save_error_log(hata_tipi, hata_mesaji, log_dir,
     return True
 
 
+def save_log(level, message, agent_name, hesap_key=None, marketplace=None,
+             session_id=None, error_type=None, traceback_str=None, extra=None):
+    """
+    Genel log fonksiyonu — info, warn, error tum seviyeleri destekler.
+    Sadece Supabase agent_logs tablosuna yazar (lokal JSON'a YAZMAZ).
+    Dashboard gorunurlugu icin.
+
+    level: "info", "warn", "error"
+    """
+    if not agent_name:
+        return
+    try:
+        from pathlib import Path as _Path
+        _project_root = str(_Path(__file__).parent)
+        import sys as _sys
+        if _project_root not in _sys.path:
+            _sys.path.insert(0, _project_root)
+        from supabase.db_client import SupabaseClient
+        _sdb = SupabaseClient()
+        _sdb._execute(
+            """INSERT INTO agent_logs (agent_id, level, message, error_type,
+                hesap_key, marketplace, session_id, traceback, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
+            (agent_name, level, str(message)[:500], error_type,
+             hesap_key, marketplace, session_id,
+             str(traceback_str)[:1000] if traceback_str else None)
+        )
+    except Exception:
+        pass  # Dashboard gorunurlugu icin — basarisiz olursa agent calismaya devam eder
+
+
 # ============================================================================
 # LOG ROTASYONU
 # ============================================================================
