@@ -151,7 +151,8 @@ def normalize_error_type(hata_tipi):
 def save_error_log(hata_tipi, hata_mesaji, log_dir,
                    traceback_str=None, adim=None, extra=None,
                    session_id=None, agent_name=None,
-                   max_kayit=200):
+                   max_kayit=200,
+                   hesap_key=None, marketplace=None):
     """
     Tum agentlar icin birlesik hata log fonksiyonu.
 
@@ -213,10 +214,32 @@ def save_error_log(hata_tipi, hata_mesaji, log_dir,
     try:
         with open(log_path, "w", encoding="utf-8") as f:
             json.dump(kayitlar, f, indent=2, ensure_ascii=False)
-        return True
     except Exception as e:
         logger.error("Hata logu yazilamadi %s: %s", log_path, e)
         return False
+
+    # ---- Supabase dual-write ----
+    if hesap_key and agent_name:
+        try:
+            from pathlib import Path as _Path
+            _project_root = str(_Path(__file__).parent)
+            import sys as _sys
+            if _project_root not in _sys.path:
+                _sys.path.insert(0, _project_root)
+            from supabase.db_client import SupabaseClient
+            _sdb = SupabaseClient()
+            _sdb._execute(
+                """INSERT INTO agent_logs (agent_id, level, message, error_type,
+                    hesap_key, marketplace, session_id, traceback, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
+                (agent_name, "error", str(hata_mesaji)[:500], hata_tipi,
+                 hesap_key, marketplace, session_id,
+                 str(traceback_str)[:1000] if traceback_str else None)
+            )
+        except Exception:
+            pass  # Supabase yazamazsa lokal zaten yazildi, sessizce devam et
+
+    return True
 
 
 # ============================================================================

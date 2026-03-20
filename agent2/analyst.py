@@ -50,6 +50,8 @@ from copy import deepcopy
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("agent2_analyst")
+sys.path.insert(0, str(Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
+from log_utils import save_error_log as _central_save_error_log
 
 # ============================================================================
 # DOSYA YOLLARI — hesap_key + marketplace'den dinamik olusturulur
@@ -1453,63 +1455,17 @@ def preflight_check(today):
 
 def save_error_log(hata_tipi, hata_mesaji, traceback_str=None, adim=None,
                    extra=None, session_id=None):
-    """
-    Agent 2 hatalarini data/logs/agent2_errors.json dosyasina ekler.
-    Agent 4 (Learning Agent) bu dosyayi okuyarak hata kaliplarini analiz eder.
-
-    Parametreler:
-        hata_tipi    : Ortak taksonomi:
-                       RateLimit, AuthError, ApiError, ServerError, NetworkError,
-                       FileNotFound, DataError, Preflight, ReportFailed, InternalError
-        hata_mesaji  : str(exception)
-        traceback_str: traceback.format_exc() ciktisi (opsiyonel)
-        adim         : Hatanin gerceklestigi adim (orn. "load_settings", "segmentize")
-        extra        : Ek baglam dict (orn. {"dosya": "settings.json", "asin": "B0..."})
-        session_id   : Pipeline session ID'si (Maestro korelasyonu icin)
-    """
+    """Agent 2 hata logu — lokal + Supabase dual-write."""
     log_dir = DATA_DIR / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "agent2_errors.json"
-
-    # Mevcut kayitlari yukle
-    try:
-        with open(log_path, "r", encoding="utf-8") as f:
-            kayitlar = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        kayitlar = []
-
-    # hata_tipi normalizasyonu — Python exception isimlerini ortak taksonomiye cevir
-    _NORM = {
-        "FileNotFoundError": "FileNotFound", "PermissionError": "FileNotFound",
-        "JSONDecodeError": "DataError", "KeyError": "DataError",
-        "ValueError": "DataError", "TypeError": "DataError", "IndexError": "DataError",
-        "ConnectionError": "NetworkError", "TimeoutError": "NetworkError",
-    }
-    normalized_tipi = _NORM.get(hata_tipi, hata_tipi)
-
-    kayit = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "hata_tipi": normalized_tipi,
-        "hata_mesaji": str(hata_mesaji)[:500],
-        "adim": adim or "bilinmiyor",
-    }
-    if traceback_str:
-        kayit["traceback"] = str(traceback_str)[:1000]
-    if extra:
-        kayit["extra"] = extra
-    if session_id:
-        kayit["session_id"] = session_id
-
-    kayitlar.append(kayit)
-
-    # Son 200 kaydi tut (eski hatalar otomatik temizlenir)
-    if len(kayitlar) > 200:
-        kayitlar = kayitlar[-200:]
-
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(kayitlar, f, indent=2, ensure_ascii=False)
-
-    logger.info("Hata logu kaydedildi: %s", log_path)
+    dir_name = DATA_DIR.name  # "vigowood_eu_UK"
+    parts = dir_name.rsplit("_", 1)
+    hk = parts[0] if len(parts) == 2 else ""
+    mp = parts[1] if len(parts) == 2 else ""
+    return _central_save_error_log(
+        hata_tipi, hata_mesaji, log_dir,
+        traceback_str=traceback_str, adim=adim, extra=extra,
+        session_id=session_id, agent_name="agent2",
+        hesap_key=hk, marketplace=mp)
 
 
 def run_analysis(hesap_key, marketplace):
@@ -1686,6 +1642,8 @@ def _sync_agent2_to_supabase(hesap_key, marketplace, today,
                 "acos": r.get("acos"),
                 "cvr": r.get("cvr"),
                 "cpc": r.get("cpc"),
+                "portfolio": r.get("portfolio_id", ""),
+                "reason": r.get("sebep", ""),
                 "karar_durumu": "PENDING",
             })
         if bid_data:
@@ -1703,11 +1661,14 @@ def _sync_agent2_to_supabase(hesap_key, marketplace, today,
                 "hedefleme": n.get("search_term") or n.get("hedefleme"),
                 "tip": n.get("tip", "KEYWORD"),
                 "sebep": n.get("sebep"),
+                "portfolio": n.get("portfolio_id", ""),
                 "impressions": n.get("impressions"),
                 "clicks": n.get("clicks"),
                 "spend": n.get("spend") or n.get("cost"),
                 "sales": n.get("sales"),
                 "acos": n.get("acos"),
+                "cvr": n.get("cvr", 0),
+                "cpc": n.get("cpc", 0),
                 "karar_durumu": "PENDING",
             })
         if neg_data:
@@ -1727,6 +1688,9 @@ def _sync_agent2_to_supabase(hesap_key, marketplace, today,
                 "tip": h.get("tip", "KEYWORD"),
                 "match_type": h.get("match_type"),
                 "suggested_bid": h.get("suggested_bid"),
+                "portfolio": h.get("portfolio_id", ""),
+                "cvr": h.get("cvr", 0),
+                "recommendation": h.get("oneri", "") or h.get("recommendation", ""),
                 "impressions": h.get("impressions"),
                 "clicks": h.get("clicks"),
                 "spend": h.get("spend") or h.get("cost"),

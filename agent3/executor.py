@@ -69,6 +69,8 @@ logger = logging.getLogger("agent3_executor")
 # ============================================================================
 
 BASE_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, str(BASE_DIR))
+from log_utils import save_error_log as _central_save_error_log
 
 # Bu degiskenler init_paths() ile set edilir
 DATA_DIR = None
@@ -2218,63 +2220,16 @@ def preflight_check(today):
 
 def save_error_log(hata_tipi, hata_mesaji, traceback_str=None, adim=None,
                    extra=None, session_id=None):
-    """
-    Agent 3 hatalarini data/logs/agent3_errors.json dosyasina ekler.
-    Agent 4 (Learning Agent) bu dosyayi okuyarak hata kaliplarini analiz eder.
-
-    Parametreler:
-        hata_tipi    : Ortak taksonomi:
-                       RateLimit, AuthError, ApiError, ServerError, NetworkError,
-                       FileNotFound, DataError, Preflight, ExecutionError,
-                       VerificationError, InternalError
-        hata_mesaji  : Hata aciklamasi
-        traceback_str: traceback.format_exc() ciktisi (opsiyonel)
-        adim         : Hatanin gerceklestigi adim (orn. "bid_execution", "preflight_check")
-        extra        : Ek baglam bilgisi dict olarak
-        session_id   : Pipeline session ID'si (Maestro korelasyonu icin)
-    """
-    log_dir = LOG_DIR
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "agent3_errors.json"
-
-    try:
-        with open(log_path, "r", encoding="utf-8") as f:
-            kayitlar = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        kayitlar = []
-
-    # hata_tipi normalizasyonu
-    _NORM = {
-        "FileNotFoundError": "FileNotFound", "PermissionError": "FileNotFound",
-        "JSONDecodeError": "DataError", "KeyError": "DataError",
-        "ValueError": "DataError", "TypeError": "DataError",
-        "ConnectionError": "NetworkError", "TimeoutError": "NetworkError",
-    }
-    normalized_tipi = _NORM.get(hata_tipi, hata_tipi)
-
-    kayit = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "hata_tipi": normalized_tipi,
-        "hata_mesaji": str(hata_mesaji)[:500],
-        "adim": adim or "bilinmiyor",
-    }
-    if traceback_str:
-        kayit["traceback"] = str(traceback_str)[:1000]
-    if extra:
-        kayit["extra"] = extra
-    if session_id:
-        kayit["session_id"] = session_id
-
-    kayitlar.append(kayit)
-
-    # Son 200 kaydi tut
-    if len(kayitlar) > 200:
-        kayitlar = kayitlar[-200:]
-
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(kayitlar, f, indent=2, ensure_ascii=False)
-
-    logger.info("Hata logu kaydedildi: %s", log_path)
+    """Agent 3 hata logu — lokal + Supabase dual-write."""
+    dir_name = DATA_DIR.name  # "vigowood_eu_UK"
+    parts = dir_name.rsplit("_", 1)
+    hk = parts[0] if len(parts) == 2 else ""
+    mp = parts[1] if len(parts) == 2 else ""
+    return _central_save_error_log(
+        hata_tipi, hata_mesaji, LOG_DIR,
+        traceback_str=traceback_str, adim=adim, extra=extra,
+        session_id=session_id, agent_name="agent3",
+        hesap_key=hk, marketplace=mp)
 
 
 def run_executor(hesap_key, marketplace, today=None, force_execute=False):

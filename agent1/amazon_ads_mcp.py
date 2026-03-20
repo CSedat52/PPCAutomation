@@ -95,6 +95,7 @@ from contextlib import asynccontextmanager
 import httpx
 from pydantic import BaseModel, ConfigDict
 from mcp.server.fastmcp import FastMCP, Context
+from log_utils import save_error_log as _central_save_error_log
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("amazon_ads_mcp")
@@ -390,55 +391,17 @@ def get_data_dir(hesap_key, marketplace):
 
 def save_error_log(hata_tipi, hata_mesaji, data_dir, traceback_str=None, adim=None,
                    extra=None, session_id=None):
-    """
-    Agent 1 hatalarini data/logs/agent1_errors.json dosyasina ekler.
-    Agent 4 (Learning Agent) bu dosyayi okuyarak tekrar eden API hata
-    kaliplarini analiz eder ve Maestro CLAUDE.md guncellemesi onerir.
-
-    Parametreler:
-        hata_tipi    : Hata kategorisi — ortak taksonomi:
-                       RateLimit, AuthError, ApiError, ServerError, NetworkError,
-                       FileNotFound, DataError, ReportFailed, InternalError
-        hata_mesaji  : Hata aciklamasi (HTTP status, endpoint, mesaj)
-        data_dir     : Hesap bazli data klasoru (Path)
-        traceback_str: traceback.format_exc() — beklenmeyen Python hatalarinda
-        adim         : Hatanin gerceklestigi adim (orn. "collect_list", "collect_report")
-        extra        : Ek baglam dict (orn. {"endpoint": "/sp/campaigns", "status_code": 429})
-        session_id   : Pipeline session ID'si (Maestro korelasyonu icin)
-    """
-    log_dir = data_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "agent1_errors.json"
-
-    try:
-        with open(log_path, "r", encoding="utf-8") as f:
-            kayitlar = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        kayitlar = []
-
-    kayit = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "hata_tipi": hata_tipi,
-        "hata_mesaji": str(hata_mesaji)[:500],
-        "adim": adim or "bilinmiyor",
-    }
-    if traceback_str:
-        kayit["traceback"] = str(traceback_str)[:1000]
-    if extra:
-        kayit["extra"] = extra
-    if session_id:
-        kayit["session_id"] = session_id
-
-    kayitlar.append(kayit)
-
-    # Son 200 kaydi tut
-    if len(kayitlar) > 200:
-        kayitlar = kayitlar[-200:]
-
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(kayitlar, f, indent=2, ensure_ascii=False)
-
-    logger.info("Hata logu kaydedildi: %s", log_path)
+    """Agent 1 hata logu — lokal + Supabase dual-write."""
+    log_dir = Path(data_dir) / "logs"
+    dir_name = Path(data_dir).name  # "vigowood_eu_UK"
+    parts = dir_name.rsplit("_", 1)
+    hk = parts[0] if len(parts) == 2 else ""
+    mp = parts[1] if len(parts) == 2 else ""
+    return _central_save_error_log(
+        hata_tipi, hata_mesaji, log_dir,
+        traceback_str=traceback_str, adim=adim, extra=extra,
+        session_id=session_id, agent_name="agent1",
+        hesap_key=hk, marketplace=mp)
 
 
 def classify_error_from_message(hata_mesaji):
@@ -1574,6 +1537,15 @@ def _sync_agent1_to_supabase(hesap_key, marketplace, today, data_dir, R):
             logger.info("kpi_daily guncellendi: %s/%s/%s", hesap_key, marketplace, today)
         except Exception as e:
             logger.warning("kpi_daily guncellenemedi: %s — %s", account_label, e)
+
+    # Agent 1 status guncelle
+    try:
+        db.update_agent_status_detail("agent1", "completed", {
+            "tasks": R.get("basarili", 0) + R.get("basarisiz", 0) + R.get("atlanan", 0),
+            "errors_7d": R.get("basarisiz", 0),
+        })
+    except Exception:
+        pass
 
     if entity_errors == 0 and report_errors == 0:
         logger.info("Supabase sync BASARILI: %s — %d entity, %d rapor",

@@ -504,7 +504,9 @@ class SupabaseClient:
                 "match_type", "segment",
                 "current_bid", "recommended_bid", "bid_change_pct",
                 "impressions", "clicks", "cost", "sales", "orders",
-                "acos", "cvr", "cpc", "decision"]
+                "acos", "cvr", "cpc",
+                "portfolio", "reason",
+                "decision"]
         rows = []
         for d in data:
             rows.append((
@@ -531,6 +533,8 @@ class SupabaseClient:
                 self._safe_numeric(d.get("acos")),
                 self._safe_numeric(d.get("cvr")),
                 self._safe_numeric(d.get("cpc")),
+                d.get("portfolio"),
+                d.get("reason") or d.get("sebep"),
                 d.get("karar_durumu", "PENDING")
             ))
         return self._insert_batch("bid_recommendations", cols, rows)
@@ -539,8 +543,11 @@ class SupabaseClient:
                                     data: list) -> int:
         cols = ["hesap_key", "marketplace", "analysis_date", "ad_type",
                 "campaign_id", "campaign_name", "ad_group_id",
-                "keyword_text", "targeting", "candidate_type", "reason",
-                "impressions", "clicks", "cost", "sales", "acos", "decision"]
+                "keyword_text", "targeting", "candidate_type",
+                "portfolio", "reason",
+                "impressions", "clicks", "cost", "sales", "acos",
+                "cvr", "cpc",
+                "decision"]
         rows = []
         for d in data:
             rows.append((
@@ -552,12 +559,15 @@ class SupabaseClient:
                 d.get("hedefleme"),
                 d.get("targeting"),
                 d.get("tip", "KEYWORD"),
-                d.get("sebep"),
+                d.get("portfolio"),
+                d.get("sebep") or d.get("reason"),
                 self._safe_int(d.get("impressions")),
                 self._safe_int(d.get("clicks")),
                 self._safe_numeric(d.get("spend") or d.get("cost")),
                 self._safe_numeric(d.get("sales")),
                 self._safe_numeric(d.get("acos")),
+                self._safe_numeric(d.get("cvr")),
+                self._safe_numeric(d.get("cpc")),
                 d.get("karar_durumu", "PENDING")
             ))
         return self._insert_batch("negative_candidates", cols, rows)
@@ -568,6 +578,7 @@ class SupabaseClient:
                 "source_campaign_id", "source_campaign_name", "source_ad_group_id",
                 "search_term", "targeting", "harvest_type",
                 "suggested_match_type", "suggested_bid",
+                "portfolio", "cvr", "recommendation",
                 "impressions", "clicks", "cost", "sales", "orders",
                 "acos", "decision"]
         rows = []
@@ -583,6 +594,9 @@ class SupabaseClient:
                 d.get("tip", "KEYWORD"),
                 d.get("match_type"),
                 self._safe_numeric(d.get("suggested_bid")),
+                d.get("portfolio"),
+                self._safe_numeric(d.get("cvr")),
+                d.get("recommendation"),
                 self._safe_int(d.get("impressions")),
                 self._safe_int(d.get("clicks")),
                 self._safe_numeric(d.get("spend") or d.get("cost")),
@@ -764,15 +778,22 @@ class SupabaseClient:
         """, (hesap_key, mp, pattern.get("tip"), pattern.get("aciklama"), Json(pattern)))
 
     def upsert_proposal(self, hesap_key: str, mp: str, proposal: dict):
+        # beklenen_sonuc/gerceklesen_sonuc (yeni) veya risk/kazanim (eski) fallback
+        beklenen = proposal.get("beklenen_sonuc") or proposal.get("risk", "")
+        gerceklesen = proposal.get("gerceklesen_sonuc") or proposal.get("kazanim", "")
         self._execute("""
             INSERT INTO proposals (hesap_key, marketplace, proposal_id, proposal_type,
                                    title, description, current_value, proposed_value,
-                                   rationale, impact_estimate, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                   rationale, impact_estimate,
+                                   beklenen_sonuc, gerceklesen_sonuc,
+                                   status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (hesap_key, marketplace, proposal_id)
             DO UPDATE SET status = EXCLUDED.status,
                           proposed_value = EXCLUDED.proposed_value,
-                          rationale = EXCLUDED.rationale
+                          rationale = EXCLUDED.rationale,
+                          beklenen_sonuc = EXCLUDED.beklenen_sonuc,
+                          gerceklesen_sonuc = EXCLUDED.gerceklesen_sonuc
         """, (
             hesap_key, mp,
             proposal.get("id"),
@@ -783,6 +804,8 @@ class SupabaseClient:
             Json(proposal.get("onerilen_deger")) if proposal.get("onerilen_deger") else None,
             proposal.get("gerekce"),
             Json(proposal.get("etki_tahmini")) if proposal.get("etki_tahmini") else None,
+            beklenen,
+            gerceklesen,
             proposal.get("durum", "PENDING")
         ))
 
@@ -865,6 +888,97 @@ class SupabaseClient:
             error.get("agent"),
             Json(error.get("extra")) if error.get("extra") else None,
             error.get("traceback")
+        ))
+
+    # ==========================================
+    # AGENT LOGS (yeni — Faz 3)
+    # ==========================================
+
+    def insert_agent_log(self, hesap_key: str, mp: str, agent_name: str,
+                         log_dict: dict):
+        """agent_logs tablosuna structured log yazar."""
+        self._execute("""
+            INSERT INTO agent_logs
+                (agent_id, level, message, error_type,
+                 hesap_key, marketplace, session_id, traceback)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            agent_name,
+            log_dict.get("level", "info"),
+            log_dict.get("message"),
+            log_dict.get("error_type"),
+            hesap_key, mp,
+            log_dict.get("session_id"),
+            log_dict.get("traceback"),
+        ))
+
+    # ==========================================
+    # PIPELINE RUNS (yeni — Faz 3)
+    # ==========================================
+
+    def upsert_pipeline_run(self, session_id: str, hesap_key: str, mp: str,
+                            step: str, status: str, error_msg: str = None):
+        """pipeline_runs tablosuna INSERT ON CONFLICT ile yazar.
+        step: 'starting', 'agent1', 'agent2', 'agent3_execute', 'agent3_verify', 'agent4', 'completed'
+        status: 'running', 'completed', 'failed'
+        """
+        # Step'e gore completed_at kolonu
+        step_col_map = {
+            "agent1": "agent1_completed_at",
+            "agent2": "agent2_completed_at",
+            "agent3_execute": "agent3_completed_at",
+            "agent3_verify": "agent3_completed_at",
+            "agent4": "agent4_completed_at",
+        }
+
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO pipeline_runs (session_id, hesap_key, marketplace,
+                                           current_step, status, error_message, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (session_id, hesap_key, marketplace)
+                DO UPDATE SET current_step = EXCLUDED.current_step,
+                              status = EXCLUDED.status,
+                              error_message = EXCLUDED.error_message,
+                              updated_at = NOW()
+            """, (session_id, hesap_key, mp, step, status, error_msg))
+
+            # Step tamamlandiysa ilgili timestamp kolonu guncelle
+            completed_col = step_col_map.get(step)
+            if completed_col and status == "completed":
+                cur.execute(f"""
+                    UPDATE pipeline_runs SET {completed_col} = NOW()
+                    WHERE session_id = %s AND hesap_key = %s AND marketplace = %s
+                """, (session_id, hesap_key, mp))
+
+            cur.close()
+        finally:
+            conn.close()
+
+    # ==========================================
+    # AGENT STATUS (yeni — Faz 3)
+    # ==========================================
+
+    def update_agent_status_detail(self, agent_name: str, status: str,
+                                   health_detail: dict = None):
+        """agent_status tablosunu gunceller."""
+        health_score = None
+        if health_detail:
+            errors = health_detail.get("errors_7d", 0)
+            health_score = max(0, 100 - errors * 5)
+
+        self._execute("""
+            UPDATE agent_status
+            SET status = %s, last_run_at = NOW(),
+                health_detail = %s, health_score = %s
+            WHERE agent_name = %s
+        """, (
+            status,
+            Json(health_detail) if health_detail else None,
+            health_score,
+            agent_name,
         ))
 
     # ==========================================

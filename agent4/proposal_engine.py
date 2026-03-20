@@ -269,8 +269,10 @@ class ProposalEngine:
             "ne":               ne,
             "neden":            neden,
             "kanit":            kanit,
-            "risk":             risk,
-            "kazanim":          kazanim,
+            "beklenen_sonuc":   risk,           # Supabase kolon adi
+            "gerceklesen_sonuc": kazanim,        # Supabase kolon adi
+            "risk":             risk,            # Geriye uyumluluk (JSON dosyalari)
+            "kazanim":          kazanim,         # Geriye uyumluluk (JSON dosyalari)
             "degisecek_dosya":  degisecek_dosya,
             "degisecek_alan":   degisecek_alan,
             "olusturma_zamani": datetime.utcnow().isoformat(),

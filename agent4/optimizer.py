@@ -32,6 +32,7 @@ from agent4.analyzers.pattern_detector  import PatternDetector
 from agent4.analyzers.anomaly_detector  import AnomalyDetector
 from agent4.proposal_engine import ProposalEngine
 from agent4.report_generator import ReportGenerator
+from log_utils import save_error_log as _central_save_error_log
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,47 +56,18 @@ def get_dirs(hesap_key, marketplace):
 
 def save_error_log(hata_tipi, hata_mesaji, data_dir, traceback_str=None, adim=None,
                    extra=None, session_id=None):
-    """
-    Agent 4 hatalarini data/logs/agent4_errors.json dosyasina ekler.
-
-    Parametreler:
-        hata_tipi    : Ortak taksonomi (InternalError, DataError, FileNotFound, vb.)
-        hata_mesaji  : Hata aciklamasi (max 500 char)
-        data_dir     : Hesap bazli data klasoru (Path)
-        traceback_str: traceback.format_exc() ciktisi (opsiyonel)
-        adim         : Hatanin gerceklestigi adim
-        extra        : Ek baglam dict (orn. {"modul": "kpi_collector", "detay": "..."})
-        session_id   : Pipeline session ID'si (korelasyon icin)
-    """
-    log_dir = data_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "agent4_errors.json"
-
-    try:
-        with open(log_path, "r", encoding="utf-8") as f:
-            kayitlar = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        kayitlar = []
-
-    kayit = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "hata_tipi": hata_tipi,
-        "hata_mesaji": str(hata_mesaji)[:500],
-        "adim": adim or "bilinmiyor",
-    }
-    if traceback_str:
-        kayit["traceback"] = str(traceback_str)[:1000]
-    if extra:
-        kayit["extra"] = extra
-    if session_id:
-        kayit["session_id"] = session_id
-
-    kayitlar.append(kayit)
-    if len(kayitlar) > 200:
-        kayitlar = kayitlar[-200:]
-
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(kayitlar, f, indent=2, ensure_ascii=False)
+    """Agent 4 hata logu — lokal + Supabase dual-write."""
+    from pathlib import Path
+    log_dir = Path(data_dir) / "logs"
+    dir_name = Path(data_dir).name
+    parts = dir_name.rsplit("_", 1)
+    hk = parts[0] if len(parts) == 2 else ""
+    mp = parts[1] if len(parts) == 2 else ""
+    return _central_save_error_log(
+        hata_tipi, hata_mesaji, log_dir,
+        traceback_str=traceback_str, adim=adim, extra=extra,
+        session_id=session_id, agent_name="agent4",
+        hesap_key=hk, marketplace=mp)
 
 
 # ============================================================================
@@ -239,6 +211,16 @@ def _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor, oneriler)
         # Durum raporu
         rapor_data = rapor.get("rapor_data", rapor)
         sdb.insert_status_report(hesap_key, marketplace, rapor_data)
+
+        # Agent 4 status guncelle
+        try:
+            sdb.update_agent_status_detail("agent4", "completed", {
+                "tasks": len(kararlar) + len(oneriler),
+                "duration": "?",
+                "errors_7d": 0,
+            })
+        except Exception:
+            pass
 
         logger.info("Supabase: Agent 4 verileri yazildi (%d karar, %d oneri)",
                      len(kararlar), len(oneriler))

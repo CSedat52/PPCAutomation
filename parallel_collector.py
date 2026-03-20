@@ -39,6 +39,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("parallel_collector")
 
 BASE_DIR = Path(__file__).parent
+from log_utils import save_error_log as _central_save_error_log
 
 # ============================================================================
 # ACCOUNTS.JSON
@@ -372,28 +373,17 @@ def is_error(result):
 
 
 def save_error_log(data_dir, hata_tipi, hata_mesaji, adim=None, extra=None):
-    """Hatalari data/{hesap}_{mp}/logs/agent1_errors.json dosyasina ekler."""
-    log_dir = data_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / "agent1_errors.json"
-    try:
-        with open(log_path, "r", encoding="utf-8") as f:
-            kayitlar = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        kayitlar = []
-    kayit = {
-        "timestamp": datetime.utcnow().isoformat(),
-        "hata_tipi": hata_tipi,
-        "hata_mesaji": hata_mesaji[:500],
-        "adim": adim or "parallel_collector",
-    }
-    if extra:
-        kayit["extra"] = extra
-    kayitlar.append(kayit)
-    if len(kayitlar) > 200:
-        kayitlar = kayitlar[-200:]
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(kayitlar, f, indent=2, ensure_ascii=False)
+    """Parallel collector hata logu — lokal + Supabase dual-write."""
+    from pathlib import Path
+    log_dir = Path(data_dir) / "logs"
+    dir_name = Path(data_dir).name
+    parts = dir_name.rsplit("_", 1)
+    hk = parts[0] if len(parts) == 2 else ""
+    mp = parts[1] if len(parts) == 2 else ""
+    return _central_save_error_log(
+        hata_tipi, hata_mesaji, log_dir,
+        adim=adim, extra=extra, agent_name="agent1",
+        hesap_key=hk, marketplace=mp)
 
 
 def build_report_payload(ad_product, report_type, group_by, columns, days_back,
@@ -769,6 +759,21 @@ async def collect_marketplace(client, data_dir, label):
     if R["hatalar"]:
         for h in R["hatalar"]:
             logger.warning("[%s] Hata: %s", label, h)
+
+    # KPI Daily sync
+    try:
+        import sys as _sys
+        _base = str(BASE_DIR)
+        if _base not in _sys.path:
+            _sys.path.insert(0, _base)
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        hesap_mp = label.split("/")  # label = "vigowood_eu/UK"
+        if len(hesap_mp) == 2:
+            db.upsert_kpi_daily(hesap_mp[0], hesap_mp[1], today)
+            logger.info("[%s] KPI daily sync tamamlandi", label)
+    except Exception as e:
+        logger.warning("[%s] KPI daily sync hatasi (collector devam eder): %s", label, e)
 
     await client.close()
     return R
