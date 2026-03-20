@@ -1693,6 +1693,18 @@ def _sync_agent2_to_supabase(hesap_key, marketplace, today,
         cname = record.get("kampanya_adi") or record.get("kampanya") or record.get("kaynak_kampanya") or ""
         return portfolio_by_name.get(cname, "")
 
+    # Bugunun eski verilerini sil (lokaldeki sil-yeniden-yaz davranisiyla ayni)
+    try:
+        for tbl in ["bid_recommendations", "negative_candidates", "harvesting_candidates"]:
+            deleted = db._execute(
+                f"DELETE FROM {tbl} WHERE hesap_key=%s AND marketplace=%s AND analysis_date=%s",
+                (hesap_key, marketplace, today))
+            if deleted:
+                logger.info("Supabase: %s — %s/%s/%s eski %d kayit silindi",
+                            tbl, hesap_key, marketplace, today, deleted)
+    except Exception as e:
+        logger.warning("Eski veri silme hatasi (devam eder): %s", e)
+
     try:
         # Bid tavsiyeleri
         bid_data = []
