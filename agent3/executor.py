@@ -243,13 +243,15 @@ def _parse_pct(value):
 
 def parse_bid_recommendations(today=None):
     """
-    Bid recommendations Excel'ini okur ve onaylanmis satirlari doner.
-    
-    Agent 2 kolon sirasi:
-    Kampanya | Reklam Tipi | Portfolio | Hedefleme | Match Type |
-    Impression | CVR | Click | Spend | Sales | ACoS | CPC |
-    Bid | Tavsiye Bid | Degisim | Sebep | Segment | Onay
+    Bid recommendations — onaylari Supabase'den okur, fallback olarak Excel kullanir.
     """
+    # Oncelik 1: Supabase'den onaylari oku
+    actions = _parse_bid_recommendations_from_supabase(today)
+    if actions is not None:
+        return actions
+
+    # Fallback: Excel'den oku
+    logger.info("Supabase'den bid onaylari alinamadi, Excel'e fallback yapiliyor...")
     filepath = find_todays_excel("bid_recommendations", today)
     if not filepath:
         logger.warning("Bid recommendations Excel bulunamadi.")
@@ -273,7 +275,6 @@ def parse_bid_recommendations(today=None):
         tavsiye_bid = _parse_currency(row.get("Tavsiye Bid", row.get("tavsiye_bid", 0)))
         segment = row.get("Segment", row.get("segment", ""))
 
-        # Uygulanacak bid
         if onay_type == "CUSTOM":
             yeni_bid = custom_bid
         else:
@@ -293,8 +294,69 @@ def parse_bid_recommendations(today=None):
             "kaynak": "bid_recommendations",
         })
 
-    logger.info("Bid recommendations: %d onaylanmis islem", len(actions))
+    logger.info("Bid recommendations (Excel): %d onaylanmis islem", len(actions))
     return actions
+
+
+def _parse_bid_recommendations_from_supabase(today=None):
+    """Supabase bid_recommendations tablosundan APPROVED/MODIFIED onaylari okur."""
+    if not today:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        current = config.CURRENT_ACCOUNT or {}
+        hk = current.get("hesap_key", "")
+        mp = current.get("marketplace", "")
+        if not hk or not mp:
+            return None
+
+        rows = db._fetch_all(
+            """SELECT campaign_name, ad_type, portfolio, keyword_text, targeting, match_type,
+                      current_bid, recommended_bid, decision_bid, segment, decision
+               FROM bid_recommendations
+               WHERE hesap_key=%s AND marketplace=%s AND analysis_date=%s
+                 AND decision IN ('APPROVED', 'MODIFIED')""",
+            (hk, mp, today))
+
+        if not rows:
+            logger.info("Supabase: bid onaylari bulunamadi (%s/%s/%s)", hk, mp, today)
+            return []
+
+        actions = []
+        for r in rows:
+            campaign_name, ad_type, portfolio, keyword_text, targeting, match_type, \
+                current_bid, recommended_bid, decision_bid, segment, decision = r
+
+            mevcut_bid = float(current_bid) if current_bid else 0
+            tavsiye_bid = float(recommended_bid) if recommended_bid else mevcut_bid
+
+            if decision == "MODIFIED" and decision_bid:
+                yeni_bid = float(decision_bid)
+                onay_tipi = "CUSTOM"
+            else:
+                yeni_bid = tavsiye_bid
+                onay_tipi = "APPROVED"
+
+            actions.append({
+                "tip": "BID_DEGISIKLIGI",
+                "kampanya_adi": campaign_name or "",
+                "reklam_tipi": ad_type or "SP",
+                "portfolio": portfolio or "",
+                "hedefleme": keyword_text or targeting or "",
+                "match_type": match_type or "",
+                "eski_bid": mevcut_bid,
+                "yeni_bid": yeni_bid,
+                "segment": segment or "",
+                "onay_tipi": onay_tipi,
+                "kaynak": "supabase_bid_recommendations",
+            })
+
+        logger.info("Bid recommendations (Supabase): %d onaylanmis islem", len(actions))
+        return actions
+    except Exception as e:
+        logger.warning("Supabase bid okuma hatasi: %s", e)
+        return None
 
 
 # ============================================================================
@@ -303,12 +365,13 @@ def parse_bid_recommendations(today=None):
 
 def parse_negative_candidates(today=None):
     """
-    Negatif keyword adaylari Excel'ini okur ve onaylanmis satirlari doner.
-    
-    Agent 2 kolon sirasi:
-    Kampanya | Reklam Tipi | Portfolio | Hedefleme | Match Type |
-    Impression | Click | Spend | Sales | CVR | CPC | Sebep | Onay
+    Negatif keyword adaylari — onaylari Supabase'den okur, fallback olarak Excel kullanir.
     """
+    actions = _parse_negative_candidates_from_supabase(today)
+    if actions is not None:
+        return actions
+
+    logger.info("Supabase'den negatif onaylari alinamadi, Excel'e fallback yapiliyor...")
     filepath = find_todays_excel("negative_candidates", today)
     if not filepath:
         logger.warning("Negative candidates Excel bulunamadi.")
@@ -330,10 +393,8 @@ def parse_negative_candidates(today=None):
         match_type = row.get("Match Type", row.get("match_type", ""))
 
         if not hedefleme or str(hedefleme).strip() == "":
-            logger.warning("Negatif aday atlandi: hedefleme/search term bos (kampanya: %s)", kampanya)
             continue
 
-        # ASIN mi keyword mu?
         is_asin = _is_asin_target(hedefleme)
 
         actions.append({
@@ -350,8 +411,61 @@ def parse_negative_candidates(today=None):
             "kaynak": "negative_candidates",
         })
 
-    logger.info("Negatif adaylar: %d onaylanmis islem", len(actions))
+    logger.info("Negatif adaylar (Excel): %d onaylanmis islem", len(actions))
     return actions
+
+
+def _parse_negative_candidates_from_supabase(today=None):
+    """Supabase negative_candidates tablosundan APPROVED onaylari okur."""
+    if not today:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        current = config.CURRENT_ACCOUNT or {}
+        hk = current.get("hesap_key", "")
+        mp = current.get("marketplace", "")
+        if not hk or not mp:
+            return None
+
+        rows = db._fetch_all(
+            """SELECT campaign_name, ad_type, portfolio, search_term, match_type,
+                      cost, sales, reason
+               FROM negative_candidates
+               WHERE hesap_key=%s AND marketplace=%s AND analysis_date=%s
+                 AND decision = 'APPROVED'""",
+            (hk, mp, today))
+
+        if not rows:
+            logger.info("Supabase: negatif onaylari bulunamadi (%s/%s/%s)", hk, mp, today)
+            return []
+
+        actions = []
+        for r in rows:
+            campaign_name, ad_type, portfolio, search_term, match_type, cost, sales, reason = r
+            hedefleme = search_term or ""
+            if not hedefleme.strip():
+                continue
+            is_asin = _is_asin_target(hedefleme)
+            actions.append({
+                "tip": "NEGATIF_ASIN" if is_asin else "NEGATIF_KEYWORD",
+                "kampanya_adi": campaign_name or "",
+                "reklam_tipi": ad_type or "SP",
+                "portfolio": portfolio or "",
+                "hedefleme": hedefleme,
+                "match_type": match_type or "",
+                "negatif_match_type": "NEGATIVE_EXACT",
+                "harcama": float(cost) if cost else 0,
+                "satis": float(sales) if sales else 0,
+                "sebep": reason or "",
+                "kaynak": "supabase_negative_candidates",
+            })
+
+        logger.info("Negatif adaylar (Supabase): %d onaylanmis islem", len(actions))
+        return actions
+    except Exception as e:
+        logger.warning("Supabase negatif okuma hatasi: %s", e)
+        return None
 
 
 def _is_asin_target(hedefleme):
@@ -390,12 +504,13 @@ def _format_asin(asin_text):
 
 def parse_harvesting_candidates(today=None):
     """
-    Harvesting adaylari Excel'ini okur ve onaylanmis satirlari doner.
-    
-    Agent 2 kolon sirasi:
-    Kaynak Kampanya | Reklam Tipi | Portfolio | Hedefleme | Match Type |
-    Kaynak | Impression | Click | Spend | Sales | ACoS | CVR | Oneri | Onay
+    Harvesting adaylari — onaylari Supabase'den okur, fallback olarak Excel kullanir.
     """
+    actions = _parse_harvesting_candidates_from_supabase(today)
+    if actions is not None:
+        return actions
+
+    logger.info("Supabase'den harvesting onaylari alinamadi, Excel'e fallback yapiliyor...")
     filepath = find_todays_excel("harvesting_candidates", today)
     if not filepath:
         logger.warning("Harvesting candidates Excel bulunamadi.")
@@ -415,7 +530,6 @@ def parse_harvesting_candidates(today=None):
         kaynak_kampanya = row.get("Kaynak Kampanya", row.get("kaynak_kampanya", ""))
         reklam_tipi = row.get("Reklam Tipi", row.get("reklam_tipi", ""))
         portfolio = row.get("Portfolio", row.get("portfolio", ""))
-        # Harvesting bid: CPC kolonu varsa kullan, yoksa Spend/Click'ten hesapla
         bid = _parse_currency(row.get("CPC", row.get("cpc", 0)))
         if bid <= 0:
             spend = _parse_currency(row.get("Spend", row.get("spend", 0)))
@@ -426,7 +540,6 @@ def parse_harvesting_candidates(today=None):
         is_asin = _is_asin_target(hedefleme)
 
         if is_asin:
-            # ASIN → mevcut ASIN Target kampanyasina ekle
             actions.append({
                 "tip": "HARVEST_ASIN",
                 "kaynak_kampanya": kaynak_kampanya,
@@ -437,7 +550,6 @@ def parse_harvesting_candidates(today=None):
                 "kaynak": "harvesting_candidates",
             })
         else:
-            # Keyword → yeni Exact kampanya olustur
             actions.append({
                 "tip": "HARVEST_KEYWORD",
                 "kaynak_kampanya": kaynak_kampanya,
@@ -449,8 +561,77 @@ def parse_harvesting_candidates(today=None):
                 "kaynak": "harvesting_candidates",
             })
 
-    logger.info("Harvesting: %d onaylanmis islem", len(actions))
+    logger.info("Harvesting (Excel): %d onaylanmis islem", len(actions))
     return actions
+
+
+def _parse_harvesting_candidates_from_supabase(today=None):
+    """Supabase harvesting_candidates tablosundan APPROVED onaylari okur."""
+    if not today:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        current = config.CURRENT_ACCOUNT or {}
+        hk = current.get("hesap_key", "")
+        mp = current.get("marketplace", "")
+        if not hk or not mp:
+            return None
+
+        rows = db._fetch_all(
+            """SELECT source_campaign_name, ad_type, portfolio, search_term, targeting,
+                      suggested_match_type, suggested_bid, cost, clicks
+               FROM harvesting_candidates
+               WHERE hesap_key=%s AND marketplace=%s AND analysis_date=%s
+                 AND decision = 'APPROVED'""",
+            (hk, mp, today))
+
+        if not rows:
+            logger.info("Supabase: harvesting onaylari bulunamadi (%s/%s/%s)", hk, mp, today)
+            return []
+
+        actions = []
+        for r in rows:
+            source_campaign, ad_type, portfolio, search_term, targeting, \
+                suggested_match, suggested_bid, cost, clicks = r
+
+            hedefleme = search_term or targeting or ""
+            if not hedefleme.strip():
+                continue
+
+            bid = float(suggested_bid) if suggested_bid else 0
+            if bid <= 0 and clicks and float(clicks) > 0 and cost:
+                bid = round(float(cost) / float(clicks), 2)
+
+            is_asin = _is_asin_target(hedefleme)
+
+            if is_asin:
+                actions.append({
+                    "tip": "HARVEST_ASIN",
+                    "kaynak_kampanya": source_campaign or "",
+                    "reklam_tipi": ad_type or "SP",
+                    "portfolio": portfolio or "",
+                    "hedefleme": hedefleme,
+                    "bid": bid,
+                    "kaynak": "supabase_harvesting_candidates",
+                })
+            else:
+                actions.append({
+                    "tip": "HARVEST_KEYWORD",
+                    "kaynak_kampanya": source_campaign or "",
+                    "reklam_tipi": ad_type or "SP",
+                    "portfolio": portfolio or "",
+                    "hedefleme": hedefleme,
+                    "match_type": suggested_match or "",
+                    "bid": bid,
+                    "kaynak": "supabase_harvesting_candidates",
+                })
+
+        logger.info("Harvesting (Supabase): %d onaylanmis islem", len(actions))
+        return actions
+    except Exception as e:
+        logger.warning("Supabase harvesting okuma hatasi: %s", e)
+        return None
 
 
 # ============================================================================
