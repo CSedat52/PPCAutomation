@@ -47,6 +47,7 @@ Versiyon: 1.1
 """
 
 import os
+import sys
 import re
 import json
 import time
@@ -70,7 +71,29 @@ logger = logging.getLogger("agent3_executor")
 
 BASE_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, str(BASE_DIR))
-from log_utils import save_error_log as _central_save_error_log
+from log_utils import save_error_log as _central_save_error_log, save_log as _save_log
+
+
+def _dashboard_status(agent_name, status, health_detail=None):
+    """Dashboard agent_status tablosunu gunceller."""
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        db.update_agent_status_detail(agent_name, status, health_detail)
+    except Exception:
+        pass
+
+
+def _dashboard_pipeline(session_id, hesap_key, marketplace, step, status, error_msg=None):
+    """Dashboard pipeline_runs tablosunu gunceller."""
+    if not session_id:
+        return
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        db.upsert_pipeline_run(session_id, hesap_key, marketplace, step, status, error_msg)
+    except Exception:
+        pass
 
 # Bu degiskenler init_paths() ile set edilir
 DATA_DIR = None
@@ -2243,8 +2266,25 @@ def run_executor(hesap_key, marketplace, today=None, force_execute=False):
 
     logger.info("=== AGENT 3 v3 EXECUTOR BASLADI -- %s/%s -- %s ===", hesap_key, marketplace, today)
 
+    # Dashboard: Agent 3 basliyor
+    _session_id = MAESTRO_SESSION_ID or f"direct_{today}_{hesap_key}_{marketplace}"
+    _dashboard_status("agent3", "running")
+    _dashboard_pipeline(_session_id, hesap_key, marketplace, "agent3_execute", "running")
+    _save_log("info", f"Agent 3 basliyor: {hesap_key}/{marketplace}", "agent3", hesap_key, marketplace, _session_id)
+
     try:
-        return _run_executor_impl(today, force_execute, hesap_key, marketplace)
+        result = _run_executor_impl(today, force_execute, hesap_key, marketplace)
+        # Dashboard: Agent 3 tamamlandi
+        _final = "completed" if result.get("durum") not in ("BASARISIZ",) else "failed"
+        _dashboard_status("agent3", _final, {
+            "tasks": result.get("ozet", {}).get("toplam", 0) if isinstance(result.get("ozet"), dict) else 0,
+            "errors_7d": 1 if _final == "failed" else 0,
+        })
+        _dashboard_pipeline(_session_id, hesap_key, marketplace, "agent3_execute", _final)
+        _save_log("info" if _final == "completed" else "error",
+                  f"Agent 3 {'tamamlandi' if _final == 'completed' else 'basarisiz'}: {result.get('durum', '')}",
+                  "agent3", hesap_key, marketplace, _session_id)
+        return result
     except Exception as e:
         tb = traceback.format_exc()
         hata_tipi = type(e).__name__
@@ -2252,6 +2292,10 @@ def run_executor(hesap_key, marketplace, today=None, force_execute=False):
         logger.error("BEKLENMEYEN HATA [%s]: %s", hata_tipi, hata_mesaji)
         save_error_log(hata_tipi, hata_mesaji, tb, adim="run_executor",
                        session_id=MAESTRO_SESSION_ID)
+        # Dashboard: Agent 3 hata
+        _dashboard_status("agent3", "failed")
+        _dashboard_pipeline(_session_id, hesap_key, marketplace, "agent3_execute", "failed", hata_mesaji[:500])
+        _save_log("error", f"Agent 3 hatasi: {hata_mesaji[:200]}", "agent3", hesap_key, marketplace, _session_id, error_type=hata_tipi)
         return {
             "agent": "Agent3_Executor",
             "tarih": today,

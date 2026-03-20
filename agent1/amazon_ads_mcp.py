@@ -95,7 +95,37 @@ from contextlib import asynccontextmanager
 import httpx
 from pydantic import BaseModel, ConfigDict
 from mcp.server.fastmcp import FastMCP, Context
-from log_utils import save_error_log as _central_save_error_log
+from log_utils import save_error_log as _central_save_error_log, save_log as _save_log
+
+
+def _dashboard_status(agent_name, status, health_detail=None):
+    """Dashboard agent_status tablosunu gunceller (hata olursa sessizce devam eder)."""
+    try:
+        _base = str(Path(__file__).parent.parent)
+        import sys as _sys
+        if _base not in _sys.path:
+            _sys.path.insert(0, _base)
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        db.update_agent_status_detail(agent_name, status, health_detail)
+    except Exception:
+        pass
+
+
+def _dashboard_pipeline(session_id, hesap_key, marketplace, step, status, error_msg=None):
+    """Dashboard pipeline_runs tablosunu gunceller (hata olursa sessizce devam eder)."""
+    if not session_id:
+        return
+    try:
+        _base = str(Path(__file__).parent.parent)
+        import sys as _sys
+        if _base not in _sys.path:
+            _sys.path.insert(0, _base)
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        db.upsert_pipeline_run(session_id, hesap_key, marketplace, step, status, error_msg)
+    except Exception:
+        pass
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("amazon_ads_mcp")
@@ -771,6 +801,13 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
     data_dir = get_data_dir(params.hesap_key, params.marketplace)
     today = datetime.utcnow().strftime("%Y-%m-%d")
     account_label = f"{params.hesap_key}/{params.marketplace}"
+
+    # Dashboard: Agent 1 basliyor
+    import os as _os
+    _session_id = _os.environ.get("MAESTRO_SESSION_ID") or f"direct_{today}_{params.hesap_key}_{params.marketplace}"
+    _dashboard_status("agent1", "running")
+    _dashboard_pipeline(_session_id, params.hesap_key, params.marketplace, "agent1", "running")
+    _save_log("info", f"Agent 1 basliyor: {account_label}", "agent1", params.hesap_key, params.marketplace, _session_id)
     R = {
         "tarih": today, "hesap": account_label,
         "dosyalar": {}, "hatalar": [], "uyarilar": [],
@@ -1410,6 +1447,16 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
 
     # ---- Supabase Sync (dual mode: dosya + DB) ----
     _sync_agent1_to_supabase(params.hesap_key, params.marketplace, today, data_dir, R)
+
+    # Dashboard: Agent 1 tamamlandi
+    _final_status = "completed" if R["basarisiz"] == 0 else "failed" if R["basarili"] == 0 else "completed"
+    _dashboard_status("agent1", _final_status, {
+        "tasks": R["basarili"] + R["basarisiz"] + R["atlanan"],
+        "errors_7d": R["basarisiz"],
+    })
+    _dashboard_pipeline(_session_id, params.hesap_key, params.marketplace, "agent1", _final_status)
+    _save_log("info", f"Agent 1 tamamlandi: {R['basarili']} basarili, {R['basarisiz']} hata, {R['atlanan']} cache",
+              "agent1", params.hesap_key, params.marketplace, _session_id)
 
     return json.dumps(R, indent=2, ensure_ascii=False)
 
