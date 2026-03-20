@@ -891,6 +891,131 @@ def check_approval(hesap_key, marketplace):
 
 
 # ============================================================================
+# EXECUTION QUEUE — Dashboard'dan Agent3 tetikleme
+# ============================================================================
+
+def poll_execution_queue():
+    """
+    Supabase execution_queue tablosundaki pending komutlari kontrol eder.
+    Dashboard'dan 'Agent3'u Calistir' butonuna basildiginda buraya komut duser.
+    """
+    sdb = _get_sdb()
+    if not sdb:
+        return []
+
+    try:
+        rows = sdb._fetch_all(
+            "SELECT id, hesap_key, marketplace, command FROM execution_queue WHERE status='pending' ORDER BY requested_at")
+        if not rows:
+            return []
+
+        logger.info("Execution queue: %d bekleyen komut bulundu", len(rows))
+        results = []
+
+        for row in rows:
+            q_id, hesap_key, marketplace, command = row[0], row[1], row[2], row[3]
+            logger.info("Queue isleniyor: %s/%s — %s", hesap_key, marketplace, command)
+
+            # Status: processing
+            sdb._execute("UPDATE execution_queue SET status='processing', started_at=NOW() WHERE id=%s", (q_id,))
+            _save_log("info", f"Queue komutu alindi: {command} — {hesap_key}/{marketplace}",
+                      "maestro", hesap_key, marketplace)
+
+            if command == "agent3_execute":
+                try:
+                    success = _run_agent3_from_queue(hesap_key, marketplace)
+                    status = "completed" if success else "failed"
+                    sdb._execute(
+                        "UPDATE execution_queue SET status=%s, completed_at=NOW(), result=%s WHERE id=%s",
+                        (status, json.dumps({"success": success}), q_id))
+                    results.append({"hesap": f"{hesap_key}/{marketplace}", "status": status})
+                except Exception as e:
+                    sdb._execute(
+                        "UPDATE execution_queue SET status='failed', completed_at=NOW(), result=%s WHERE id=%s",
+                        (json.dumps({"error": str(e)[:500]}), q_id))
+                    results.append({"hesap": f"{hesap_key}/{marketplace}", "status": "failed", "error": str(e)[:200]})
+            else:
+                sdb._execute("UPDATE execution_queue SET status='unknown_command', completed_at=NOW() WHERE id=%s", (q_id,))
+
+        return results
+    except Exception as e:
+        logger.error("Execution queue hatasi: %s", e)
+        return []
+
+
+def _run_agent3_from_queue(hesap_key, marketplace):
+    """Dashboard onaylarindan Agent3'u calistirir."""
+    config.init_account(hesap_key, marketplace)
+    state = state_manager.load_state()
+    session_id = f"queue_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{hesap_key}_{marketplace}"
+
+    _save_log("info", f"Agent3 basliyor (dashboard queue): {hesap_key}/{marketplace}",
+              "agent3", hesap_key, marketplace, session_id)
+
+    sdb = _get_sdb()
+    if sdb:
+        try:
+            sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", "running")
+            sdb.update_agent_status_detail("agent3", "running")
+        except Exception:
+            pass
+
+    env = {**os.environ, "MAESTRO_SESSION_ID": session_id}
+    try:
+        result = subprocess.run(
+            [sys.executable, config.AGENT3_SCRIPT, hesap_key, marketplace, "--execute"],
+            capture_output=True, text=True, timeout=600,
+            cwd=config.BASE_DIR, env=env,
+        )
+        success = result.returncode == 0
+
+        final_status = "completed" if success else "failed"
+        _save_log("info" if success else "error",
+                  f"Agent3 {'tamamlandi' if success else 'basarisiz'} (dashboard queue): {hesap_key}/{marketplace}",
+                  "agent3", hesap_key, marketplace, session_id)
+        if sdb:
+            try:
+                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", final_status)
+                sdb.update_agent_status_detail("agent3", final_status)
+            except Exception:
+                pass
+
+        return success
+    except Exception as e:
+        logger.error("Agent3 queue calistirma hatasi: %s", e)
+        _save_log("error", f"Agent3 hatasi (queue): {str(e)[:200]}",
+                  "agent3", hesap_key, marketplace, session_id)
+        if sdb:
+            try:
+                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", "failed", str(e)[:500])
+                sdb.update_agent_status_detail("agent3", "failed")
+            except Exception:
+                pass
+        return False
+
+
+def watch_queue(interval_minutes=5):
+    """
+    Execution queue'yu belirli araliklarla kontrol eder.
+    Kullanim: python -m maestro.maestro_agent watch
+    """
+    logger.info("=" * 60)
+    logger.info("  EXECUTION QUEUE WATCH — her %d dakikada bir kontrol", interval_minutes)
+    logger.info("=" * 60)
+
+    while True:
+        try:
+            results = poll_execution_queue()
+            if results:
+                for r in results:
+                    logger.info("  %s: %s", r.get("hesap"), r.get("status"))
+        except Exception as e:
+            logger.error("Watch dongusu hatasi: %s", e)
+
+        time.sleep(interval_minutes * 60)
+
+
+# ============================================================================
 # CLI GIRIS NOKTASI
 # ============================================================================
 
@@ -908,6 +1033,7 @@ def main():
         print("  accounts                       : Aktif hesap listesi")
         print("  log                            : Son log dosyasi")
         print("  history                        : Gecmis session ozeti")
+        print("  watch [dakika]                 : Dashboard execution queue izle (varsayilan 5dk)")
         return
 
     command = sys.argv[1].lower().replace("-", "_")
@@ -972,9 +1098,13 @@ def main():
             hesap = s.get('hesap', '')
             print(f"  {hesap:25s} | {s.get('session_id', '')} | {s.get('date', '')} | {s.get('status', '')}")
 
+    elif command == "watch":
+        interval = int(args[0]) if args else 5
+        watch_queue(interval)
+
     else:
         print(f"Bilinmeyen komut: {command}")
-        print("Gecerli komutlar: start, resume, status, check, accounts, log, history")
+        print("Gecerli komutlar: start, resume, status, check, accounts, log, history, watch")
 
 
 if __name__ == "__main__":
