@@ -39,7 +39,30 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("parallel_collector")
 
 BASE_DIR = Path(__file__).parent
-from log_utils import save_error_log as _central_save_error_log
+sys.path.insert(0, str(BASE_DIR))
+from log_utils import save_error_log as _central_save_error_log, save_log as _save_log
+
+
+def _dashboard_status(agent_name, status, health_detail=None):
+    """Dashboard agent_status tablosunu gunceller."""
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        db.update_agent_status_detail(agent_name, status, health_detail)
+    except Exception:
+        pass
+
+
+def _dashboard_pipeline(session_id, hesap_key, marketplace, step, status, error_msg=None):
+    """Dashboard pipeline_runs tablosunu gunceller."""
+    if not session_id:
+        return
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        db.upsert_pipeline_run(session_id, hesap_key, marketplace, step, status, error_msg)
+    except Exception:
+        pass
 
 # ============================================================================
 # ACCOUNTS.JSON
@@ -410,6 +433,15 @@ async def collect_marketplace(client, data_dir, label):
     today = datetime.utcnow().strftime("%Y-%m-%d")
     R = {"basarili": 0, "basarisiz": 0, "atlanan": 0, "hatalar": []}
 
+    # Dashboard: Agent 1 basliyor (label = "vigowood_na/US")
+    _parts = label.split("/")
+    _hk = _parts[0] if len(_parts) == 2 else ""
+    _mp = _parts[1] if len(_parts) == 2 else ""
+    _session_id = f"parallel_{today}_{_hk}_{_mp}"
+    _dashboard_status("agent1", "running")
+    _dashboard_pipeline(_session_id, _hk, _mp, "agent1", "running")
+    _save_log("info", f"Agent 1 basliyor (parallel): {label}", "agent1", _hk, _mp, _session_id)
+
     async def collect_list(name, endpoint, state_filter, extract_key,
                            method="POST", content_type="application/json",
                            accept="application/json", max_count=1000,
@@ -775,6 +807,16 @@ async def collect_marketplace(client, data_dir, label):
     except Exception as e:
         logger.warning("[%s] KPI daily sync hatasi (collector devam eder): %s", label, e)
 
+    # Dashboard: Agent 1 tamamlandi
+    _final = "completed" if R["basarisiz"] == 0 else "failed" if R["basarili"] == 0 else "completed"
+    _dashboard_status("agent1", _final, {
+        "tasks": R["basarili"] + R["basarisiz"] + R["atlanan"],
+        "errors_7d": R["basarisiz"],
+    })
+    _dashboard_pipeline(_session_id, _hk, _mp, "agent1", _final)
+    _save_log("info", f"Agent 1 tamamlandi (parallel): {label} — {R['basarili']} basarili, {R['basarisiz']} hata",
+              "agent1", _hk, _mp, _session_id)
+
     await client.close()
     return R
 
@@ -879,6 +921,10 @@ async def run_all(targets=None):
         logger.info("    %s: %s (tumu paralel)", hk, ", ".join(mp_list))
     logger.info("=" * 60)
 
+    # Dashboard: Maestro/pipeline basladi
+    _save_log("info", f"Parallel collector basladi: {len(account_tasks)} hesap", "maestro")
+    _dashboard_status("maestro", "running")
+
     start_time = time.time()
 
     # Her hesap icin paralel task olustur
@@ -919,6 +965,10 @@ async def run_all(targets=None):
 
     logger.info("  Toplam: %d basarili, %d hata", toplam_basarili, toplam_hata)
     logger.info("=" * 60)
+
+    # Dashboard: Tamamlandi
+    _dashboard_status("maestro", "ONLINE")
+    _save_log("info", f"Parallel collector tamamlandi: {toplam_basarili} basarili, {toplam_hata} hata ({minutes}dk {seconds}sn)", "maestro")
 
 
 # ============================================================================
