@@ -791,7 +791,7 @@ async def collect_marketplace(client, data_dir, label):
         for h in R["hatalar"]:
             logger.warning("[%s] Hata: %s", label, h)
 
-    # KPI Daily sync
+    # Supabase sync: KPI daily + targeting reports + search term reports
     try:
         import sys as _sys
         _base = str(BASE_DIR)
@@ -801,10 +801,39 @@ async def collect_marketplace(client, data_dir, label):
         db = SupabaseClient()
         hesap_mp = label.split("/")  # label = "vigowood_eu/UK"
         if len(hesap_mp) == 2:
-            db.upsert_kpi_daily(hesap_mp[0], hesap_mp[1], today)
+            hesap_key, marketplace = hesap_mp[0], hesap_mp[1]
+
+            # KPI daily
+            db.upsert_kpi_daily(hesap_key, marketplace, today)
             logger.info("[%s] KPI daily sync tamamlandi", label)
+
+            # Targeting reports + search term reports
+            report_sync_map = [
+                (f"{today}_sp_targeting_report_14d.json", "SP", "14d", "targeting"),
+                (f"{today}_sb_targeting_report_14d.json", "SB", "14d", "targeting"),
+                (f"{today}_sd_targeting_report_14d.json", "SD", "14d", "targeting"),
+                (f"{today}_sd_targeting_report_30d.json", "SD", "30d", "targeting"),
+                (f"{today}_sp_search_term_report_30d.json", "SP", "30d", "search_term"),
+                (f"{today}_sb_search_term_report_30d.json", "SB", "30d", "search_term"),
+            ]
+            for fname, ad_type, period, rtype in report_sync_map:
+                fpath = data_dir / fname
+                if fpath.exists():
+                    try:
+                        import json as _json
+                        with open(fpath, "r", encoding="utf-8") as _f:
+                            rdata = _json.load(_f)
+                        if isinstance(rdata, list) and len(rdata) > 0:
+                            if rtype == "targeting":
+                                db.insert_targeting_reports(hesap_key, marketplace, ad_type, period, today, rdata)
+                            else:
+                                db.insert_search_term_reports(hesap_key, marketplace, ad_type, today, rdata)
+                            logger.info("[%s] %s sync: %d satir", label, fname, len(rdata))
+                    except Exception as re:
+                        logger.warning("[%s] %s sync hatasi: %s", label, fname, re)
+            logger.info("[%s] Rapor sync tamamlandi", label)
     except Exception as e:
-        logger.warning("[%s] KPI daily sync hatasi (collector devam eder): %s", label, e)
+        logger.warning("[%s] Supabase sync hatasi (collector devam eder): %s", label, e)
 
     # Dashboard: Marketplace bazli pipeline tamamlandi
     _final = "completed" if R["basarisiz"] == 0 else "failed" if R["basarili"] == 0 else "completed"
