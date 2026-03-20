@@ -1660,6 +1660,39 @@ def _sync_agent2_to_supabase(hesap_key, marketplace, today,
                        session_id=MAESTRO_SESSION_ID)
         return
 
+    # Portfolio bilgisini Supabase'ten al (tek guvenilir kaynak)
+    # campaign_name uzerinden eslestirme (bid_recommendations'da campaign_id NULL olabiliyor)
+    portfolio_by_name = {}  # campaign_name -> portfolio_name
+    portfolio_by_id = {}    # campaign_id -> portfolio_name
+    try:
+        camp_rows = db._fetch_all(
+            "SELECT campaign_id, name, portfolio_id FROM campaigns WHERE hesap_key=%s AND marketplace=%s AND portfolio_id IS NOT NULL",
+            (hesap_key, marketplace))
+        pf_rows = db._fetch_all(
+            "SELECT portfolio_id, name FROM portfolios WHERE hesap_key=%s AND marketplace=%s",
+            (hesap_key, marketplace))
+        pid_to_name = {str(r[0]): r[1] for r in pf_rows if r[0] and r[1]}
+
+        for r in camp_rows:
+            cid, cname, pid = str(r[0] or ""), r[1] or "", str(r[2] or "")
+            pf_name = pid_to_name.get(pid, "")
+            if pf_name:
+                if cid:
+                    portfolio_by_id[cid] = pf_name
+                if cname:
+                    portfolio_by_name[cname] = pf_name
+        logger.info("Portfolio lookup: %d by id, %d by name", len(portfolio_by_id), len(portfolio_by_name))
+    except Exception as e:
+        logger.warning("Portfolio lookup hatasi (devam eder): %s", e)
+
+    def _get_portfolio(record):
+        """campaign_id veya kampanya_adi uzerinden portfolio ismini dondurur."""
+        cid = str(record.get("campaign_id", "") or "")
+        if cid and cid in portfolio_by_id:
+            return portfolio_by_id[cid]
+        cname = record.get("kampanya_adi") or record.get("kampanya") or record.get("kaynak_kampanya") or ""
+        return portfolio_by_name.get(cname, "")
+
     try:
         # Bid tavsiyeleri
         bid_data = []
@@ -1685,7 +1718,7 @@ def _sync_agent2_to_supabase(hesap_key, marketplace, today,
                 "acos": r.get("acos"),
                 "cvr": r.get("cvr"),
                 "cpc": r.get("cpc"),
-                "portfolio": r.get("portfolio_id", ""),
+                "portfolio": _get_portfolio(r),
                 "reason": r.get("sebep", ""),
                 "karar_durumu": "PENDING",
             })
@@ -1704,7 +1737,7 @@ def _sync_agent2_to_supabase(hesap_key, marketplace, today,
                 "hedefleme": n.get("search_term") or n.get("hedefleme"),
                 "tip": n.get("tip", "KEYWORD"),
                 "sebep": n.get("sebep"),
-                "portfolio": n.get("portfolio_id", ""),
+                "portfolio": _get_portfolio(n),
                 "impressions": n.get("impressions"),
                 "clicks": n.get("clicks"),
                 "spend": n.get("spend") or n.get("cost"),
@@ -1731,7 +1764,7 @@ def _sync_agent2_to_supabase(hesap_key, marketplace, today,
                 "tip": h.get("tip", "KEYWORD"),
                 "match_type": h.get("match_type"),
                 "suggested_bid": h.get("suggested_bid"),
-                "portfolio": h.get("portfolio_id", ""),
+                "portfolio": _get_portfolio(h),
                 "cvr": h.get("cvr", 0),
                 "recommendation": h.get("oneri", "") or h.get("recommendation", ""),
                 "impressions": h.get("impressions"),
