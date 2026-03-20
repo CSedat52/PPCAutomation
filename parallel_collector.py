@@ -433,12 +433,11 @@ async def collect_marketplace(client, data_dir, label):
     today = datetime.utcnow().strftime("%Y-%m-%d")
     R = {"basarili": 0, "basarisiz": 0, "atlanan": 0, "hatalar": []}
 
-    # Dashboard: Agent 1 basliyor (label = "vigowood_na/US")
+    # Dashboard: Marketplace bazli pipeline takibi
     _parts = label.split("/")
     _hk = _parts[0] if len(_parts) == 2 else ""
     _mp = _parts[1] if len(_parts) == 2 else ""
     _session_id = f"parallel_{today}_{_hk}_{_mp}"
-    _dashboard_status("agent1", "running")
     _dashboard_pipeline(_session_id, _hk, _mp, "agent1", "running")
     _save_log("info", f"Agent 1 basliyor (parallel): {label}", "agent1", _hk, _mp, _session_id)
 
@@ -807,12 +806,8 @@ async def collect_marketplace(client, data_dir, label):
     except Exception as e:
         logger.warning("[%s] KPI daily sync hatasi (collector devam eder): %s", label, e)
 
-    # Dashboard: Agent 1 tamamlandi
+    # Dashboard: Marketplace bazli pipeline tamamlandi
     _final = "completed" if R["basarisiz"] == 0 else "failed" if R["basarili"] == 0 else "completed"
-    _dashboard_status("agent1", _final, {
-        "tasks": R["basarili"] + R["basarisiz"] + R["atlanan"],
-        "errors_7d": R["basarisiz"],
-    })
     _dashboard_pipeline(_session_id, _hk, _mp, "agent1", _final)
     _save_log("info", f"Agent 1 tamamlandi (parallel): {label} — {R['basarili']} basarili, {R['basarisiz']} hata",
               "agent1", _hk, _mp, _session_id)
@@ -921,9 +916,10 @@ async def run_all(targets=None):
         logger.info("    %s: %s (tumu paralel)", hk, ", ".join(mp_list))
     logger.info("=" * 60)
 
-    # Dashboard: Maestro/pipeline basladi
-    _save_log("info", f"Parallel collector basladi: {len(account_tasks)} hesap", "maestro")
+    # Dashboard: Pipeline basladi — agent1 running (tum marketplace'ler bitene kadar)
+    _dashboard_status("agent1", "running")
     _dashboard_status("maestro", "running")
+    _save_log("info", f"Parallel collector basladi: {len(account_tasks)} hesap", "maestro")
 
     start_time = time.time()
 
@@ -966,7 +962,12 @@ async def run_all(targets=None):
     logger.info("  Toplam: %d basarili, %d hata", toplam_basarili, toplam_hata)
     logger.info("=" * 60)
 
-    # Dashboard: Tamamlandi
+    # Dashboard: Tum marketplace'ler bitti — agent1 durumunu guncelle
+    _agent1_final = "completed" if toplam_hata == 0 else "failed" if toplam_basarili == 0 else "completed"
+    _dashboard_status("agent1", _agent1_final, {
+        "tasks": toplam_basarili + toplam_hata,
+        "errors_7d": toplam_hata,
+    })
     _dashboard_status("maestro", "ONLINE")
     _save_log("info", f"Parallel collector tamamlandi: {toplam_basarili} basarili, {toplam_hata} hata ({minutes}dk {seconds}sn)", "maestro")
 
