@@ -836,6 +836,7 @@ async def collect_marketplace(client, data_dir, label):
                 ("sp_campaign_negative_keywords", lambda d: db.upsert_negative_keywords(hesap_key, marketplace, "SP", d, "CAMPAIGN")),
                 ("sb_negative_keywords", lambda d: db.upsert_negative_keywords(hesap_key, marketplace, "SB", d, "AD_GROUP")),
                 ("sp_negative_targets", lambda d: db.upsert_negative_targets(hesap_key, marketplace, d)),
+                ("sb_themes", lambda d: db.upsert_themes(hesap_key, marketplace, d)),
             ]
             entity_count = 0
             for suffix, fn in entity_ops:

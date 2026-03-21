@@ -1554,6 +1554,7 @@ def _sync_agent1_to_supabase(hesap_key, marketplace, today, data_dir, R):
         ("sp_campaign_negative_keywords", lambda d: db.upsert_negative_keywords(hesap_key, marketplace, "SP", d, "CAMPAIGN")),
         ("sb_negative_keywords", lambda d: db.upsert_negative_keywords(hesap_key, marketplace, "SB", d, "AD_GROUP")),
         ("sp_negative_targets", lambda d: db.upsert_negative_targets(hesap_key, marketplace, d)),
+        ("sb_themes", lambda d: db.upsert_themes(hesap_key, marketplace, d)),
     ]
 
     entity_count = 0

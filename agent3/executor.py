@@ -814,6 +814,7 @@ def build_targeting_lookup(today=None):
                 "ad_type": ad_type,
                 "campaign_id": cid,
                 "ad_group_id": agid,
+                "state": e.get("state", "enabled"),
                 "bid": e.get("bid", 0),
             }
             # Birincil key: (campaign_id, keyword_text, match_type)
@@ -847,6 +848,7 @@ def build_targeting_lookup(today=None):
                 "ad_type": ad_type,
                 "campaign_id": cid,
                 "ad_group_id": agid,
+                "state": e.get("state", "enabled"),
                 "bid": e.get("bid", 0),
             }
 
@@ -2635,6 +2637,18 @@ async def apply_execution_plan(hesap_key, marketplace, plan_path):
         "sp_negative_target_add": {"method": "POST", "path": "/sp/negativeTargets",
             "content_type": "application/vnd.spNegativeTargetingClause.v3+json",
             "accept": "application/vnd.spNegativeTargetingClause.v3+json", "wrapper_key": "negativeTargetingClauses"},
+        "sp_campaign_create": {"method": "POST", "path": "/sp/campaigns",
+            "content_type": "application/vnd.spCampaign.v3+json",
+            "accept": "application/vnd.spCampaign.v3+json", "wrapper_key": "campaigns"},
+        "sp_ad_group_create": {"method": "POST", "path": "/sp/adGroups",
+            "content_type": "application/vnd.spAdGroup.v3+json",
+            "accept": "application/vnd.spAdGroup.v3+json", "wrapper_key": "adGroups"},
+        "sp_product_ad_create": {"method": "POST", "path": "/sp/productAds",
+            "content_type": "application/vnd.spProductAd.v3+json",
+            "accept": "application/vnd.spProductAd.v3+json", "wrapper_key": "productAds"},
+        "sp_keyword_create": {"method": "POST", "path": "/sp/keywords",
+            "content_type": "application/vnd.spKeyword.v3+json",
+            "accept": "application/vnd.spKeyword.v3+json", "wrapper_key": "keywords"},
     }
 
     results = {
@@ -2736,6 +2750,148 @@ async def apply_execution_plan(hesap_key, marketplace, plan_path):
             logger.error("  BASARISIZ: %s -- %s", op.get("hedefleme",""), error)
 
         await asyncio.sleep(EXECUTE_DELAY)
+
+    # --- FAZ 3: HARVESTING (sub_operations with chain dependency) ---
+    logger.info("--- Faz 3: Harvesting (%d islem) ---", len(plan.get("harvesting_islemleri", [])))
+
+    def extract_entity_id(response, wrapper_key, id_field):
+        """SP v3 response'tan entity ID cikar."""
+        if not isinstance(response, dict):
+            return None
+        inner = response.get(wrapper_key, response)
+        if isinstance(inner, dict):
+            successes = inner.get("success", [])
+            if successes and isinstance(successes[0], dict):
+                val = successes[0].get(id_field)
+                if val:
+                    return str(val)
+                for v in successes[0].values():
+                    if isinstance(v, dict) and id_field in v:
+                        return str(v[id_field])
+        if isinstance(response, dict) and id_field in response:
+            return str(response[id_field])
+        return None
+
+    for harvest in plan.get("harvesting_islemleri", []):
+        if harvest.get("status") != "HAZIR":
+            results["ozet"]["atlanan"] += 1
+            continue
+
+        sub_ops = harvest.get("sub_operations", [])
+        logger.info("Harvesting: %s -- %s (%d sub-op)",
+                     harvest.get("hedefleme", ""), harvest.get("tip", ""), len(sub_ops))
+
+        new_campaign_id = None
+        new_ad_group_id = None
+        chain_broken = False
+        sub_sonuclar = []
+
+        for sub_op in sub_ops:
+            if chain_broken:
+                sub_sonuclar.append({
+                    "op": sub_op.get("op", ""),
+                    "durum": "ATLANDI",
+                    "hata": "Onceki islem basarisiz (chain broken)",
+                })
+                continue
+
+            ep_name = sub_op.get("api_endpoint", "")
+            payload = dict(sub_op.get("api_payload", {}))
+
+            # Placeholder degistir
+            placeholder_fail = False
+            for key in list(payload.keys()):
+                val = payload[key]
+                if val == "__YENI_KAMPANYA_ID__":
+                    if new_campaign_id:
+                        payload[key] = new_campaign_id
+                    else:
+                        placeholder_fail = True
+                        chain_broken = True
+                        sub_sonuclar.append({
+                            "op": sub_op.get("op", ""),
+                            "durum": "BASARISIZ",
+                            "hata": "Kampanya ID henuz mevcut degil",
+                        })
+                        break
+                elif val == "__YENI_AD_GROUP_ID__":
+                    if new_ad_group_id:
+                        payload[key] = new_ad_group_id
+                    else:
+                        placeholder_fail = True
+                        chain_broken = True
+                        sub_sonuclar.append({
+                            "op": sub_op.get("op", ""),
+                            "durum": "BASARISIZ",
+                            "hata": "Ad Group ID henuz mevcut degil",
+                        })
+                        break
+
+            if placeholder_fail:
+                continue
+
+            logger.info("  Sub-op: %s -- %s", sub_op.get("op", ""), ep_name)
+            success, resp, error = await execute_single(ep_name, payload)
+
+            sub_sonuc = {
+                "op": sub_op.get("op", ""),
+                "durum": "BASARILI" if success else "BASARISIZ",
+                "hata": error,
+            }
+
+            if success:
+                ep_info = WRITE_ENDPOINTS.get(ep_name, {})
+                wrapper = ep_info.get("wrapper_key")
+
+                if sub_op.get("op") == "KAMPANYA_OLUSTUR" and wrapper:
+                    extracted = extract_entity_id(resp, wrapper, "campaignId")
+                    if extracted:
+                        new_campaign_id = extracted
+                        sub_sonuc["campaignId"] = extracted
+                        logger.info("    -> Yeni kampanya ID: %s", extracted)
+                    else:
+                        chain_broken = True
+                        sub_sonuc["durum"] = "BASARISIZ"
+                        sub_sonuc["hata"] = f"Kampanya olusturuldu ama ID alinamadi. Response: {json.dumps(resp, ensure_ascii=False)[:300]}"
+                        logger.error("    -> ID alinamadi: %s", json.dumps(resp, ensure_ascii=False)[:300])
+
+                elif sub_op.get("op") == "AD_GROUP_OLUSTUR" and wrapper:
+                    extracted = extract_entity_id(resp, wrapper, "adGroupId")
+                    if extracted:
+                        new_ad_group_id = extracted
+                        sub_sonuc["adGroupId"] = extracted
+                        logger.info("    -> Yeni ad group ID: %s", extracted)
+                    else:
+                        chain_broken = True
+                        sub_sonuc["durum"] = "BASARISIZ"
+                        sub_sonuc["hata"] = f"Ad group olusturuldu ama ID alinamadi. Response: {json.dumps(resp, ensure_ascii=False)[:300]}"
+                        logger.error("    -> ID alinamadi: %s", json.dumps(resp, ensure_ascii=False)[:300])
+                else:
+                    logger.info("    -> BASARILI")
+            else:
+                chain_broken = True
+                logger.error("    -> BASARISIZ: %s", error)
+
+            sub_sonuclar.append(sub_sonuc)
+            await asyncio.sleep(EXECUTE_DELAY)
+
+        # Harvesting ozet durumu
+        failed_subs = [s for s in sub_sonuclar if s["durum"] != "BASARILI"]
+        if failed_subs:
+            results["ozet"]["basarisiz"] += 1
+        else:
+            results["ozet"]["basarili"] += 1
+
+        results["rollback_log"].append({
+            "tip": harvest.get("tip", "HARVEST"),
+            "hedefleme": harvest.get("hedefleme", ""),
+            "yeni_kampanya_adi": harvest.get("kampanya_adi", ""),
+            "kaynak_kampanya": harvest.get("kaynak_kampanya", ""),
+            "source_campaign_id": str(harvest.get("source_campaign_id", "")),
+            "new_campaign_id": new_campaign_id,
+            "new_ad_group_id": new_ad_group_id,
+            "sub_operations": sub_sonuclar,
+        })
 
     # --- ROLLBACK LOG KAYDET ---
     logs_dir = LOG_DIR

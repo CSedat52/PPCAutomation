@@ -359,6 +359,27 @@ class SupabaseClient:
             ))
         return self._upsert_batch("negative_targets", cols, rows, conflict)
 
+    def upsert_themes(self, hesap_key: str, mp: str, data: list) -> int:
+        cols = ["hesap_key", "marketplace", "theme_id", "campaign_id",
+                "ad_group_id", "theme_type", "bid", "state",
+                "raw_data", "collected_at"]
+        conflict = ["hesap_key", "marketplace", "theme_id"]
+        rows = []
+        now = datetime.utcnow()
+        for d in data:
+            rows.append((
+                hesap_key, mp,
+                self._safe_str(d.get("themeId")),
+                self._safe_str(d.get("campaignId")),
+                self._safe_str(d.get("adGroupId")),
+                d.get("themeType"),
+                self._safe_numeric(d.get("bid")),
+                d.get("state"),
+                Json(d),
+                now
+            ))
+        return self._upsert_batch("themes", cols, rows, conflict)
+
     # ==========================================
     # AGENT 1 — RAPOR INSERT (birikmeli)
     # ==========================================
