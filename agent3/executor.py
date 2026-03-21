@@ -100,6 +100,8 @@ DATA_DIR = None
 ANALYSIS_DIR = None
 LOG_DIR = None
 CONFIG_DIR = None
+HESAP_KEY = None
+MARKETPLACE = None
 
 # Maestro pipeline session ID'si (env var ile iletilir, korelasyon icin)
 MAESTRO_SESSION_ID = os.environ.get("MAESTRO_SESSION_ID")
@@ -107,7 +109,9 @@ MAESTRO_SESSION_ID = os.environ.get("MAESTRO_SESSION_ID")
 
 def init_paths(hesap_key, marketplace):
     """Hesap+marketplace icin tum path'leri set eder."""
-    global DATA_DIR, ANALYSIS_DIR, LOG_DIR, CONFIG_DIR
+    global DATA_DIR, ANALYSIS_DIR, LOG_DIR, CONFIG_DIR, HESAP_KEY, MARKETPLACE
+    HESAP_KEY = hesap_key
+    MARKETPLACE = marketplace
 
     dir_name = f"{hesap_key}_{marketplace}"
     DATA_DIR = BASE_DIR / "data" / dir_name
@@ -305,9 +309,8 @@ def _parse_bid_recommendations_from_supabase(today=None):
     try:
         from supabase.db_client import SupabaseClient
         db = SupabaseClient()
-        current = config.CURRENT_ACCOUNT or {}
-        hk = current.get("hesap_key", "")
-        mp = current.get("marketplace", "")
+        hk = HESAP_KEY or ""
+        mp = MARKETPLACE or ""
         if not hk or not mp:
             return None
 
@@ -422,9 +425,8 @@ def _parse_negative_candidates_from_supabase(today=None):
     try:
         from supabase.db_client import SupabaseClient
         db = SupabaseClient()
-        current = config.CURRENT_ACCOUNT or {}
-        hk = current.get("hesap_key", "")
-        mp = current.get("marketplace", "")
+        hk = HESAP_KEY or ""
+        mp = MARKETPLACE or ""
         if not hk or not mp:
             return None
 
@@ -572,9 +574,8 @@ def _parse_harvesting_candidates_from_supabase(today=None):
     try:
         from supabase.db_client import SupabaseClient
         db = SupabaseClient()
-        current = config.CURRENT_ACCOUNT or {}
-        hk = current.get("hesap_key", "")
-        mp = current.get("marketplace", "")
+        hk = HESAP_KEY or ""
+        mp = MARKETPLACE or ""
         if not hk or not mp:
             return None
 
@@ -826,6 +827,7 @@ def build_targeting_lookup(today=None):
     # ---- TARGET ENTITY'LER (SP + SD) ----
     for prefix, ad_type, id_field in [
         ("sp_targets", "SP", "targetId"),
+        ("sb_targets", "SB", "targetId"),
         ("sd_targets", "SD", "targetId"),
     ]:
         fpath = DATA_DIR / f"{today}_{prefix}.json"
@@ -837,7 +839,7 @@ def build_targeting_lookup(today=None):
             eid = str(e.get(id_field, ""))
             cid = str(e.get("campaignId", ""))
             agid = str(e.get("adGroupId", ""))
-            expression = e.get("expression", e.get("targetingExpression", ""))
+            expression = e.get("expression", e.get("expressions", e.get("targetingExpression", "")))
 
             entity_info = {
                 "entity_id": eid,
@@ -872,6 +874,43 @@ def build_targeting_lookup(today=None):
             elif isinstance(expression, str) and expression:
                 key = (cid, expression.lower(), "TARGETING")
                 lookup[key] = entity_info
+
+    # ---- SB THEME ENTITY'LER ----
+    THEME_TYPE_TO_REPORT = {
+        "KEYWORDS_RELATED_TO_YOUR_BRAND": "keywords-related-to-your-brand",
+        "KEYWORDS_RELATED_TO_YOUR_LANDING_PAGES": "keywords-related-to-your-landing-pages",
+    }
+
+    sb_themes_path = DATA_DIR / f"{today}_sb_themes.json"
+    if sb_themes_path.exists():
+        with open(sb_themes_path, "r", encoding="utf-8") as f:
+            themes = json.load(f)
+        for t in themes:
+            tid = str(t.get("themeId", ""))
+            cid = str(t.get("campaignId", ""))
+            agid = str(t.get("adGroupId", ""))
+            theme_type = t.get("themeType", "")
+            report_text = THEME_TYPE_TO_REPORT.get(theme_type, theme_type.lower())
+
+            entity_info = {
+                "entity_id": tid,
+                "entity_type": "THEME",
+                "ad_type": "SB",
+                "campaign_id": cid,
+                "ad_group_id": agid,
+                "state": t.get("state", "enabled"),
+                "bid": t.get("bid", 0),
+            }
+
+            # Birincil key: (campaign_id, report_text, "THEME")
+            key = (cid, report_text, "THEME")
+            lookup[key] = entity_info
+            # Ikincil key: TARGETING ile de bulunabilsin
+            key2 = (cid, report_text, "TARGETING")
+            if key2 not in lookup:
+                lookup[key2] = entity_info
+
+        logger.info("SB Themes: %d theme entity yuklendi", len(themes))
 
     logger.info("Targeting lookup: %d entity (keyword + target + auto-targeting)", len(lookup))
     return lookup
@@ -1081,12 +1120,33 @@ def prepare_bid_change(action, config, campaign_lookup, targeting_lookup):
                 "targetId": entity["entity_id"],
                 "bid": round(yeni_bid, 2),
             }
+        elif ad_type == "SB":
+            result["api_endpoint"] = "sb_target_bid_update"
+            sb_state = entity.get("state", "enabled").lower()
+            result["api_payload"] = {
+                "targetId": entity["entity_id"],
+                "campaignId": entity["campaign_id"],
+                "adGroupId": entity["ad_group_id"],
+                "state": sb_state,
+                "bid": round(yeni_bid, 2),
+            }
         elif ad_type == "SD":
             result["api_endpoint"] = "sd_target_bid_update"
             result["api_payload"] = {
                 "targetId": entity["entity_id"],
                 "bid": round(yeni_bid, 2),
             }
+
+    elif entity_type == "THEME":
+        result["api_endpoint"] = "sb_theme_bid_update"
+        sb_state = entity.get("state", "enabled").lower()
+        result["api_payload"] = {
+            "themeId": entity["entity_id"],
+            "campaignId": entity["campaign_id"],
+            "adGroupId": entity["ad_group_id"],
+            "state": sb_state,
+            "bid": round(yeni_bid, 2),
+        }
 
     result["campaign_id"] = camp_id
     result["entity_id"] = entity["entity_id"]
@@ -1849,7 +1909,12 @@ def process_verification_results(verification_report, actual_data):
         entity_type = task["entity_type"]
 
         # Guncel bid'i bul
-        source = keywords if entity_type == "KEYWORD" else targets
+        if entity_type == "KEYWORD":
+            source = keywords
+        elif entity_type == "THEME":
+            source = actual_data.get("themes", {})
+        else:
+            source = targets
         actual_entity = source.get(entity_id, {})
         gercek_bid = actual_entity.get("bid", None)
 
@@ -2002,6 +2067,7 @@ def load_verify_actual_data(data_date):
     actual = {
         "keywords": {},
         "targets": {},
+        "themes": {},
         "negative_keywords": {},
         "negative_targets": {},
         "campaigns": {},
@@ -2054,6 +2120,30 @@ def load_verify_actual_data(data_date):
                     tid = str(t.get("targetId", ""))
                     if tid:
                         actual["targets"][tid] = {"bid": t.get("bid", 0)}
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    # SB Targets
+    sb_tgt_path = DATA_DIR / f"{prefix}sb_targets.json"
+    if sb_tgt_path.exists():
+        try:
+            with open(sb_tgt_path, "r", encoding="utf-8") as f:
+                for t in json.load(f):
+                    tid = str(t.get("targetId", ""))
+                    if tid:
+                        actual["targets"][tid] = {"bid": t.get("bid", 0)}
+        except (json.JSONDecodeError, IOError):
+            pass
+
+    # SB Themes
+    theme_path = DATA_DIR / f"{prefix}sb_themes.json"
+    if theme_path.exists():
+        try:
+            with open(theme_path, "r", encoding="utf-8") as f:
+                for t in json.load(f):
+                    tid = str(t.get("themeId", ""))
+                    if tid:
+                        actual["themes"][tid] = {"bid": t.get("bid", 0)}
         except (json.JSONDecodeError, IOError):
             pass
 
@@ -2485,6 +2575,191 @@ def run_executor(hesap_key, marketplace, today=None, force_execute=False):
         }
 
 
+async def apply_execution_plan(hesap_key, marketplace, plan_path):
+    """
+    Execution plan dosyasini okuyup dogrudan Amazon API'ye gonderir.
+    MCP server'a bagimlilik olmadan calisir.
+    parallel_collector.py'deki AmazonAdsClient'i kullanir.
+    """
+    import asyncio
+    sys.path.insert(0, str(BASE_DIR))
+    from parallel_collector import AmazonAdsClient, load_accounts
+
+    accounts = load_accounts()
+    lwa = accounts["lwa_app"]
+    hesap = accounts["hesaplar"][hesap_key]
+    mp_config = hesap["marketplaces"][marketplace]
+
+    config = {
+        "client_id": lwa["client_id"],
+        "client_secret": lwa["client_secret"],
+        "refresh_token": hesap["refresh_token"],
+        "marketplace": marketplace,
+        "profile_id": mp_config["profile_id"],
+        "account_id": hesap["account_id"],
+        "api_endpoint": hesap["api_endpoint"],
+        "token_endpoint": hesap["token_endpoint"],
+    }
+    client = AmazonAdsClient(config)
+
+    with open(plan_path, "r", encoding="utf-8") as f:
+        plan = json.load(f)
+
+    # Plan dosya adindan tarihi cikar
+    fname = Path(plan_path).name
+    today = fname[:10] if len(fname) >= 10 and fname[4] == "-" else datetime.utcnow().strftime("%Y-%m-%d")
+
+    # WRITE_ENDPOINTS — executor icinde tanimla (amazon_ads_mcp'ye bagimlilik olmasin)
+    WRITE_ENDPOINTS = {
+        "sp_keyword_bid_update": {"method": "PUT", "path": "/sp/keywords",
+            "content_type": "application/vnd.spKeyword.v3+json",
+            "accept": "application/vnd.spKeyword.v3+json", "wrapper_key": "keywords"},
+        "sp_target_bid_update": {"method": "PUT", "path": "/sp/targets",
+            "content_type": "application/vnd.spTargetingClause.v3+json",
+            "accept": "application/vnd.spTargetingClause.v3+json", "wrapper_key": "targetingClauses"},
+        "sb_keyword_bid_update": {"method": "PUT", "path": "/sb/keywords",
+            "content_type": "application/json", "accept": "*/*", "wrapper_key": None},
+        "sb_target_bid_update": {"method": "PUT", "path": "/sb/targets",
+            "content_type": "application/json", "accept": "*/*", "wrapper_key": None},
+        "sb_theme_bid_update": {"method": "PUT", "path": "/sb/themes",
+            "content_type": "application/json",
+            "accept": "application/vnd.sbthemesupdateresponse.v3+json", "wrapper_key": "themes"},
+        "sd_target_bid_update": {"method": "PUT", "path": "/sd/targets",
+            "content_type": "application/json", "accept": "application/json", "wrapper_key": None},
+        "sp_negative_keyword_add": {"method": "POST", "path": "/sp/negativeKeywords",
+            "content_type": "application/vnd.spNegativeKeyword.v3+json",
+            "accept": "application/vnd.spNegativeKeyword.v3+json", "wrapper_key": "negativeKeywords"},
+        "sp_campaign_negative_keyword_add": {"method": "POST", "path": "/sp/campaignNegativeKeywords",
+            "content_type": "application/vnd.spCampaignNegativeKeyword.v3+json",
+            "accept": "application/vnd.spCampaignNegativeKeyword.v3+json", "wrapper_key": "campaignNegativeKeywords"},
+        "sp_negative_target_add": {"method": "POST", "path": "/sp/negativeTargets",
+            "content_type": "application/vnd.spNegativeTargetingClause.v3+json",
+            "accept": "application/vnd.spNegativeTargetingClause.v3+json", "wrapper_key": "negativeTargetingClauses"},
+    }
+
+    results = {
+        "tarih": today, "durum": "BASLATILDI",
+        "bid_sonuclari": [], "negatif_sonuclari": [], "hatalar": [],
+        "rollback_log": [],
+        "ozet": {"basarili": 0, "basarisiz": 0, "atlanan": 0},
+    }
+
+    EXECUTE_DELAY = 0.3
+
+    async def execute_single(ep_name, payload):
+        ep = WRITE_ENDPOINTS.get(ep_name)
+        if not ep:
+            return False, {}, f"Bilinmeyen endpoint: {ep_name}"
+        wrapper = ep["wrapper_key"]
+        body = {wrapper: [payload]} if wrapper else [payload]
+        try:
+            resp = await client._request_with_retry(
+                ep["method"], ep["path"], body,
+                content_type=ep["content_type"], accept=ep["accept"]
+            )
+            if wrapper and isinstance(resp, dict):
+                inner = resp.get(wrapper, resp)
+                if isinstance(inner, dict) and inner.get("error"):
+                    return False, resp, f"API error: {json.dumps(inner['error'])[:500]}"
+                return True, resp, None
+            if isinstance(resp, list):
+                for item in resp:
+                    if isinstance(item, dict) and "code" in item:
+                        if str(item.get("code", "")).upper() not in ("SUCCESS", "200"):
+                            return False, resp, f"API error: {json.dumps(item)[:500]}"
+                return True, resp, None
+            return True, resp, None
+        except Exception as e:
+            return False, {}, f"Exception: {str(e)[:300]}"
+
+    # --- BID DEGISIKLIKLERI ---
+    logger.info("--- Faz 1: Bid Degisiklikleri (%d islem) ---", len(plan.get("bid_islemleri", [])))
+    for op in plan.get("bid_islemleri", []):
+        if op.get("status") != "HAZIR":
+            results["ozet"]["atlanan"] += 1
+            continue
+
+        ep_name = op.get("api_endpoint", "")
+        payload = op.get("api_payload", {})
+        success, resp, error = await execute_single(ep_name, payload)
+
+        if success:
+            results["ozet"]["basarili"] += 1
+            _entity_id, _entity_type, _ad_type = "", "", ""
+            if "keywordId" in payload: _entity_id, _entity_type = str(payload["keywordId"]), "KEYWORD"
+            elif "targetId" in payload: _entity_id, _entity_type = str(payload["targetId"]), "TARGET"
+            elif "themeId" in payload: _entity_id, _entity_type = str(payload["themeId"]), "THEME"
+            if ep_name.startswith("sp_"): _ad_type = "SP"
+            elif ep_name.startswith("sb_"): _ad_type = "SB"
+            elif ep_name.startswith("sd_"): _ad_type = "SD"
+
+            results["rollback_log"].append({
+                "tip": "BID_DEGISIKLIGI",
+                "kampanya": op.get("kampanya", ""), "hedefleme": op.get("hedefleme", ""),
+                "eski_bid": op.get("eski_bid"), "yeni_bid": op.get("yeni_bid"),
+                "entity_id": _entity_id, "entity_type": _entity_type,
+                "ad_type": _ad_type, "campaign_id": str(payload.get("campaignId", "")),
+                "api_endpoint": ep_name, "api_payload": payload,
+                "rollback": f"Bid'i {op.get('eski_bid')} olarak geri al",
+            })
+            logger.info("  BASARILI: %s -- %s (%.2f)", op.get("kampanya",""), op.get("hedefleme",""), payload.get("bid",0))
+        else:
+            results["ozet"]["basarisiz"] += 1
+            results["hatalar"].append({"faz": "BID", "hata": error})
+            logger.error("  BASARISIZ: %s -- %s", op.get("hedefleme",""), error)
+
+        await asyncio.sleep(EXECUTE_DELAY)
+
+    # --- NEGATIF EKLEMELER ---
+    logger.info("--- Faz 2: Negatif Eklemeler (%d islem) ---", len(plan.get("negatif_islemleri", [])))
+    for op in plan.get("negatif_islemleri", []):
+        if op.get("status") != "HAZIR":
+            results["ozet"]["atlanan"] += 1
+            continue
+
+        ep_name = op.get("api_endpoint", "")
+        payload = op.get("api_payload", {})
+        success, resp, error = await execute_single(ep_name, payload)
+
+        if success:
+            results["ozet"]["basarili"] += 1
+            results["rollback_log"].append({
+                "tip": op.get("tip", "NEGATIF"),
+                "kampanya": op.get("kampanya", ""), "hedefleme": op.get("hedefleme", ""),
+                "campaign_id": str(payload.get("campaignId", "")),
+                "api_endpoint": ep_name, "api_payload": payload,
+            })
+            logger.info("  BASARILI: %s -- %s", op.get("kampanya",""), op.get("hedefleme",""))
+        else:
+            results["ozet"]["basarisiz"] += 1
+            results["hatalar"].append({"faz": "NEGATIF", "hata": error})
+            logger.error("  BASARISIZ: %s -- %s", op.get("hedefleme",""), error)
+
+        await asyncio.sleep(EXECUTE_DELAY)
+
+    # --- ROLLBACK LOG KAYDET ---
+    logs_dir = LOG_DIR
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    rollback = {
+        "tarih": today,
+        "olusturma_zamani": datetime.utcnow().isoformat(),
+        "islemler": results["rollback_log"],
+    }
+    rollback_path = logs_dir / f"{today}_rollback.json"
+    with open(rollback_path, "w", encoding="utf-8") as f:
+        json.dump(rollback, f, indent=2, ensure_ascii=False)
+
+    results["durum"] = "TAMAMLANDI"
+    results["rollback_dosyasi"] = str(rollback_path)
+
+    ozet = results["ozet"]
+    logger.info("=== EXECUTION TAMAMLANDI: %d basarili, %d basarisiz, %d atlanan ===",
+                ozet["basarili"], ozet["basarisiz"], ozet["atlanan"])
+
+    await client.close()
+    return results
+
+
 def _run_executor_impl(today, force_execute=False, hesap_key="", marketplace=""):
 
     # 0. On kontrol — Agent 2 raporlari mevcut mu?
@@ -2832,5 +3107,17 @@ if __name__ == "__main__":
                 print(f"\n--- Dogrulama icin once verify verilerini cekin ---")
     else:
         force = "--execute" in sys.argv
+        apply_direct = "--apply" in sys.argv
         result = run_executor(hesap_key, marketplace, today=custom_date, force_execute=force)
         print(json.dumps(result, indent=2, ensure_ascii=False))
+
+        # --apply: Plan olusturulduktan sonra dogrudan Amazon API'ye gonder
+        if apply_direct and force:
+            plan_path = result.get("plan_dosyasi")
+            if plan_path and Path(plan_path).exists():
+                import asyncio
+                logger.info("=== APPLY: Execution plan Amazon API'ye gonderiliyor ===")
+                apply_result = asyncio.run(apply_execution_plan(hesap_key, marketplace, plan_path))
+                print(json.dumps(apply_result, indent=2, ensure_ascii=False))
+            else:
+                logger.error("Plan dosyasi bulunamadi, --apply uygulanamadi")

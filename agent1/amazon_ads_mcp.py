@@ -234,6 +234,18 @@ WRITE_ENDPOINTS = {
         "accept": "application/json",
         "wrapper_key": None,
     },
+    "sb_target_bid_update": {
+        "method": "PUT", "path": "/sb/targets",
+        "content_type": "application/json",
+        "accept": "*/*",
+        "wrapper_key": None,
+    },
+    "sb_theme_bid_update": {
+        "method": "PUT", "path": "/sb/themes",
+        "content_type": "application/json",
+        "accept": "application/vnd.sbthemesupdateresponse.v3+json",
+        "wrapper_key": "themes",
+    },
     # --- NEGATIVE ADDITIONS (POST) ---
     "sp_negative_keyword_add": {
         "method": "POST", "path": "/sp/negativeKeywords",
@@ -1041,6 +1053,15 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
                                ["enabled"], "negativeKeywords",
                                method="GET",
                                accept="application/vnd.sbnegativekeyword.v3.2+json"),
+        # SB Themes
+        collect_list_throttled("sb_themes", "/sb/themes/list",
+                               ["enabled", "paused"], "themes",
+                               content_type="application/json",
+                               accept="application/vnd.sbthemeslistresponse.v3+json",
+                               custom_body={
+                                   "stateFilter": {"include": ["enabled", "paused"]},
+                                   "maxResults": 100
+                               }),
         # SD Entities (3)
         collect_list_throttled("sd_campaigns", "/sd/campaigns",
                                ["enabled", "paused"], "campaigns",
@@ -1057,7 +1078,7 @@ async def amazon_ads_collect_all_data(params: AccountInput, ctx: Context = None)
         "portfolios",
         "sp_campaigns", "sp_ad_groups", "sp_product_ads", "sp_keywords", "sp_targets",
         "sp_negative_keywords", "sp_campaign_negative_keywords", "sp_negative_targets",
-        "sb_campaigns", "sb_ad_groups", "sb_keywords", "sb_targets", "sb_negative_keywords",
+        "sb_campaigns", "sb_ad_groups", "sb_keywords", "sb_targets", "sb_negative_keywords", "sb_themes",
         "sd_campaigns", "sd_ad_groups", "sd_targets",
     ]
 
@@ -1723,6 +1744,29 @@ async def amazon_ads_collect_verify_data(params: VerifyInput, ctx: Context = Non
                                    accept=SB_CONTENT_TYPES["keywords"])
     R["sb_keyword_sayisi"] = len(sb_kws)
 
+    # SB targets (SB ASIN targeting dogrulama icin)
+    sb_targets = await collect_verify("sb_targets", "/sb/targets/list",
+                                       ["enabled", "paused"], "targets",
+                                       content_type="application/json",
+                                       accept=SB_CONTENT_TYPES["targets"],
+                                       custom_body={
+                                           "filters": [{"filterType": "TARGETING_STATE",
+                                                        "values": ["enabled", "paused"]}],
+                                           "maxResults": 100
+                                       })
+    R["sb_target_sayisi"] = len(sb_targets)
+
+    # SB themes (theme-based targeting dogrulama icin)
+    sb_themes = await collect_verify("sb_themes", "/sb/themes/list",
+                                      ["enabled", "paused"], "themes",
+                                      content_type="application/json",
+                                      accept="application/vnd.sbthemeslistresponse.v3+json",
+                                      custom_body={
+                                          "stateFilter": {"include": ["enabled", "paused"]},
+                                          "maxResults": 100
+                                      })
+    R["sb_theme_sayisi"] = len(sb_themes)
+
     # SD targets
     sd_targets = await collect_verify("sd_targets", "/sd/targets",
                                        ["enabled", "paused"], "targets",
@@ -1895,6 +1939,9 @@ async def amazon_ads_execute_plan(params: ExecutePlanInput, ctx: Context = None)
             elif "targetId" in payload:
                 _entity_id = str(payload["targetId"])
                 _entity_type = "TARGET"
+            elif "themeId" in payload:
+                _entity_id = str(payload["themeId"])
+                _entity_type = "THEME"
             if ep_name.startswith("sp_"):
                 _ad_type = "SP"
             elif ep_name.startswith("sb_"):

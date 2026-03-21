@@ -575,6 +575,11 @@ async def collect_marketplace(client, data_dir, label):
                                                          "values": ["enabled", "paused"]}], "maxResults": 100}),
         collect_list_throttled("sb_negative_keywords", "/sb/negativeKeywords", ["enabled"], "negativeKeywords",
                                method="GET", accept="application/vnd.sbnegativekeyword.v3.2+json"),
+        # SB Themes (theme-based targeting: keywords-related-to-brand/landing-pages)
+        collect_list_throttled("sb_themes", "/sb/themes/list", ["enabled", "paused"], "themes",
+                               content_type="application/json",
+                               accept="application/vnd.sbthemeslistresponse.v3+json",
+                               custom_body={"stateFilter": {"include": ["enabled", "paused"]}, "maxResults": 100}),
         # SD Entities (3)
         collect_list_throttled("sd_campaigns", "/sd/campaigns", ["enabled", "paused"], "campaigns", method="GET"),
         collect_list_throttled("sd_ad_groups", "/sd/adGroups", ["enabled", "paused"], "adGroups", method="GET"),
@@ -588,7 +593,7 @@ async def collect_marketplace(client, data_dir, label):
         "portfolios",
         "sp_campaigns", "sp_ad_groups", "sp_product_ads", "sp_keywords", "sp_targets",
         "sp_negative_keywords", "sp_campaign_negative_keywords", "sp_negative_targets",
-        "sb_campaigns", "sb_ad_groups", "sb_keywords", "sb_targets", "sb_negative_keywords",
+        "sb_campaigns", "sb_ad_groups", "sb_keywords", "sb_targets", "sb_negative_keywords", "sb_themes",
         "sd_campaigns", "sd_ad_groups", "sd_targets",
     ]
     entity_map = dict(zip(entity_names, entity_results))
