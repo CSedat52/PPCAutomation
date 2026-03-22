@@ -19,6 +19,7 @@ KRITIK KURAL:
   AGENT_KURAL         — settings.json → ozel_kurallar
 """
 
+import os
 import json
 import logging
 import hashlib
@@ -279,16 +280,64 @@ class ProposalEngine:
         }
 
     def _kaydet(self, oneri: dict):
+        # Supabase'e yaz
+        hk = os.environ.get("HESAP_KEY", "")
+        mp = os.environ.get("MARKETPLACE", "")
+        if hk and mp:
+            try:
+                from supabase.db_client import SupabaseClient
+                db = SupabaseClient()
+                db.upsert_proposal(hk, mp, {
+                    "id": oneri["id"],
+                    "kategori": oneri.get("kategori", ""),
+                    "baslik": oneri.get("ne", ""),
+                    "aciklama": oneri.get("neden", ""),
+                    "gerekce": oneri.get("kanit", ""),
+                    "beklenen_sonuc": oneri.get("beklenen_sonuc", ""),
+                    "gerceklesen_sonuc": oneri.get("gerceklesen_sonuc", ""),
+                    "status": oneri.get("durum", "PENDING"),
+                })
+                logger.info("Öneri Supabase'e kaydedildi: %s", oneri["id"])
+            except Exception as e:
+                logger.warning("Öneri Supabase'e yazilamadi: %s", e)
+
+        # JSON dosyasina da yaz (fallback)
         path = self.proposals_dir / f"{oneri['id']}.json"
-        # Aynı ID varsa üzerine yazma — mevcut durumu koru
         if path.exists():
             return
         with open(path, "w", encoding="utf-8") as f:
             json.dump(oneri, f, indent=2, ensure_ascii=False)
-        logger.info("Öneri kaydedildi: %s — %s", oneri["id"], oneri["ne"][:60])
 
     # ----------------------------------------------------------------- utils
     def _get_asin_parametre(self, asin: str, parametre: str, varsayilan):
+        """ASIN parametresini Supabase asin_bid_params'dan yukler. Fallback: bid_functions.json."""
+        hk = os.environ.get("HESAP_KEY", "")
+        mp = os.environ.get("MARKETPLACE", "")
+        if hk and mp:
+            try:
+                from supabase.db_client import SupabaseClient
+                db = SupabaseClient()
+                conn = db._conn()
+                cur = conn.cursor()
+                cur.execute("SELECT aktif, hassasiyet, max_degisim FROM asin_bid_params WHERE hesap_key = %s AND marketplace = %s AND asin = %s", (hk, mp, asin))
+                row = cur.fetchone()
+                cur.close()
+                conn.close()
+                if row and row[0]:  # aktif=True
+                    params = {"hassasiyet": float(row[1] or 0.5), "max_degisim": float(row[2] or 0.2)}
+                    if parametre in params:
+                        return params[parametre]
+                # Global tanh parametrelerini Supabase'den al
+                cur2 = db._conn().cursor()
+                cur2.execute("SELECT tanh_formulu FROM bid_functions WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+                row2 = cur2.fetchone()
+                cur2.connection.close()
+                if row2 and row2[0]:
+                    tf = row2[0] if isinstance(row2[0], dict) else json.loads(row2[0])
+                    return tf.get(parametre, varsayilan)
+            except Exception:
+                pass
+
         bid_path = self.config_dir / "bid_functions.json"
         try:
             with open(bid_path, "r", encoding="utf-8") as f:
@@ -301,6 +350,32 @@ class ProposalEngine:
             return varsayilan
 
     def _get_settings_deger(self, yol: str, varsayilan):
+        """Settings degerini Supabase'den yukler. Fallback: settings.json."""
+        hk = os.environ.get("HESAP_KEY", "")
+        mp = os.environ.get("MARKETPLACE", "")
+        if hk and mp:
+            try:
+                from supabase.db_client import SupabaseClient
+                db = SupabaseClient()
+                conn = db._conn()
+                cur = conn.cursor()
+                cur.execute("SELECT genel_ayarlar, esik_degerleri, segmentasyon_kurallari, agent3_ayarlari FROM settings WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+                row = cur.fetchone()
+                cur.close()
+                conn.close()
+                if row:
+                    s = {}
+                    for i, key in enumerate(["genel_ayarlar", "esik_degerleri", "segmentasyon_kurallari", "agent3_ayarlari"]):
+                        if row[i]:
+                            s[key] = row[i] if isinstance(row[i], dict) else json.loads(row[i])
+                    parcalar = yol.split(".")
+                    obj = s
+                    for p in parcalar:
+                        obj = obj[p]
+                    return obj
+            except Exception:
+                pass
+
         settings_path = self.config_dir / "settings.json"
         try:
             with open(settings_path, "r", encoding="utf-8") as f:

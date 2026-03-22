@@ -114,15 +114,50 @@ def init_account(hesap_key, marketplace):
 
 
 def load_accounts():
-    """accounts.json dosyasini yukler."""
+    """Hesap bilgilerini Supabase'den yukler. Basarisizsa accounts.json'a fallback."""
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        conn = db._conn()
+        cur = conn.cursor()
+        cur.execute("SELECT hesap_key, marketplace, aktif FROM marketplaces WHERE aktif = true")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        if rows:
+            # accounts.json formatina donustur (geriye uyumluluk)
+            hesaplar = {}
+            for hk, mp, aktif in rows:
+                if hk not in hesaplar:
+                    hesaplar[hk] = {"marketplaces": {}}
+                hesaplar[hk]["marketplaces"][mp] = {"aktif": True}
+            return {"hesaplar": hesaplar}
+    except Exception:
+        pass
+
     with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def get_active_pipelines():
-    """Aktif hesap+marketplace kombinasyonlarini sirasiyla doner."""
+    """Aktif hesap+marketplace kombinasyonlarini Supabase'den sirasiyla doner."""
+    # Once Supabase'den dene
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        conn = db._conn()
+        cur = conn.cursor()
+        cur.execute("SELECT hesap_key, marketplace FROM marketplaces WHERE aktif = true ORDER BY hesap_key, marketplace")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        if rows:
+            return [{"hesap_key": hk, "marketplace": mp} for hk, mp in rows]
+    except Exception:
+        pass
+
+    # Fallback: accounts.json
     accounts = load_accounts()
-    # Pipeline sirasi accounts.json'da tanimli
     sira = accounts.get("pipeline_ayarlari", {}).get("calisma_sirasi", [])
     if sira:
         result = []
@@ -133,7 +168,6 @@ def get_active_pipelines():
             if mp_config.get("aktif", False):
                 result.append({"hesap_key": hesap_key, "marketplace": mp})
         return result
-    # Sira tanimli degilse tum aktif kombinasyonlari don
     result = []
     for hesap_key, hesap in accounts.get("hesaplar", {}).items():
         for mp_code, mp_config in hesap.get("marketplaces", {}).items():

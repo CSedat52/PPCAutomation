@@ -123,12 +123,34 @@ def init_paths(hesap_key, marketplace):
 
 
 def load_settings():
-    """Config dosyasini yukler."""
+    """Settings'i Supabase'den yukler. Basarisizsa JSON dosyasina fallback."""
+    hk = os.environ.get("HESAP_KEY", "")
+    mp = os.environ.get("MARKETPLACE", "")
+    if hk and mp:
+        try:
+            from supabase.db_client import SupabaseClient
+            db = SupabaseClient()
+            conn = db._conn()
+            cur = conn.cursor()
+            cur.execute("SELECT genel_ayarlar, esik_degerleri, asin_hedefleri, segmentasyon_kurallari, agent3_ayarlari FROM settings WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            if row:
+                result = {}
+                for i, key in enumerate(["genel_ayarlar", "esik_degerleri", "asin_hedefleri", "segmentasyon_kurallari", "agent3_ayarlari"]):
+                    if row[i]:
+                        result[key] = row[i] if isinstance(row[i], dict) else json.loads(row[i])
+                logger.info("Settings Supabase'den yuklendi (%s/%s)", hk, mp)
+                return result
+        except Exception as e:
+            logger.warning("Settings Supabase'den okunamadi, dosyaya fallback: %s", e)
+
     settings_path = CONFIG_DIR / "settings.json"
-    if not settings_path.exists():
-        raise FileNotFoundError(f"Config dosyasi bulunamadi: {settings_path}")
-    with open(settings_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    if settings_path.exists():
+        with open(settings_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    raise FileNotFoundError(f"Settings bulunamadi: Supabase ve {settings_path}")
 
 
 def get_agent3_config(settings):
@@ -726,76 +748,120 @@ def check_daily_limit(total_actions, config):
 
 def build_campaign_lookup(today=None):
     """
-    Agent 1'in cektigi kampanya listelerinden kampanya_adi → kampanya_id eslemesi olusturur.
-    Ayrica kampanya_id → ad_group_id ve portfolio bilgilerini de toplar.
+    Kampanya/AdGroup/Portfolio lookup'ini Supabase'den olusturur.
+    Basarisizsa JSON dosyalarina fallback yapar.
     """
     if today is None:
         today = datetime.utcnow().strftime("%Y-%m-%d")
 
     lookup = {
-        "by_name": {},       # kampanya_adi → {id, ad_type, portfolio_id, portfolio_name}
-        "by_id": {},         # kampanya_id → {name, ad_type, portfolio_id, portfolio_name}
-        "ad_groups": {},     # kampanya_id → [ad_group dicts]
-        "portfolios": {},    # portfolio_id → portfolio_name
+        "by_name": {},
+        "by_id": {},
+        "ad_groups": {},
+        "portfolios": {},
     }
 
-    # Portfolio listesi
-    portfolio_file = DATA_DIR / f"{today}_portfolios.json"
-    if portfolio_file.exists():
-        with open(portfolio_file, "r", encoding="utf-8") as f:
-            portfolios = json.load(f)
-        for p in portfolios:
-            pid = str(p.get("portfolioId", ""))
-            pname = p.get("name", "")
-            if pid:
-                lookup["portfolios"][pid] = pname
+    hk = os.environ.get("HESAP_KEY", "")
+    mp = os.environ.get("MARKETPLACE", "")
+    supabase_ok = False
 
-    # Kampanya listeleri (SP, SB, SD)
-    for prefix, ad_type in [("sp_campaigns", "SP"), ("sb_campaigns", "SB"), ("sd_campaigns", "SD")]:
-        fpath = DATA_DIR / f"{today}_{prefix}.json"
-        if not fpath.exists():
-            continue
-        with open(fpath, "r", encoding="utf-8") as f:
-            camps = json.load(f)
-        for c in camps:
-            cid = str(c.get("campaignId", ""))
-            cname = c.get("name", c.get("campaignName", ""))
-            pid = str(c.get("portfolioId", ""))
-            pname = lookup["portfolios"].get(pid, "")
-            info = {
-                "id": cid,
-                "name": cname,
-                "ad_type": ad_type,
-                "portfolio_id": pid,
-                "portfolio_name": pname,
-                "state": c.get("state", ""),
-            }
-            if cname:
-                lookup["by_name"][cname] = info
-            if cid:
-                lookup["by_id"][cid] = info
+    if hk and mp:
+        try:
+            from supabase.db_client import SupabaseClient
+            db = SupabaseClient()
+            conn = db._conn()
+            cur = conn.cursor()
 
-    # Ad Group listeleri
-    for prefix, ad_type in [("sp_ad_groups", "SP"), ("sb_ad_groups", "SB"), ("sd_ad_groups", "SD")]:
-        fpath = DATA_DIR / f"{today}_{prefix}.json"
-        if not fpath.exists():
-            continue
-        with open(fpath, "r", encoding="utf-8") as f:
-            groups = json.load(f)
-        for g in groups:
-            cid = str(g.get("campaignId", ""))
-            if cid not in lookup["ad_groups"]:
-                lookup["ad_groups"][cid] = []
-            lookup["ad_groups"][cid].append({
-                "ad_group_id": str(g.get("adGroupId", "")),
-                "name": g.get("name", ""),
-                "state": g.get("state", ""),
-                "default_bid": g.get("defaultBid", 0),
-            })
+            # Portfolios
+            cur.execute("SELECT portfolio_id, name FROM portfolios WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+            for pid, pname in cur.fetchall():
+                if pid:
+                    lookup["portfolios"][str(pid)] = pname
 
-    logger.info("Kampanya lookup: %d kampanya, %d ad group, %d portfolio",
-                len(lookup["by_id"]), sum(len(v) for v in lookup["ad_groups"].values()),
-                len(lookup["portfolios"]))
+            # Campaigns
+            cur.execute("SELECT campaign_id, name, ad_type, portfolio_id, state FROM campaigns WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+            for cid, cname, ad_type, pid, state in cur.fetchall():
+                cid_s = str(cid or "")
+                pid_s = str(pid or "")
+                pname = lookup["portfolios"].get(pid_s, "")
+                info = {"id": cid_s, "name": cname, "ad_type": ad_type or "SP", "portfolio_id": pid_s, "portfolio_name": pname, "state": state or ""}
+                if cname:
+                    lookup["by_name"][cname] = info
+                if cid_s:
+                    lookup["by_id"][cid_s] = info
+
+            # Ad Groups
+            cur.execute("SELECT campaign_id, ad_group_id, name, state, default_bid FROM ad_groups WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+            for cid, agid, name, state, bid in cur.fetchall():
+                cid_s = str(cid or "")
+                if cid_s not in lookup["ad_groups"]:
+                    lookup["ad_groups"][cid_s] = []
+                lookup["ad_groups"][cid_s].append({
+                    "ad_group_id": str(agid or ""),
+                    "name": name or "",
+                    "state": state or "",
+                    "default_bid": bid or 0,
+                })
+
+            cur.close()
+            conn.close()
+            supabase_ok = True
+            logger.info("Kampanya lookup Supabase'den yuklendi: %d kampanya, %d ad group, %d portfolio",
+                        len(lookup["by_id"]), sum(len(v) for v in lookup["ad_groups"].values()),
+                        len(lookup["portfolios"]))
+        except Exception as e:
+            logger.warning("Kampanya lookup Supabase hatasi, JSON fallback: %s", e)
+
+    if not supabase_ok:
+        # JSON dosyalarina fallback
+        portfolio_file = DATA_DIR / f"{today}_portfolios.json"
+        if portfolio_file.exists():
+            with open(portfolio_file, "r", encoding="utf-8") as f:
+                portfolios = json.load(f)
+            for p in portfolios:
+                pid = str(p.get("portfolioId", ""))
+                pname = p.get("name", "")
+                if pid:
+                    lookup["portfolios"][pid] = pname
+
+        for prefix, ad_type in [("sp_campaigns", "SP"), ("sb_campaigns", "SB"), ("sd_campaigns", "SD")]:
+            fpath = DATA_DIR / f"{today}_{prefix}.json"
+            if not fpath.exists():
+                continue
+            with open(fpath, "r", encoding="utf-8") as f:
+                camps = json.load(f)
+            for c in camps:
+                cid = str(c.get("campaignId", ""))
+                cname = c.get("name", c.get("campaignName", ""))
+                pid = str(c.get("portfolioId", ""))
+                pname = lookup["portfolios"].get(pid, "")
+                info = {"id": cid, "name": cname, "ad_type": ad_type, "portfolio_id": pid, "portfolio_name": pname, "state": c.get("state", "")}
+                if cname:
+                    lookup["by_name"][cname] = info
+                if cid:
+                    lookup["by_id"][cid] = info
+
+        for prefix, ad_type in [("sp_ad_groups", "SP"), ("sb_ad_groups", "SB"), ("sd_ad_groups", "SD")]:
+            fpath = DATA_DIR / f"{today}_{prefix}.json"
+            if not fpath.exists():
+                continue
+            with open(fpath, "r", encoding="utf-8") as f:
+                groups = json.load(f)
+            for g in groups:
+                cid = str(g.get("campaignId", ""))
+                if cid not in lookup["ad_groups"]:
+                    lookup["ad_groups"][cid] = []
+                lookup["ad_groups"][cid].append({
+                    "ad_group_id": str(g.get("adGroupId", "")),
+                    "name": g.get("name", ""),
+                    "state": g.get("state", ""),
+                    "default_bid": g.get("defaultBid", 0),
+                })
+
+        logger.info("Kampanya lookup JSON'dan yuklendi: %d kampanya, %d ad group, %d portfolio",
+                    len(lookup["by_id"]), sum(len(v) for v in lookup["ad_groups"].values()),
+                    len(lookup["portfolios"]))
+
     return lookup
 
 
@@ -854,90 +920,120 @@ def build_targeting_lookup(today=None):
 
     lookup = {}  # key: (kampanya_id, hedefleme_text, match_type) → entity bilgisi
 
-    # ---- KEYWORD ENTITY'LER (SP + SB) ----
-    for prefix, ad_type, id_field, text_field in [
-        ("sp_keywords", "SP", "keywordId", "keywordText"),
-        ("sb_keywords", "SB", "keywordId", "keywordText"),
-    ]:
-        fpath = DATA_DIR / f"{today}_{prefix}.json"
-        if not fpath.exists():
-            continue
-        with open(fpath, "r", encoding="utf-8") as f:
-            entities = json.load(f)
-        for e in entities:
-            eid = str(e.get(id_field, ""))
-            text = e.get(text_field, "")
-            mt = e.get("matchType", "")
-            cid = str(e.get("campaignId", ""))
-            agid = str(e.get("adGroupId", ""))
-            entity_info = {
-                "entity_id": eid,
-                "entity_type": "KEYWORD",
-                "ad_type": ad_type,
-                "campaign_id": cid,
-                "ad_group_id": agid,
-                "state": e.get("state", "enabled"),
-                "bid": e.get("bid", 0),
-            }
-            # Birincil key: (campaign_id, keyword_text, match_type)
-            key = (cid, text.lower(), mt.upper())
-            lookup[key] = entity_info
-            # Ikincil key: TARGETING ile de bulunabilsin (fallback)
-            key2 = (cid, text.lower(), "TARGETING")
-            if key2 not in lookup:
-                lookup[key2] = entity_info
+    hk = os.environ.get("HESAP_KEY", "")
+    mp = os.environ.get("MARKETPLACE", "")
+    supabase_ok = False
 
-    # ---- TARGET ENTITY'LER (SP + SD) ----
-    for prefix, ad_type, id_field in [
-        ("sp_targets", "SP", "targetId"),
-        ("sb_targets", "SB", "targetId"),
-        ("sd_targets", "SD", "targetId"),
-    ]:
-        fpath = DATA_DIR / f"{today}_{prefix}.json"
-        if not fpath.exists():
-            continue
-        with open(fpath, "r", encoding="utf-8") as f:
-            entities = json.load(f)
-        for e in entities:
-            eid = str(e.get(id_field, ""))
-            cid = str(e.get("campaignId", ""))
-            agid = str(e.get("adGroupId", ""))
-            expression = e.get("expression", e.get("expressions", e.get("targetingExpression", "")))
+    if hk and mp:
+        try:
+            from supabase.db_client import SupabaseClient
+            db = SupabaseClient()
+            conn = db._conn()
+            cur = conn.cursor()
 
-            entity_info = {
-                "entity_id": eid,
-                "entity_type": "TARGET",
-                "ad_type": ad_type,
-                "campaign_id": cid,
-                "ad_group_id": agid,
-                "state": e.get("state", "enabled"),
-                "bid": e.get("bid", 0),
-            }
-
-            if isinstance(expression, list) and expression:
-                expr_type = expression[0].get("type", "")
-                expr_value = str(expression[0].get("value", "")).lower()
-
-                # 1. Value bazli key (ASIN veya category)
-                if expr_value:
-                    key = (cid, expr_value, "TARGETING")
-                    lookup[key] = entity_info
-                    # Kampanya+AdGroup+Value key (ayni ASIN birden fazla ad group'ta)
-                    key_ag = (cid, agid, expr_value)
-                    lookup[key_ag] = entity_info
-
-                # 2. Auto-targeting reverse map (entity type → rapor adi)
-                if expr_type in AUTO_TARGETING_REVERSE:
-                    rapor_adi = AUTO_TARGETING_REVERSE[expr_type]
-                    key_auto = (cid, rapor_adi, "TARGETING")
-                    key_auto_ag = (cid, agid, rapor_adi)
-                    if key_auto not in lookup:
-                        lookup[key_auto] = entity_info
-                    lookup[key_auto_ag] = entity_info
-
-            elif isinstance(expression, str) and expression:
-                key = (cid, expression.lower(), "TARGETING")
+            # KEYWORDS
+            cur.execute("SELECT keyword_id, keyword_text, match_type, campaign_id, ad_group_id, ad_type, state, bid FROM keywords WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+            for eid, text, mt, cid, agid, ad_type, state, bid in cur.fetchall():
+                entity_info = {"entity_id": str(eid or ""), "entity_type": "KEYWORD", "ad_type": ad_type or "SP",
+                               "campaign_id": str(cid or ""), "ad_group_id": str(agid or ""), "state": state or "enabled", "bid": bid or 0}
+                cid_s = str(cid or "")
+                key = (cid_s, (text or "").lower(), (mt or "").upper())
                 lookup[key] = entity_info
+                key2 = (cid_s, (text or "").lower(), "TARGETING")
+                if key2 not in lookup:
+                    lookup[key2] = entity_info
+
+            # TARGETS
+            cur.execute("SELECT target_id, campaign_id, ad_group_id, ad_type, state, bid, expression FROM targets WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+            for eid, cid, agid, ad_type, state, bid, expression in cur.fetchall():
+                cid_s = str(cid or "")
+                agid_s = str(agid or "")
+                entity_info = {"entity_id": str(eid or ""), "entity_type": "TARGET", "ad_type": ad_type or "SP",
+                               "campaign_id": cid_s, "ad_group_id": agid_s, "state": state or "enabled", "bid": bid or 0}
+
+                expr = expression
+                if isinstance(expr, str):
+                    try:
+                        expr = json.loads(expr)
+                    except Exception:
+                        pass
+
+                if isinstance(expr, list) and expr:
+                    first = expr[0] if isinstance(expr[0], dict) else {}
+                    expr_type = first.get("type", "")
+                    expr_value = str(first.get("value", "")).lower()
+                    if expr_value:
+                        lookup[(cid_s, expr_value, "TARGETING")] = entity_info
+                        lookup[(cid_s, agid_s, expr_value)] = entity_info
+                    if expr_type in AUTO_TARGETING_REVERSE:
+                        rapor_adi = AUTO_TARGETING_REVERSE[expr_type]
+                        if (cid_s, rapor_adi, "TARGETING") not in lookup:
+                            lookup[(cid_s, rapor_adi, "TARGETING")] = entity_info
+                        lookup[(cid_s, agid_s, rapor_adi)] = entity_info
+                elif isinstance(expr, str) and expr:
+                    lookup[(cid_s, expr.lower(), "TARGETING")] = entity_info
+
+            cur.close()
+            conn.close()
+            supabase_ok = True
+            logger.info("Targeting lookup Supabase'den yuklendi: %d entity", len(lookup))
+        except Exception as e:
+            logger.warning("Targeting lookup Supabase hatasi, JSON fallback: %s", e)
+
+    if not supabase_ok:
+        # JSON dosyalarina fallback
+        for prefix, ad_type, id_field, text_field in [
+            ("sp_keywords", "SP", "keywordId", "keywordText"),
+            ("sb_keywords", "SB", "keywordId", "keywordText"),
+        ]:
+            fpath = DATA_DIR / f"{today}_{prefix}.json"
+            if not fpath.exists():
+                continue
+            with open(fpath, "r", encoding="utf-8") as f:
+                entities = json.load(f)
+            for e in entities:
+                eid = str(e.get(id_field, ""))
+                text = e.get(text_field, "")
+                mt = e.get("matchType", "")
+                cid = str(e.get("campaignId", ""))
+                agid = str(e.get("adGroupId", ""))
+                entity_info = {"entity_id": eid, "entity_type": "KEYWORD", "ad_type": ad_type,
+                               "campaign_id": cid, "ad_group_id": agid, "state": e.get("state", "enabled"), "bid": e.get("bid", 0)}
+                lookup[(cid, text.lower(), mt.upper())] = entity_info
+                key2 = (cid, text.lower(), "TARGETING")
+                if key2 not in lookup:
+                    lookup[key2] = entity_info
+
+        for prefix, ad_type, id_field in [
+            ("sp_targets", "SP", "targetId"),
+            ("sb_targets", "SB", "targetId"),
+            ("sd_targets", "SD", "targetId"),
+        ]:
+            fpath = DATA_DIR / f"{today}_{prefix}.json"
+            if not fpath.exists():
+                continue
+            with open(fpath, "r", encoding="utf-8") as f:
+                entities = json.load(f)
+            for e in entities:
+                eid = str(e.get(id_field, ""))
+                cid = str(e.get("campaignId", ""))
+                agid = str(e.get("adGroupId", ""))
+                expression = e.get("expression", e.get("expressions", e.get("targetingExpression", "")))
+                entity_info = {"entity_id": eid, "entity_type": "TARGET", "ad_type": ad_type,
+                               "campaign_id": cid, "ad_group_id": agid, "state": e.get("state", "enabled"), "bid": e.get("bid", 0)}
+                if isinstance(expression, list) and expression:
+                    expr_type = expression[0].get("type", "")
+                    expr_value = str(expression[0].get("value", "")).lower()
+                    if expr_value:
+                        lookup[(cid, expr_value, "TARGETING")] = entity_info
+                        lookup[(cid, agid, expr_value)] = entity_info
+                    if expr_type in AUTO_TARGETING_REVERSE:
+                        rapor_adi = AUTO_TARGETING_REVERSE[expr_type]
+                        if (cid, rapor_adi, "TARGETING") not in lookup:
+                            lookup[(cid, rapor_adi, "TARGETING")] = entity_info
+                        lookup[(cid, agid, rapor_adi)] = entity_info
+                elif isinstance(expression, str) and expression:
+                    lookup[(cid, expression.lower(), "TARGETING")] = entity_info
 
     # ---- SB THEME ENTITY'LER ----
     THEME_TYPE_TO_REPORT = {

@@ -11,6 +11,7 @@ Dosyalar (data/agent4/db/):
   kalip_kutuphanesi.json   — Tekrar eden kalıplar
 """
 
+import os
 import json
 import logging
 from datetime import datetime
@@ -37,14 +38,42 @@ class DBManager:
 
     # ------------------------------------------------------------------ load
     def load(self):
+        hk = os.environ.get("HESAP_KEY", "")
+        mp = os.environ.get("MARKETPLACE", "")
+
+        # Supabase'den yukle
+        if hk and mp:
+            try:
+                from supabase.db_client import SupabaseClient
+                from psycopg2.extras import Json
+                db = SupabaseClient()
+                conn = db._conn()
+                cur = conn.cursor()
+                cur.execute("SELECT db_key, db_data FROM agent4_learning_db WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+                rows = cur.fetchall()
+                cur.close()
+                conn.close()
+                if rows:
+                    for db_key, db_data in rows:
+                        if db_key in self.DB_FILES:
+                            self._data[db_key] = db_data if isinstance(db_data, dict) else json.loads(db_data)
+                            logger.info("DB Supabase'den yuklendi: %s (%d kayit)", db_key, self._record_count(db_key))
+                    # Eksik tablolar icin bos baslat
+                    for key in self.DB_FILES:
+                        if key not in self._data:
+                            self._data[key] = self._empty(key)
+                    return self
+            except Exception as e:
+                logger.warning("Agent4 DB Supabase'den okunamadi, dosyaya fallback: %s", e)
+
+        # JSON dosyalarina fallback
         for key, filename in self.DB_FILES.items():
             path = self.db_dir / filename
             if path.exists():
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                         self._data[key] = json.load(f)
-                    logger.info("DB yuklendi: %s (%d kayit)",
-                                filename, self._record_count(key))
+                    logger.info("DB dosyadan yuklendi: %s (%d kayit)", filename, self._record_count(key))
                 except (json.JSONDecodeError, IOError) as e:
                     logger.warning("DB okunamadi %s: %s — bos baslaniyor", filename, e)
                     self._data[key] = self._empty(key)
@@ -54,10 +83,35 @@ class DBManager:
 
     # ------------------------------------------------------------------ save
     def save(self):
+        # JSON dosyalarina yaz (fallback)
         for key, filename in self.DB_FILES.items():
             path = self.db_dir / filename
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self._data[key], f, indent=2, ensure_ascii=False)
+
+        # Supabase'e yaz
+        hk = os.environ.get("HESAP_KEY", "")
+        mp = os.environ.get("MARKETPLACE", "")
+        if hk and mp:
+            try:
+                from supabase.db_client import SupabaseClient
+                from psycopg2.extras import Json
+                db = SupabaseClient()
+                conn = db._conn()
+                cur = conn.cursor()
+                for key in self.DB_FILES:
+                    cur.execute("""
+                        INSERT INTO agent4_learning_db (hesap_key, marketplace, db_key, db_data, updated_at)
+                        VALUES (%s, %s, %s, %s, NOW())
+                        ON CONFLICT (hesap_key, marketplace, db_key) DO UPDATE SET db_data = EXCLUDED.db_data, updated_at = NOW()
+                    """, (hk, mp, key, Json(self._data.get(key, {}))))
+                conn.commit()
+                cur.close()
+                conn.close()
+                logger.info("DB Supabase'e kaydedildi (%d tablo)", len(self.DB_FILES))
+            except Exception as e:
+                logger.warning("Agent4 DB Supabase'e yazilamadi: %s", e)
+
         logger.info("DB kaydedildi (%d tablo)", len(self.DB_FILES))
 
     # ----------------------------------------------------------- accessors

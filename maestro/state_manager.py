@@ -27,8 +27,27 @@ def _ensure_dirs():
 
 
 def load_state():
-    """State dosyasini yukler. Yoksa bos state doner."""
+    """State'i Supabase'den yukler. Basarisizsa JSON dosyasina fallback."""
     _ensure_dirs()
+    acc = config.CURRENT_ACCOUNT
+    if acc:
+        try:
+            from supabase.db_client import SupabaseClient
+            db = SupabaseClient()
+            conn = db._conn()
+            cur = conn.cursor()
+            cur.execute("SELECT state_data FROM maestro_state WHERE hesap_key = %s AND marketplace = %s",
+                        (acc["hesap_key"], acc["marketplace"]))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            if row and row[0]:
+                data = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                logger.debug("State Supabase'den yuklendi (%s)", acc["label"])
+                return data
+        except Exception as e:
+            logger.debug("State Supabase'den okunamadi, dosyaya fallback: %s", e)
+
     if not os.path.exists(config.STATE_FILE):
         return _empty_state()
     try:
@@ -40,10 +59,30 @@ def load_state():
 
 
 def save_state(state):
-    """State dosyasini kaydeder."""
+    """State'i hem Supabase'e hem JSON dosyasina kaydeder."""
     _ensure_dirs()
+    # JSON dosyaya yaz (fallback)
     with open(config.STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
+    # Supabase'e yaz
+    acc = config.CURRENT_ACCOUNT
+    if acc:
+        try:
+            from supabase.db_client import SupabaseClient
+            from psycopg2.extras import Json
+            db = SupabaseClient()
+            conn = db._conn()
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO maestro_state (hesap_key, marketplace, state_data, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (hesap_key, marketplace) DO UPDATE SET state_data = EXCLUDED.state_data, updated_at = NOW()
+            """, (acc["hesap_key"], acc["marketplace"], Json(state)))
+            conn.commit()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            logger.debug("State Supabase'e yazilamadi: %s", e)
 
 
 def _empty_state():

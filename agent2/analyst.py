@@ -121,17 +121,66 @@ CURRENCY_MAP = {
 # ============================================================================
 
 def load_settings():
-    if not SETTINGS_FILE.exists():
-        raise FileNotFoundError(f"Ayar dosyasi bulunamadi: {SETTINGS_FILE}")
-    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    """Settings'i Supabase'den yukler. Basarisizsa JSON dosyasina fallback."""
+    hk = os.environ.get("HESAP_KEY", "")
+    mp = os.environ.get("MARKETPLACE", "")
+    if hk and mp:
+        try:
+            from supabase.db_client import SupabaseClient
+            db = SupabaseClient()
+            conn = db._conn()
+            cur = conn.cursor()
+            cur.execute("SELECT genel_ayarlar, esik_degerleri, asin_hedefleri, segmentasyon_kurallari, agent3_ayarlari FROM settings WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            if row:
+                result = {}
+                if row[0]: result["genel_ayarlar"] = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                if row[1]: result["esik_degerleri"] = row[1] if isinstance(row[1], dict) else json.loads(row[1])
+                if row[2]: result["asin_hedefleri"] = row[2] if isinstance(row[2], dict) else json.loads(row[2])
+                if row[3]: result["segmentasyon_kurallari"] = row[3] if isinstance(row[3], dict) else json.loads(row[3])
+                if row[4]: result["agent3_ayarlari"] = row[4] if isinstance(row[4], dict) else json.loads(row[4])
+                logger.info("Settings Supabase'den yuklendi (%s/%s)", hk, mp)
+                return result
+        except Exception as e:
+            logger.warning("Settings Supabase'den okunamadi, dosyaya fallback: %s", e)
+
+    if SETTINGS_FILE and SETTINGS_FILE.exists():
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    raise FileNotFoundError(f"Settings bulunamadi: Supabase ve {SETTINGS_FILE}")
 
 
 def load_bid_functions():
-    if not BID_FUNCTIONS_FILE.exists():
-        raise FileNotFoundError(f"Bid fonksiyon dosyasi bulunamadi: {BID_FUNCTIONS_FILE}")
-    with open(BID_FUNCTIONS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+    """Bid functions'i Supabase'den yukler. Basarisizsa JSON dosyasina fallback."""
+    hk = os.environ.get("HESAP_KEY", "")
+    mp = os.environ.get("MARKETPLACE", "")
+    if hk and mp:
+        try:
+            from supabase.db_client import SupabaseClient
+            db = SupabaseClient()
+            conn = db._conn()
+            cur = conn.cursor()
+            cur.execute("SELECT tanh_formulu, segment_parametreleri, genel_limitler, asin_parametreleri FROM bid_functions WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+            if row:
+                result = {}
+                if row[0]: result["tanh_formulu"] = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                if row[1]: result["segment_parametreleri"] = row[1] if isinstance(row[1], dict) else json.loads(row[1])
+                if row[2]: result["genel_limitler"] = row[2] if isinstance(row[2], dict) else json.loads(row[2])
+                if row[3]: result["asin_parametreleri"] = row[3] if isinstance(row[3], dict) else json.loads(row[3])
+                logger.info("Bid functions Supabase'den yuklendi (%s/%s)", hk, mp)
+                return result
+        except Exception as e:
+            logger.warning("Bid functions Supabase'den okunamadi, dosyaya fallback: %s", e)
+
+    if BID_FUNCTIONS_FILE and BID_FUNCTIONS_FILE.exists():
+        with open(BID_FUNCTIONS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    raise FileNotFoundError(f"Bid functions bulunamadi: Supabase ve {BID_FUNCTIONS_FILE}")
 
 
 def get_hedef_acos(settings, asin):
@@ -212,12 +261,52 @@ def load_all_agent1_data():
 # ============================================================================
 
 def load_previous_decisions():
-    if not DECISIONS_DIR.exists():
+    """Onceki kararlari Supabase'den yukler. Fallback: JSON dosyasindan."""
+    hk = os.environ.get("HESAP_KEY", "")
+    mp = os.environ.get("MARKETPLACE", "")
+    if hk and mp:
+        try:
+            from supabase.db_client import SupabaseClient
+            db = SupabaseClient()
+            conn = db._conn()
+            cur = conn.cursor()
+            # Son analiz tarihinden kararlari al
+            cur.execute("""
+                SELECT keyword_id, keyword_text, campaign_name, current_bid, recommended_bid,
+                       bid_change_pct, segment, analysis_date, ad_type
+                FROM bid_recommendations
+                WHERE hesap_key = %s AND marketplace = %s
+                ORDER BY analysis_date DESC LIMIT 5000
+            """, (hk, mp))
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+            if rows:
+                result = {}
+                for row in rows:
+                    hid = str(row[0] or "")
+                    if hid and hid not in result:
+                        result[hid] = {
+                            "hedefleme_id": hid,
+                            "hedefleme": row[1] or "",
+                            "kampanya": row[2] or "",
+                            "onceki_bid": float(row[3] or 0),
+                            "yeni_bid": float(row[4] or 0),
+                            "degisim_yuzde": float(row[5] or 0),
+                            "segment": row[6] or "",
+                            "tarih": str(row[7] or ""),
+                            "reklam_tipi": row[8] or "",
+                        }
+                logger.info("Onceki kararlar Supabase'den yuklendi: %d kayit", len(result))
+                return result
+        except Exception as e:
+            logger.warning("Onceki kararlar Supabase'den okunamadi, dosyaya fallback: %s", e)
+
+    if not DECISIONS_DIR or not DECISIONS_DIR.exists():
         return {}
     candidates = sorted(DECISIONS_DIR.glob("*_decisions.json"), reverse=True)
     if not candidates:
         return {}
-    # En son karar dosyasini yukle
     with open(candidates[0], "r", encoding="utf-8") as f:
         decisions = json.load(f)
     return {d["hedefleme_id"]: d for d in decisions}
