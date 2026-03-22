@@ -145,7 +145,69 @@ def get_agent3_config(settings):
     }
     user_config = settings.get("agent3_ayarlari", {})
     merged = {**defaults, **user_config}
+
+    # Supabase portfolio_asin_campaigns tablosundan guncel eslestirmeleri oku
+    # Dashboard'dan yapilan eslestirmeler burada — settings.json'daki eski verileri override eder
+    supabase_map = _load_portfolio_asin_campaigns_from_supabase()
+    if supabase_map:
+        merged["portfolio_asin_target_kampanyalari"] = supabase_map
+        logger.info("Portfolio ASIN kampanya eslestirmeleri Supabase'den yuklendi: %d portfolio", len(supabase_map))
+
     return merged
+
+
+def _load_portfolio_asin_campaigns_from_supabase():
+    """
+    Supabase portfolio_asin_campaigns tablosundan {portfolio_name: campaign_id} eslesmesi okur.
+    Mevcut hesap/marketplace icin aktif eslestirmeleri doner.
+    Birden fazla kampanya varsa ilkini kullanir (ASIN Target oncelikli).
+    """
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        conn = db._conn()
+        cur = conn.cursor()
+
+        hk = os.environ.get("HESAP_KEY", "")
+        mp = os.environ.get("MARKETPLACE", "")
+        if not hk or not mp:
+            # init_paths'den alinmis olabilir
+            if DATA_DIR:
+                parts = DATA_DIR.parent.name.split("_")
+                if len(parts) >= 2:
+                    mp = parts[-1]
+                    hk = "_".join(parts[:-1])
+
+        if not hk or not mp:
+            logger.debug("Portfolio ASIN campaigns: hesap_key/marketplace belirlenemedi")
+            conn.close()
+            return {}
+
+        cur.execute("""
+            SELECT portfolio_name, campaign_id, campaign_name
+            FROM portfolio_asin_campaigns
+            WHERE hesap_key = %s AND marketplace = %s AND campaign_id IS NOT NULL
+            ORDER BY portfolio_name
+        """, (hk, mp))
+
+        rows = cur.fetchall()
+        conn.close()
+
+        if not rows:
+            return {}
+
+        # portfolio_name -> campaign_id (ilk eslesen)
+        result = {}
+        for portfolio_name, campaign_id, campaign_name in rows:
+            if portfolio_name not in result:
+                result[portfolio_name] = campaign_id
+                logger.debug("Portfolio ASIN mapping: %s -> %s (%s)", portfolio_name, campaign_id, campaign_name)
+
+        return result
+
+    except Exception as e:
+        logger.warning("Portfolio ASIN campaigns Supabase'den okunamadi: %s", e)
+        return {}
 
 
 # ============================================================================
@@ -1416,8 +1478,8 @@ def prepare_harvest_asin(action, config, campaign_lookup, today=None):
     if not target_camp_id:
         result["status"] = "HATA"
         result["hatalar"].append(
-            f"Portfolio '{portfolio}' icin ASIN Target kampanya ID'si config'de tanimli degil. "
-            f"settings.json → agent3_ayarlari → portfolio_asin_target_kampanyalari'na ekleyin."
+            f"Portfolio '{portfolio}' icin ASIN Target kampanya ID'si tanimli degil. "
+            f"Dashboard → Ayarlar → Portfolio ASIN Kampanya Eslestirme'den tanimlayin."
         )
         return result
 
