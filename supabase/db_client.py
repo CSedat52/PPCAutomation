@@ -189,7 +189,65 @@ class SupabaseClient:
                 Json(d.get("budget")) if d.get("budget") else None,
                 now
             ))
-        return self._upsert_batch("portfolios", cols, rows, conflict)
+        count = self._upsert_batch("portfolios", cols, rows, conflict)
+
+        # Portfolio sync: yeni portfoliolari portfolio_targets'a ekle + portfolio_id'leri guncelle
+        try:
+            self._sync_portfolio_targets(hesap_key, mp)
+        except Exception as e:
+            logger.warning("Portfolio targets sync hatasi: %s", e)
+
+        return count
+
+    def _sync_portfolio_targets(self, hesap_key: str, mp: str):
+        """
+        portfolios tablosundan yeni portfoliolari portfolio_targets'a ekler (varsayilan ACoS %20).
+        Ayrica portfolio_targets ve portfolio_asin_campaigns'deki portfolio_id'leri gunceller.
+        """
+        conn = self._conn()
+        cur = conn.cursor()
+        try:
+            # 1. Yeni portfoliolari portfolio_targets'a ekle
+            cur.execute("""
+                INSERT INTO portfolio_targets (hesap_key, marketplace, portfolio_name, portfolio_id, target_acos)
+                SELECT p.hesap_key, p.marketplace, p.name, p.portfolio_id, 20
+                FROM portfolios p
+                LEFT JOIN portfolio_targets pt
+                  ON p.hesap_key = pt.hesap_key AND p.marketplace = pt.marketplace AND p.name = pt.portfolio_name
+                WHERE pt.id IS NULL
+                  AND p.hesap_key = %s AND p.marketplace = %s
+            """, (hesap_key, mp))
+            new_count = cur.rowcount
+            if new_count > 0:
+                logger.info("Portfolio targets: %d yeni portfolio eklendi (%s/%s)", new_count, hesap_key, mp)
+
+            # 2. portfolio_targets'taki portfolio_id'leri guncelle
+            cur.execute("""
+                UPDATE portfolio_targets pt
+                SET portfolio_id = p.portfolio_id
+                FROM portfolios p
+                WHERE pt.hesap_key = p.hesap_key AND pt.marketplace = p.marketplace AND pt.portfolio_name = p.name
+                  AND pt.hesap_key = %s AND pt.marketplace = %s
+                  AND (pt.portfolio_id IS NULL OR pt.portfolio_id != p.portfolio_id)
+            """, (hesap_key, mp))
+
+            # 3. portfolio_asin_campaigns'teki portfolio_id'leri guncelle
+            cur.execute("""
+                UPDATE portfolio_asin_campaigns pac
+                SET portfolio_id = p.portfolio_id
+                FROM portfolios p
+                WHERE pac.hesap_key = p.hesap_key AND pac.marketplace = p.marketplace AND pac.portfolio_name = p.name
+                  AND pac.hesap_key = %s AND pac.marketplace = %s
+                  AND (pac.portfolio_id IS NULL OR pac.portfolio_id != p.portfolio_id)
+            """, (hesap_key, mp))
+
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+            conn.close()
 
     def upsert_campaigns(self, hesap_key: str, mp: str, ad_type: str, data: list) -> int:
         cols = ["hesap_key", "marketplace", "ad_type", "campaign_id", "name", "state",
