@@ -570,8 +570,9 @@ def get_tanh_params_for_asin(asin, bid_funcs):
     ASIN bazli tanh parametrelerini yukler.
 
     Oncelik sirasi:
-      1. bid_functions.json > asin_parametreleri > [asin] varsa ve aktif=True ise → ASIN parametreleri
-      2. Yoksa veya aktif=False ise → tanh_formulu global degerleri
+      1. Supabase asin_bid_params tablosunda aktif=True ise → ASIN parametreleri
+      2. bid_functions.asin_parametreleri'nde varsa (fallback) → ASIN parametreleri
+      3. Yoksa → tanh_formulu global degerleri
 
     Donus: (hassasiyet, max_degisim, parametre_kaynagi)
       parametre_kaynagi: "ASIN_OZEL" veya "GLOBAL" — log ve Excel raporuna yazilir.
@@ -583,11 +584,15 @@ def get_tanh_params_for_asin(asin, bid_funcs):
     if not asin:
         return global_hass, global_max, "GLOBAL"
 
-    asin_params = bid_funcs.get("asin_parametreleri", {})
-    asin_entry  = asin_params.get(asin)
+    # Supabase asin_bid_params tablosundan oku (oncelikli)
+    asin_entry = _get_asin_bid_params_cache().get(asin)
 
-    # _aciklama, _yapi_aciklamasi gibi meta anahtarlari atla
-    if not asin_entry or asin_entry.get("_NOT") or not isinstance(asin_entry, dict):
+    # Fallback: bid_functions.asin_parametreleri (eski format)
+    if not asin_entry:
+        asin_params = bid_funcs.get("asin_parametreleri", {})
+        asin_entry = asin_params.get(asin)
+
+    if not asin_entry or not isinstance(asin_entry, dict):
         return global_hass, global_max, "GLOBAL"
 
     if not asin_entry.get("aktif", True):
@@ -596,6 +601,48 @@ def get_tanh_params_for_asin(asin, bid_funcs):
     hass = asin_entry.get("hassasiyet", global_hass)
     maxd = asin_entry.get("max_degisim", global_max)
     return hass, maxd, "ASIN_OZEL"
+
+
+# Cache: asin_bid_params Supabase'den bir kez okunur, session boyunca kullanilir
+_asin_bid_params_cache = None
+
+def _get_asin_bid_params_cache():
+    """Supabase asin_bid_params tablosundan tum ASIN parametrelerini yukler ve cache'ler."""
+    global _asin_bid_params_cache
+    if _asin_bid_params_cache is not None:
+        return _asin_bid_params_cache
+
+    _asin_bid_params_cache = {}
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        conn = db._conn()
+        cur = conn.cursor()
+
+        import os
+        hk = os.environ.get("HESAP_KEY", "")
+        mp = os.environ.get("MARKETPLACE", "")
+
+        if hk and mp:
+            cur.execute("""
+                SELECT asin, aktif, hassasiyet, max_degisim, urun_adi
+                FROM asin_bid_params
+                WHERE hesap_key = %s AND marketplace = %s
+            """, (hk, mp))
+            for row in cur.fetchall():
+                _asin_bid_params_cache[row[0]] = {
+                    "aktif": row[1],
+                    "hassasiyet": float(row[2]) if row[2] else 0.5,
+                    "max_degisim": float(row[3]) if row[3] else 0.2,
+                    "urun_adi": row[4],
+                }
+        cur.close()
+        conn.close()
+    except Exception as e:
+        import logging
+        logging.getLogger("analyst").warning("asin_bid_params Supabase'den okunamadi: %s", e)
+
+    return _asin_bid_params_cache
 
 
 def calculate_new_bid(segment, target, hedef_acos, settings, bid_funcs, previous_decisions):

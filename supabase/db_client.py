@@ -373,7 +373,41 @@ class SupabaseClient:
                 Json(d),
                 now
             ))
-        return self._upsert_batch("product_ads", cols, rows, conflict)
+        count = self._upsert_batch("product_ads", cols, rows, conflict)
+
+        # Yeni ASIN'leri asin_bid_params'a otomatik ekle (varsayilan parametrelerle)
+        try:
+            self._sync_asin_bid_params(hesap_key, mp)
+        except Exception as e:
+            logger.warning("ASIN bid params sync hatasi: %s", e)
+
+        return count
+
+    def _sync_asin_bid_params(self, hesap_key: str, mp: str):
+        """product_ads'daki yeni ASIN'leri asin_bid_params tablosuna ekler (varsayilan parametrelerle)."""
+        conn = self._conn()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                INSERT INTO asin_bid_params (hesap_key, marketplace, asin, aktif, hassasiyet, max_degisim)
+                SELECT DISTINCT pa.hesap_key, pa.marketplace, pa.asin, false, 0.5, 0.2
+                FROM product_ads pa
+                LEFT JOIN asin_bid_params abp
+                  ON pa.hesap_key = abp.hesap_key AND pa.marketplace = abp.marketplace AND pa.asin = abp.asin
+                WHERE abp.id IS NULL
+                  AND pa.hesap_key = %s AND pa.marketplace = %s
+                  AND pa.asin IS NOT NULL
+            """, (hesap_key, mp))
+            new_count = cur.rowcount
+            if new_count > 0:
+                logger.info("ASIN bid params: %d yeni ASIN eklendi (%s/%s)", new_count, hesap_key, mp)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+            conn.close()
 
     def upsert_negative_keywords(self, hesap_key: str, mp: str, ad_type: str,
                                   data: list, scope: str = "AD_GROUP") -> int:
