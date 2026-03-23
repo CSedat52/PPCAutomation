@@ -129,7 +129,6 @@ Diger tool'lar:
 amazon_ads_list_accounts({})                                    # Tum hesaplari listele
 amazon_ads_get_profiles({"hesap_key": "vigowood_eu", "marketplace": "DE"})  # Profilleri goster
 amazon_ads_collect_verify_data({"hesap_key": "vigowood_na", "marketplace": "US"})  # Verify verisi
-amazon_ads_execute_plan({"hesap_key": "vigowood_na", "marketplace": "US"})  # Execution plan uygula
 ```
 
 Teknik: accounts.json'dan credential okur. SP->sales14d/purchases14d, SB/SD->sales/purchases. Pagination destekli. 8 koruma mekanizmasi. Bos raporlara 1 retry, hatali raporlara 3 retry.
@@ -144,11 +143,12 @@ Ciktilar: `data/{hesap}_{mp}/analysis/{tarih}_bid_recommendations.xlsx`, `_negat
 
 ### Agent 3: Executor v3 (Multi-Account)
 Script: `agent3/executor.py`
-Cagiris: `python agent3/executor.py <hesap_key> <marketplace> [--execute] [--verify]`
-Ornek: `python agent3/executor.py vigowood_na US`
-Ornek: `python agent3/executor.py vigowood_na US --execute`
-Ornek: `python agent3/executor.py vigowood_na US --verify`
-Gorevi: Onaylanmis kararlari Amazon API uzerinden uygular.
+Cagiris: `python agent3/executor.py <hesap_key> <marketplace> [--execute] [--verify] [--collect-verify]`
+Ornek: `python agent3/executor.py vigowood_na US`                   (dry-run)
+Ornek: `python agent3/executor.py vigowood_na US --execute`          (plan + dogrudan API'ye gonder)
+Ornek: `python agent3/executor.py vigowood_na US --collect-verify`   (verify verileri cek)
+Ornek: `python agent3/executor.py vigowood_na US --verify`           (dogrulama yap)
+Gorevi: Onaylanmis kararlari Amazon API uzerinden uygular. MCP server'a bagimlilik YOK.
 Hata logu: `data/{hesap}_{mp}/logs/agent3_errors.json`
 
 ### Agent 4: Optimizer & Learning Agent v2 (Multi-Account)
@@ -288,22 +288,28 @@ Veriler toplandiktan sonra her hesap icin sirayla (bir hesap hata verse bile son
   - Exit code 0 + durum = "TAMAMLANDI" → Basarili, devam et.
   - Hata varsa → PROBLEM COZME MODUNA GIR.
 
-**ADIM 3: Onay Bekleme (her hesap icin)**
-- Kullaniciya Excel'leri doldurmasi gerektigini soyle.
-- E-posta gonder (hesap bilgisi subject'te yer alir).
-- Kullanici "onay" yazinca devam et.
+**ADIM 3: Watch Modu — Dashboard Onay Bekleme (her hesap icin)**
+- Agent 2 bittikten sonra Maestro otomatik WATCH moduna girer.
+- Watch modu her 5 dakikada bir Supabase `execution_queue` tablosunu kontrol eder.
+- Dashboard'dan kullanici "Agent3'u Calistir" butonuna bastiginda `execution_queue`'ya
+  `status='pending', command='agent3_execute'` kaydi eklenir.
+- Watch modu bu kaydi aldiginda otomatik olarak tam pipeline'i baslatir:
+  1. Agent 3 `--execute` (plan + API'ye gonder)
+  2. 5 dakika bekleme
+  3. Agent 3 `--collect-verify` (verify verileri cek)
+  4. Agent 3 `--verify` (dogrulama)
+  5. Agent 4 optimizer
+- 24 saatten eski pending kayitlar otomatik expire edilir.
 
-**ADIM 4: Agent 3 — Execution (her hesap icin)**
-- `python agent3/executor.py HESAP MP --date PIPELINE_DATE` (dry-run) calistir.
-- Sonucu degerlendir:
-  - HAZIR islemler var → Otomatik execute'a gec.
-  - Entity bulunamadi hatalari → Normal, o satirlari atla.
-  - Baska hatalar → PROBLEM COZME MODUNA GIR.
+**ALTERNATIF: Manuel Onay (Maestro watch modu disinda)**
+- Kullaniciya Excel'leri doldurmasi gerektigini soyle.
+- Kullanici "onay" yazinca asagidaki adimlari sirayla calistir:
+
+**ADIM 4: Agent 3 — Execution (manuel mod veya watch icinde otomatik)**
 - `python agent3/executor.py HESAP MP --execute --date PIPELINE_DATE` calistir.
-- execute_plan MCP tool'unu cagirirken MUTLAKA plan_file parametresi gecir:
-  `amazon_ads_execute_plan({"hesap_key": "HESAP", "marketplace": "MP", "plan_file": "data/{hesap}_{mp}/logs/PIPELINE_DATE_execution_plan.json"})`
+  (Bu komut plan olusturur VE dogrudan Amazon API'ye gonderir. MCP tool gerekmez.)
 - 5 dakika bekle.
-- Verify: `amazon_ads_collect_verify_data({"hesap_key": "HESAP", "marketplace": "MP"})` cagir.
+- Verify verileri cek: `python agent3/executor.py HESAP MP --collect-verify`
 - `python agent3/executor.py HESAP MP --verify --date PIPELINE_DATE` calistir.
 
 **ADIM 5: Agent 4 — Optimizer (her hesap icin)**
@@ -368,9 +374,8 @@ Herhangi bir agent hata verdiginde Maestro su adimlari izler:
 1. Hangi hesap+marketplace icin oldugunu sor
 2. `python agent3/executor.py HESAP MP` (dry-run) calistir
 3. "Bu islemler uygulansin mi?" sor
-4. Onaylarsa: `python agent3/executor.py HESAP MP --execute`
-5. execute_plan MCP tool'unda plan_file parametresi gecir
-6. 5 dk bekle → verify
+4. Onaylarsa: `python agent3/executor.py HESAP MP --execute` (plan olusturur + API'ye gonderir)
+5. 5 dk bekle → verify
 
 ### "hesaplari goster" dediginde:
 `amazon_ads_list_accounts({})` tool'unu cagir.

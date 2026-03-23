@@ -160,18 +160,18 @@ def start_pipeline(hesap_key, marketplace, force=False):
         except Exception:
             pass
 
-    # Otomatik watch modu — 5 dakikada bir execution_queue kontrol et
+    # Otomatik watch modu — 5 dakikada bir execution_queue kontrol et (ulke bazli)
     logger.info("=" * 60)
-    logger.info("  WATCH MODU AKTIF — Dashboard'dan Agent3 komutu bekleniyor")
+    logger.info("  WATCH MODU AKTIF — %s — Dashboard'dan Agent3 komutu bekleniyor", account_label)
     logger.info("  Her 5 dakikada bir execution_queue kontrol edilecek")
     logger.info("=" * 60)
 
     watch_interval = 5 * 60  # 5 dakika
     while True:
         try:
-            results = poll_execution_queue()
+            # Sadece bu hesap/marketplace icin pending komutlari izle
+            results = poll_execution_queue(filter_hesap=hesap_key, filter_marketplace=marketplace)
             if results:
-                # Agent3 calistirildi — pipeline'i tamamla
                 for r in results:
                     logger.info("  Queue sonucu: %s — %s", r.get("hesap"), r.get("status"))
 
@@ -901,18 +901,40 @@ def check_approval(hesap_key, marketplace):
 # EXECUTION QUEUE — Dashboard'dan Agent3 tetikleme
 # ============================================================================
 
-def poll_execution_queue():
+def poll_execution_queue(filter_hesap=None, filter_marketplace=None):
     """
     Supabase execution_queue tablosundaki pending komutlari kontrol eder.
     Dashboard'dan 'Agent3'u Calistir' butonuna basildiginda buraya komut duser.
+
+    Opsiyonel filtre: sadece belirli hesap/marketplace icin islem yap.
+    24 saatten eski pending kayitlar otomatik expire edilir.
     """
     sdb = _get_sdb()
     if not sdb:
         return []
 
     try:
-        rows = sdb._fetch_all(
-            "SELECT id, hesap_key, marketplace, command FROM execution_queue WHERE status='pending' ORDER BY requested_at")
+        # Eski pending kayitlari expire et (24 saatten eski)
+        sdb._execute(
+            "UPDATE execution_queue SET status='expired', completed_at=NOW() "
+            "WHERE status='pending' AND requested_at < NOW() - INTERVAL '24 hours'")
+
+        # Pending komutlari cek
+        if filter_hesap and filter_marketplace:
+            rows = sdb._fetch_all(
+                "SELECT id, hesap_key, marketplace, command FROM execution_queue "
+                "WHERE status='pending' AND hesap_key=%s AND marketplace=%s ORDER BY requested_at",
+                (filter_hesap, filter_marketplace))
+        elif filter_hesap:
+            rows = sdb._fetch_all(
+                "SELECT id, hesap_key, marketplace, command FROM execution_queue "
+                "WHERE status='pending' AND hesap_key=%s ORDER BY requested_at",
+                (filter_hesap,))
+        else:
+            rows = sdb._fetch_all(
+                "SELECT id, hesap_key, marketplace, command FROM execution_queue "
+                "WHERE status='pending' ORDER BY requested_at")
+
         if not rows:
             return []
 
@@ -951,54 +973,105 @@ def poll_execution_queue():
 
 
 def _run_agent3_from_queue(hesap_key, marketplace):
-    """Dashboard onaylarindan Agent3'u calistirir."""
+    """
+    Dashboard onaylarindan tam pipeline calistirir:
+    1. Agent 3 --execute (plan + API'ye gonder)
+    2. 5 dakika bekle
+    3. Agent 3 --collect-verify (verify verileri cek)
+    4. Agent 3 --verify (dogrulama)
+    5. Agent 4 optimizer
+    """
     config.init_account(hesap_key, marketplace)
-    state = state_manager.load_state()
     session_id = f"queue_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{hesap_key}_{marketplace}"
-
-    _save_log("info", f"Agent3 basliyor (dashboard queue): {hesap_key}/{marketplace}",
-              "agent3", hesap_key, marketplace, session_id)
+    account_label = f"{hesap_key}/{marketplace}"
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    env = {**os.environ, "MAESTRO_SESSION_ID": session_id}
 
     sdb = _get_sdb()
-    if sdb:
+
+    def _update_sdb(step, status, error_msg=None):
+        if sdb:
+            try:
+                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, step, status,
+                                        error_msg)
+                sdb.update_agent_status_detail(step.split("_")[0] if "_" in step else step, status)
+            except Exception:
+                pass
+
+    def _run_step(script_args, step_name, timeout_sec=600):
+        """Bir subprocess adimini calistir. Basari/basarisizlik doner."""
+        _save_log("info", f"{step_name} basliyor: {account_label}",
+                  step_name, hesap_key, marketplace, session_id)
+        _update_sdb(step_name, "running")
         try:
-            sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", "running")
-            sdb.update_agent_status_detail("agent3", "running")
-        except Exception:
-            pass
+            result = subprocess.run(
+                [sys.executable] + script_args,
+                capture_output=True, text=True, timeout=timeout_sec,
+                cwd=config.BASE_DIR, env=env,
+            )
+            success = result.returncode == 0
+            status = "completed" if success else "failed"
+            log_msg = f"{step_name} {'tamamlandi' if success else 'basarisiz'}: {account_label}"
+            if not success and result.stderr:
+                log_msg += f" — {result.stderr[:200]}"
+            _save_log("info" if success else "error", log_msg,
+                      step_name, hesap_key, marketplace, session_id)
+            _update_sdb(step_name, status)
+            return success
+        except subprocess.TimeoutExpired:
+            _save_log("error", f"{step_name} timeout ({timeout_sec}s): {account_label}",
+                      step_name, hesap_key, marketplace, session_id)
+            _update_sdb(step_name, "failed", f"Timeout ({timeout_sec}s)")
+            return False
+        except Exception as e:
+            _save_log("error", f"{step_name} hatasi: {str(e)[:200]}",
+                      step_name, hesap_key, marketplace, session_id)
+            _update_sdb(step_name, "failed", str(e)[:500])
+            return False
 
-    env = {**os.environ, "MAESTRO_SESSION_ID": session_id}
-    try:
-        result = subprocess.run(
-            [sys.executable, config.AGENT3_SCRIPT, hesap_key, marketplace, "--execute"],
-            capture_output=True, text=True, timeout=600,
-            cwd=config.BASE_DIR, env=env,
-        )
-        success = result.returncode == 0
+    logger.info("=" * 60)
+    logger.info("  QUEUE PIPELINE BASLADI — %s", account_label)
+    logger.info("=" * 60)
 
-        final_status = "completed" if success else "failed"
-        _save_log("info" if success else "error",
-                  f"Agent3 {'tamamlandi' if success else 'basarisiz'} (dashboard queue): {hesap_key}/{marketplace}",
-                  "agent3", hesap_key, marketplace, session_id)
-        if sdb:
-            try:
-                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", final_status)
-                sdb.update_agent_status_detail("agent3", final_status)
-            except Exception:
-                pass
-
-        return success
-    except Exception as e:
-        logger.error("Agent3 queue calistirma hatasi: %s", e)
-        _save_log("error", f"Agent3 hatasi (queue): {str(e)[:200]}",
-                  "agent3", hesap_key, marketplace, session_id)
-        if sdb:
-            try:
-                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", "failed", str(e)[:500])
-                sdb.update_agent_status_detail("agent3", "failed")
-            except Exception:
-                pass
+    # --- Adim 1: Agent 3 Execute (plan + API'ye gonder) ---
+    ok = _run_step(
+        [config.AGENT3_SCRIPT, hesap_key, marketplace, "--execute", "--date", today],
+        "agent3_execute", timeout_sec=600)
+    if not ok:
+        logger.error("Agent 3 execute basarisiz, pipeline durduruluyor: %s", account_label)
         return False
+
+    # --- Adim 2: 5 dakika bekle ---
+    logger.info("5 dakika bekleniyor (API yansima suresi)...")
+    _update_sdb("agent3_verify_wait", "running")
+    time.sleep(300)
+
+    # --- Adim 3: Verify verileri cek ---
+    ok = _run_step(
+        [config.AGENT3_SCRIPT, hesap_key, marketplace, "--collect-verify"],
+        "agent3_collect_verify", timeout_sec=300)
+    if not ok:
+        logger.warning("Verify veri toplama basarisiz, verify atlaniyor: %s", account_label)
+        # Verify basarisiz olsa bile Agent 4'e devam et
+
+    # --- Adim 4: Dogrulama ---
+    if ok:
+        _run_step(
+            [config.AGENT3_SCRIPT, hesap_key, marketplace, "--verify", "--date", today],
+            "agent3_verify", timeout_sec=300)
+        # Verify sonucu ne olursa olsun devam et
+
+    # --- Adim 5: Agent 4 Optimizer ---
+    _run_step(
+        [config.AGENT4_SCRIPT, hesap_key, marketplace],
+        "agent4_optimize", timeout_sec=300)
+
+    logger.info("=" * 60)
+    logger.info("  QUEUE PIPELINE TAMAMLANDI — %s", account_label)
+    logger.info("=" * 60)
+
+    _update_sdb("pipeline_complete", "completed")
+    return True
 
 
 def watch_queue(interval_minutes=5):

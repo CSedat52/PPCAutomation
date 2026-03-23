@@ -2735,6 +2735,95 @@ def run_executor(hesap_key, marketplace, today=None, force_execute=False):
         }
 
 
+async def _collect_verify_data(hesap_key, marketplace):
+    """
+    Verify verilerini Amazon API'den ceker. MCP server'a bagimlilik yok.
+    parallel_collector.py'deki AmazonAdsClient'i kullanir.
+    """
+    sys.path.insert(0, str(BASE_DIR))
+    from parallel_collector import AmazonAdsClient, load_accounts
+
+    accounts = load_accounts()
+    lwa = accounts["lwa_app"]
+    hesap = accounts["hesaplar"][hesap_key]
+    mp_config = hesap["marketplaces"][marketplace]
+
+    config = {
+        "client_id": lwa["client_id"],
+        "client_secret": lwa["client_secret"],
+        "refresh_token": hesap["refresh_token"],
+        "marketplace": marketplace,
+        "profile_id": mp_config["profile_id"],
+        "account_id": hesap["account_id"],
+        "api_endpoint": hesap["api_endpoint"],
+        "token_endpoint": hesap["token_endpoint"],
+    }
+    client = AmazonAdsClient(config)
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    VERIFY_ENTITIES = [
+        ("sp_campaigns",          "POST", "/sp/campaigns/list",          "application/vnd.spCampaign.v3+json",              {"stateFilter": {"include": ["ENABLED", "PAUSED"]}}, "campaigns"),
+        ("sp_keywords",           "POST", "/sp/keywords/list",           "application/vnd.spKeyword.v3+json",               {"stateFilter": {"include": ["ENABLED", "PAUSED"]}}, "keywords"),
+        ("sp_targets",            "POST", "/sp/targets/list",            "application/vnd.spTargetingClause.v3+json",       {"stateFilter": {"include": ["ENABLED", "PAUSED"]}}, "targetingClauses"),
+        ("sp_negative_keywords",  "POST", "/sp/negativeKeywords/list",   "application/vnd.spNegativeKeyword.v3+json",       {}, "negativeKeywords"),
+        ("sp_negative_targets",   "POST", "/sp/negativeTargets/list",    "application/vnd.spNegativeTargetingClause.v3+json",{}, "negativeTargetingClauses"),
+        ("sb_keywords",           "GET",  "/sb/keywords",                None, {"stateFilter": "enabled,paused", "count": 1000}, None),
+        ("sb_targets",            "POST", "/sb/targets/list",            "application/vnd.sbtargetingresource.v3.2+json",   {"filter": {"states": ["enabled", "paused"]}}, None),
+        ("sb_themes",             "POST", "/sb/themes/list",             "application/vnd.sbthemesresource.v3+json",        {}, None),
+        ("sd_targets",            "GET",  "/sd/targets",                 None, {"stateFilter": "enabled,paused", "count": 1000}, None),
+    ]
+
+    results = {"tarih": today, "hesap": f"{hesap_key}/{marketplace}", "dosyalar": {}, "hatalar": [], "basarili": 0, "basarisiz": 0}
+
+    for name, method, path, ct, params, _wrapper in VERIFY_ENTITIES:
+        try:
+            if method == "GET":
+                query = "&".join(f"{k}={v}" for k, v in params.items())
+                full_path = f"{path}?{query}" if query else path
+                resp = await client._request_with_retry("GET", full_path, None)
+            else:
+                resp = await client._request_with_retry("POST", path, params, content_type=ct, accept=ct)
+
+            # Extract data
+            if isinstance(resp, dict) and _wrapper:
+                data = resp.get(_wrapper, [])
+            elif isinstance(resp, list):
+                data = resp
+            elif isinstance(resp, dict):
+                for v in resp.values():
+                    if isinstance(v, list):
+                        data = v
+                        break
+                else:
+                    data = [resp] if resp else []
+            else:
+                data = []
+
+            # Pagination for SP POST endpoints
+            if method == "POST" and isinstance(resp, dict) and _wrapper:
+                next_token = resp.get("nextToken")
+                while next_token:
+                    page_params = {**params, "nextToken": next_token}
+                    resp2 = await client._request_with_retry("POST", path, page_params, content_type=ct, accept=ct)
+                    page_data = resp2.get(_wrapper, []) if isinstance(resp2, dict) else resp2 if isinstance(resp2, list) else []
+                    data.extend(page_data)
+                    next_token = resp2.get("nextToken") if isinstance(resp2, dict) else None
+
+            filepath = DATA_DIR / f"{today}_verify_{name}.json"
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            logger.info("Kaydedildi: %s (%d kayit)", filepath, len(data))
+            results["dosyalar"][name] = str(filepath)
+            results["basarili"] += 1
+        except Exception as e:
+            logger.error("Verify hatasi [%s]: %s", name, str(e))
+            results["hatalar"].append({"entity": name, "hata": str(e)})
+            results["basarisiz"] += 1
+
+    results["durum"] = "BASARILI" if results["basarisiz"] == 0 else "KISMI_BASARILI"
+    return results
+
+
 async def apply_execution_plan(hesap_key, marketplace, plan_path):
     """
     Execution plan dosyasini okuyup dogrudan Amazon API'ye gonderir.
@@ -3163,15 +3252,14 @@ def _run_executor_impl(today, force_execute=False, hesap_key="", marketplace="")
         return report
 
     # 6. UYGULAMA MODU
-    # Not: Gercek API cagrilari Agent 1'in MCP tool'lari uzerinden yapilir.
-    # Bu fonksiyon API payload'larini hazirlar; gercek cagrilar Claude Code tarafindan yapilir.
-    
+    # Plan olusturulur, ardindan apply_execution_plan() ile dogrudan Amazon API'ye gonderilir.
+
     execution_report = {
         "agent": "Agent3_Executor",
         "tarih": today,
         "mod": "UYGULAMA",
-        "durum": "BEKLIYOR",
-        "mesaj": "API payload'lari hazir. Claude Code MCP tool'lari ile uygulanacak.",
+        "durum": "PLAN_HAZIRLANIYOR",
+        "mesaj": "API payload'lari hazirlaniyor.",
         "bid_islemleri": [
             {
                 "kampanya": op["action"]["kampanya_adi"],
@@ -3223,7 +3311,6 @@ def _run_executor_impl(today, force_execute=False, hesap_key="", marketplace="")
         json.dump(execution_report, f, indent=2, ensure_ascii=False)
 
     logger.info("Execution plan kaydedildi: %s", exec_path)
-    logger.info("=== AGENT 3 EXECUTION PLAN HAZIR ===")
 
     # Execution hatalari varsa agent3_errors.json'a kaydet
     toplam_hata = (
@@ -3239,7 +3326,7 @@ def _run_executor_impl(today, force_execute=False, hesap_key="", marketplace="")
                     "tip": op["action"].get("tip", "bid"),
                     "kampanya": op["action"].get("kampanya_adi", ""),
                     "hedefleme": op["action"].get("hedefleme", ""),
-                    "hatalar": op["hatalar"][:3],  # Max 3 hata detayi
+                    "hatalar": op["hatalar"][:3],
                 })
         save_error_log(
             hata_tipi="ExecutionError",
@@ -3254,6 +3341,33 @@ def _run_executor_impl(today, force_execute=False, hesap_key="", marketplace="")
                               execution_report, bid_ops, neg_ops, harvest_ops)
 
     execution_report["plan_dosyasi"] = str(exec_path)
+
+    # --- DOGRUDAN API'YE GONDER ---
+    hazir_islem = sum(1 for o in bid_ops + neg_ops + harvest_ops if o["status"] == "HAZIR")
+    if hazir_islem > 0:
+        logger.info("=== APPLY: %d islem Amazon API'ye gonderiliyor ===", hazir_islem)
+        import asyncio
+        try:
+            apply_result = asyncio.run(apply_execution_plan(hesap_key, marketplace, str(exec_path)))
+            if isinstance(apply_result, str):
+                apply_result = json.loads(apply_result)
+            execution_report["api_sonuclari"] = apply_result
+            execution_report["durum"] = apply_result.get("durum", "TAMAMLANDI")
+            execution_report["mesaj"] = apply_result.get("ozet_mesaj", "API uygulamasi tamamlandi")
+            ozet = apply_result.get("ozet", {})
+            logger.info("=== AGENT 3 EXECUTION TAMAMLANDI === Basarili: %d, Basarisiz: %d, Atlanan: %d",
+                        ozet.get("basarili", 0), ozet.get("basarisiz", 0), ozet.get("atlanan", 0))
+        except Exception as e:
+            tb = traceback.format_exc()
+            logger.error("API uygulama hatasi: %s", str(e))
+            save_error_log("ExecutionError", str(e), tb, adim="apply_execution_plan",
+                           session_id=MAESTRO_SESSION_ID)
+            execution_report["durum"] = "API_HATASI"
+            execution_report["mesaj"] = f"Plan hazir ama API uygulamasi basarisiz: {str(e)[:300]}"
+    else:
+        logger.info("Hazir islem yok, API cagrisi yapilmadi.")
+        execution_report["durum"] = "PLAN_HAZIR_ISLEM_YOK"
+
     execution_report["dogrulama_talimati"] = {
         "bekleme_suresi_saniye": VERIFICATION_DELAY_SECONDS,
         "bekleme_suresi_dakika": VERIFICATION_DELAY_SECONDS // 60,
@@ -3375,11 +3489,13 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    # Kullanim: python agent3/executor.py <hesap_key> <marketplace> [--execute] [--verify] [--date YYYY-MM-DD]
+    # Kullanim: python agent3/executor.py <hesap_key> <marketplace> [--execute] [--verify] [--collect-verify] [--date YYYY-MM-DD]
     if len(sys.argv) < 3:
-        print("Kullanim: python agent3/executor.py <hesap_key> <marketplace> [--execute] [--verify]")
-        print("Ornek:    python agent3/executor.py vigowood_na US")
-        print("Ornek:    python agent3/executor.py vigowood_na US --execute")
+        print("Kullanim: python agent3/executor.py <hesap_key> <marketplace> [--execute] [--verify] [--collect-verify]")
+        print("Ornek:    python agent3/executor.py vigowood_na US                    (dry-run)")
+        print("Ornek:    python agent3/executor.py vigowood_na US --execute           (plan + API'ye gonder)")
+        print("Ornek:    python agent3/executor.py vigowood_na US --collect-verify    (verify verileri cek)")
+        print("Ornek:    python agent3/executor.py vigowood_na US --verify            (dogrulama yap)")
         sys.exit(1)
 
     hesap_key = sys.argv[1]
@@ -3391,6 +3507,19 @@ if __name__ == "__main__":
     for i, arg in enumerate(sys.argv):
         if arg == "--date" and i + 1 < len(sys.argv):
             custom_date = sys.argv[i + 1]
+
+    if "--collect-verify" in sys.argv:
+        # Verify verilerini Amazon API'den cek (MCP server'a bagimlilik yok)
+        import asyncio
+        today = custom_date or datetime.utcnow().strftime("%Y-%m-%d")
+        logger.info("=== VERIFY VERI TOPLAMA BASLADI === %s/%s", hesap_key, marketplace)
+        try:
+            result = asyncio.run(_collect_verify_data(hesap_key, marketplace))
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        except Exception as e:
+            logger.error("Verify veri toplama hatasi: %s", str(e))
+            print(json.dumps({"durum": "HATA", "mesaj": str(e)}, indent=2))
+        sys.exit(0)
 
     if "--verify" in sys.argv:
         today = custom_date or datetime.utcnow().strftime("%Y-%m-%d")
@@ -3421,17 +3550,5 @@ if __name__ == "__main__":
                 print(f"\n--- Dogrulama icin once verify verilerini cekin ---")
     else:
         force = "--execute" in sys.argv
-        apply_direct = "--apply" in sys.argv
         result = run_executor(hesap_key, marketplace, today=custom_date, force_execute=force)
         print(json.dumps(result, indent=2, ensure_ascii=False))
-
-        # --apply: Plan olusturulduktan sonra dogrudan Amazon API'ye gonder
-        if apply_direct and force:
-            plan_path = result.get("plan_dosyasi")
-            if plan_path and Path(plan_path).exists():
-                import asyncio
-                logger.info("=== APPLY: Execution plan Amazon API'ye gonderiliyor ===")
-                apply_result = asyncio.run(apply_execution_plan(hesap_key, marketplace, plan_path))
-                print(json.dumps(apply_result, indent=2, ensure_ascii=False))
-            else:
-                logger.error("Plan dosyasi bulunamadi, --apply uygulanamadi")

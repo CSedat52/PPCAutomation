@@ -73,6 +73,7 @@ STATE_DIR = os.path.join(BASE_DIR, "maestro", "state")
 
 AGENT2_SCRIPT = os.path.join(BASE_DIR, "agent2", "analyst.py")
 AGENT3_SCRIPT = os.path.join(BASE_DIR, "agent3", "executor.py")
+AGENT4_SCRIPT = os.path.join(BASE_DIR, "agent4", "optimizer.py")
 
 ACCOUNTS_FILE = os.path.join(BASE_DIR, "config", "accounts.json")
 if not os.path.exists(ACCOUNTS_FILE):
