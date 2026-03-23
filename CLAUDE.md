@@ -51,6 +51,7 @@ amazon-ppc-automation/
 +-- CLAUDE.md                            # Bu dosya
 +-- log_utils.py                         # Ortak hata taksonomisi ve log yardimci fonksiyonlari
 +-- parallel_collector.py                # Paralel veri toplayici (Agent 1 paralel)
++-- parallel_analyzer.py                 # Paralel analizci (Agent 2 paralel)
 +-- config/
 |   +-- accounts.json                    # TUM hesap credential'lari ve profile_id'ler
 |   +-- vigowood_na_US/
@@ -281,11 +282,12 @@ Script bitince tum verileri data/{hesap}_{mp}/ altina kaydeder.
 **ADIM 2-6: Her hesap+marketplace icin SIRAYLA devam et**
 Veriler toplandiktan sonra her hesap icin sirayla (bir hesap hata verse bile sonrakine gecer):
 
-**ADIM 2: Agent 2 — Analiz (her hesap icin)**
-- `python agent2/analyst.py HESAP MP` calistir.
-- Agent 2 kendi tarihini kullanir (bugunun tarihi). Dosyalar PIPELINE_DATE ile ayni gun oldugu icin sorun yok.
+**ADIM 2: Agent 2 — Paralel Analiz (tum marketplace'ler)**
+- `python parallel_analyzer.py HESAP1:MP1 HESAP2:MP2 ...` calistir (Agent 1 ile ayni target listesi).
+- Tek komut tum marketplace'leri paralel analiz eder ve kompakt ozet basar.
+- Alternatif (tek marketplace): `python agent2/analyst.py HESAP MP`
 - Sonucu degerlendir:
-  - Exit code 0 + durum = "TAMAMLANDI" → Basarili, devam et.
+  - Tum marketplace'ler TAMAMLANDI → devam et.
   - Hata varsa → PROBLEM COZME MODUNA GIR.
 
 **ADIM 3: Watch Modu — Dashboard Onay Bekleme (her hesap icin)**
@@ -319,9 +321,10 @@ Veriler toplandiktan sonra her hesap icin sirayla (bir hesap hata verse bile son
 - Hata varsa → Problem Cozme Moduna gir.
 - NOT: Agent 4 kendi tarihini kullanir, PIPELINE_DATE gerektirmez.
 
-**ADIM 6: Sonraki hesaba gec veya Pipeline Ozet**
-- Diger hesaplar kaldiysa ADIM 2'ye don (sonraki hesap).
-- Tum hesaplar bittiyse ozet raporla, tamamlandi e-postasi gonder.
+**ADIM 6: Pipeline Ozet**
+- Agent 2 zaten tum marketplace'leri paralel analiz ettigi icin hesap bazli dongu YOKTUR.
+- Adim 3-5 her marketplace icin sirayla (veya watch modu ile otomatik) calisir.
+- Tum marketplace'ler bittiyse ozet raporla, tamamlandi e-postasi gonder.
 
 ---
 
@@ -367,7 +370,8 @@ Herhangi bir agent hata verdiginde Maestro su adimlari izler:
 1. Hangi hesap+marketplace icin oldugunu sor
 2. `config/{hesap}_{mp}/settings.json` oku ve goster
 3. Kullanicidan onay al
-4. `python agent2/analyst.py HESAP MP` calistir
+4. Birden fazla marketplace icin: `python parallel_analyzer.py HESAP1:MP1 HESAP2:MP2 ...` calistir
+   Tek marketplace icin: `python agent2/analyst.py HESAP MP` calistir
 5. Sonuclari raporla
 
 ### "agent 3'u calistir" veya "uygula" dediginde:
@@ -402,6 +406,8 @@ Herhangi bir agent hata verdiginde Maestro su adimlari izler:
 | python parallel_collector.py | Tum hesaplar paralel veri toplama |
 | python parallel_collector.py vigowood_eu | Tek hesap paralel |
 | python parallel_collector.py vigowood_na:US vigowood_eu:DE | Belirli marketplace'ler |
+| python parallel_analyzer.py | Tum hesaplar paralel analiz |
+| python parallel_analyzer.py vigowood_na:US vigowood_eu:DE | Belirli marketplace'ler analiz |
 
 ---
 
@@ -442,6 +448,8 @@ MAESTRO_NOTIFY_EMAIL=your@gmail.com
 12. Her agent cagirisinda hesap_key + marketplace ZORUNLU parametre
 13. Hesaplar arasi veri izolasyonu — yanlis klasorden okuma/yazma yapma
 14. Pipeline bir hesapta hata verse bile sonraki hesaba gecmeli
+15. Uzun suren background komutlarini (parallel_collector, agent3 execute vb.) takip ederken ASLA TaskOutput kullanma. TaskOutput her seferinde TUM ciktiyi bastan dondurur ve context'i gereksiz sisirir. Bunun yerine `tail -20` veya `tail -30` kullan.
+16. Birden fazla marketplace icin Agent 2 calistirirken `python parallel_analyzer.py` kullan. Tek komut, tek kompakt ozet.
 
 ---
 
