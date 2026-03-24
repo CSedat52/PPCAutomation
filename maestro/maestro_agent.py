@@ -16,11 +16,12 @@ Calisma Modlari:
 
 Pipeline Akisi (her hesap+marketplace icin):
   1. config.init_account(hesap_key, marketplace)
-  2. Agent 1 (Veri Toplama — MCP tool)
+  2. Agent 1 (Veri Toplama — parallel_collector subprocess)
   3. Agent 2 (Analiz — Python script)
-  4. Onay bekleme (E-posta + Excel kontrol dongusu)
-  5. Agent 3 (Execution — Python script + MCP tools)
-  6. Ozet rapor e-postasi
+  4. Onay bekleme (Dashboard execution_queue watch)
+  5. Agent 3 (Execution — Python script)
+  6. Agent 4 (Optimizer — Python script)
+  7. Ozet rapor e-postasi
 """
 
 import os
@@ -311,10 +312,9 @@ def resume_pipeline(hesap_key, marketplace):
 # ============================================================================
 
 def _run_agent1(state, session_id, hesap_key, marketplace):
-    """Agent 1'i calistirir (MCP tool)."""
+    """Agent 1'i calistirir (parallel_collector subprocess)."""
     logger.info("--- AGENT 1: Veri Toplama (%s/%s) ---", hesap_key, marketplace)
     state_manager.update_agent_status(state, "agent1", "running")
-
     _save_log("info", f"Agent 1 basliyor: {hesap_key}/{marketplace}",
               "agent1", hesap_key, marketplace, session_id)
     sdb = _get_sdb()
@@ -326,79 +326,70 @@ def _run_agent1(state, session_id, hesap_key, marketplace):
 
     today = datetime.utcnow().strftime(config.DATE_FORMAT)
     data_dir = Path(config.ACCOUNT_DATA_DIR)
-
     kritik_dosya = data_dir / f"{today}_sp_campaigns.json"
 
+    # Cache kontrolu — veriler zaten varsa atla
     if kritik_dosya.exists():
         logger.info("Agent 1 verileri zaten mevcut (tarih: %s). Devam ediliyor.", today)
-        state_manager.update_agent_status(
-            state, "agent1", "completed",
-            summary=f"Veriler mevcut (tarih: {today})"
-        )
-        _save_log("info", f"Agent 1 tamamlandi (cached, tarih: {today})",
-                  "agent1", hesap_key, marketplace, session_id)
+        state_manager.update_agent_status(state, "agent1", "completed",
+            summary=f"Veriler mevcut (tarih: {today})")
+        _save_log("info", "Agent 1 tamamlandi (cached)", "agent1", hesap_key, marketplace, session_id)
         if sdb:
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "completed")
-                sdb.update_agent_status_detail("agent1", "completed", {"tasks": 0, "duration": "cached"})
             except Exception:
                 pass
         return True
 
-    logger.info("Agent 1 verileri bulunamadi. MCP tool cagiriliyor...")
-    logger.info("TALIMAT: Claude Code 'amazon_ads_collect_all_data({\"hesap_key\": \"%s\", \"marketplace\": \"%s\"})' cagirmali.",
-                hesap_key, marketplace)
+    # parallel_collector.py'yi subprocess olarak calistir
+    logger.info("parallel_collector baslatiliyor: %s:%s", hesap_key, marketplace)
 
-    # Bekleme dongusu — Claude Code MCP tool'u cagirdiktan sonra dosyalar olusur
-    max_wait_minutes = 30
-    check_interval = 30  # saniye
-    waited = 0
+    def run_collector():
+        env_vars = {**os.environ,
+                    "MAESTRO_SESSION_ID": session_id,
+                    "HESAP_KEY": hesap_key,
+                    "MARKETPLACE": marketplace}
+        result = subprocess.run(
+            [sys.executable, os.path.join(config.BASE_DIR, "parallel_collector.py"),
+             f"{hesap_key}:{marketplace}"],
+            capture_output=True, text=True, timeout=7200,
+            cwd=config.BASE_DIR, env=env_vars,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"parallel_collector hatasi (code {result.returncode}): {result.stderr[:500]}")
+        return result.stdout
 
-    while waited < max_wait_minutes * 60:
-        if kritik_dosya.exists():
-            # Dosya sayisini kontrol et
-            files = list(data_dir.glob(f"{today}_*.json"))
-            logger.info("Agent 1 verileri algilandi: %d dosya", len(files))
-            state_manager.update_agent_status(
-                state, "agent1", "completed",
-                summary=f"{len(files)} dosya toplandi"
-            )
-            _save_log("info", f"Agent 1 tamamlandi: {len(files)} dosya toplandi",
-                      "agent1", hesap_key, marketplace, session_id)
-            if sdb:
-                try:
-                    sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "completed")
-                    sdb.update_agent_status_detail("agent1", "completed", {"tasks": len(files)})
-                except Exception:
-                    pass
-            return True
+    success, result, error_info = retry_handler.execute_with_retry(run_collector, "Agent 1")
 
-        time.sleep(check_interval)
-        waited += check_interval
-        if waited % 120 == 0:
-            logger.info("Agent 1 bekleniyor... (%d dk)", waited // 60)
-
-    # Timeout
-    error_msg = f"Agent 1 {max_wait_minutes} dakika icinde tamamlanmadi."
-    logger.error(error_msg)
-    state_manager.update_agent_status(state, "agent1", "failed", errors=[error_msg])
-    save_error_log("AgentFailure", error_msg, session_id=session_id,
-                   adim="run_agent1",
-                   extra={"agent": "agent1", "sebep": "timeout",
-                          "bekleme_dk": max_wait_minutes})
-    _save_log("error", f"Agent 1 hatasi: {error_msg[:200]}",
-              "agent1", hesap_key, marketplace, session_id, error_type="AgentFailure")
-    if sdb:
-        try:
-            sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "failed", error_msg=error_msg)
-            sdb.update_agent_status_detail("agent1", "failed")
-        except Exception:
-            pass
-    email_handler.send_error(
-        session_id, "Agent 1", error_msg,
-        suggestion="Amazon API baglantisini kontrol edin. 'maestro resume' ile tekrar deneyin."
-    )
-    return False
+    if success:
+        files = list(data_dir.glob(f"{today}_*.json"))
+        state_manager.update_agent_status(state, "agent1", "completed",
+            summary=f"{len(files)} dosya toplandi")
+        _save_log("info", f"Agent 1 tamamlandi: {len(files)} dosya",
+                  "agent1", hesap_key, marketplace, session_id)
+        if sdb:
+            try:
+                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "completed")
+                sdb.update_agent_status_detail("agent1", "completed", {"tasks": len(files)})
+            except Exception:
+                pass
+        return True
+    else:
+        error_msg = error_info.get("error_message", "Bilinmeyen hata") if error_info else "Bilinmeyen hata"
+        error_type = error_info.get("error_type", "server_error") if error_info else "server_error"
+        state_manager.update_agent_status(state, "agent1", "failed", errors=[error_msg])
+        save_error_log("AgentFailure", error_msg, session_id=session_id, adim="run_agent1",
+                       extra={"agent": "agent1", "error_type": error_type})
+        _save_log("error", f"Agent 1 hatasi: {error_msg[:200]}",
+                  "agent1", hesap_key, marketplace, session_id, error_type="AgentFailure")
+        if sdb:
+            try:
+                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "failed", error_msg=error_msg)
+            except Exception:
+                pass
+        email_handler.send_error(session_id, "Agent 1", error_msg,
+            suggestion=retry_handler.get_error_suggestion(error_type))
+        return False
 
 
 def _run_agent2(state, session_id, hesap_key, marketplace):
@@ -416,7 +407,10 @@ def _run_agent2(state, session_id, hesap_key, marketplace):
             pass
 
     def run_agent2_script():
-        env = {**os.environ, "MAESTRO_SESSION_ID": session_id}
+        env = {**os.environ,
+               "MAESTRO_SESSION_ID": session_id,
+               "HESAP_KEY": hesap_key,
+               "MARKETPLACE": marketplace}
         result = subprocess.run(
             [sys.executable, config.AGENT2_SCRIPT, hesap_key, marketplace],
             capture_output=True, text=True, timeout=600,
@@ -502,7 +496,10 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
     # Adim 1: Dry-run
     logger.info("Agent 3 — Adim 1: Dry-run")
     def run_agent3_dryrun():
-        env = {**os.environ, "MAESTRO_SESSION_ID": session_id}
+        env = {**os.environ,
+               "MAESTRO_SESSION_ID": session_id,
+               "HESAP_KEY": hesap_key,
+               "MARKETPLACE": marketplace}
         result = subprocess.run(
             [sys.executable, config.AGENT3_SCRIPT, hesap_key, marketplace],
             capture_output=True, text=True, timeout=300,
@@ -562,7 +559,10 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
     # Adim 2: Execute
     logger.info("Agent 3 — Adim 2: Execution")
     def run_agent3_execute():
-        env = {**os.environ, "MAESTRO_SESSION_ID": session_id}
+        env = {**os.environ,
+               "MAESTRO_SESSION_ID": session_id,
+               "HESAP_KEY": hesap_key,
+               "MARKETPLACE": marketplace}
         result = subprocess.run(
             [sys.executable, config.AGENT3_SCRIPT, hesap_key, marketplace, "--execute"],
             capture_output=True, text=True, timeout=600,
@@ -607,7 +607,10 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
 
     logger.info("Agent 3 — Adim 4: Dogrulama")
     def run_agent3_verify():
-        env = {**os.environ, "MAESTRO_SESSION_ID": session_id}
+        env = {**os.environ,
+               "MAESTRO_SESSION_ID": session_id,
+               "HESAP_KEY": hesap_key,
+               "MARKETPLACE": marketplace}
         result = subprocess.run(
             [sys.executable, config.AGENT3_SCRIPT, hesap_key, marketplace, "--verify"],
             capture_output=True, text=True, timeout=300,
@@ -974,104 +977,55 @@ def poll_execution_queue(filter_hesap=None, filter_marketplace=None):
 
 def _run_agent3_from_queue(hesap_key, marketplace):
     """
-    Dashboard onaylarindan tam pipeline calistirir:
-    1. Agent 3 --execute (plan + API'ye gonder)
-    2. 5 dakika bekle
-    3. Agent 3 --collect-verify (verify verileri cek)
-    4. Agent 3 --verify (dogrulama)
-    5. Agent 4 optimizer
+    Dashboard onaylarindan Maestro'yu Claude Code uzerinden calistirir.
+    Claude Code CLAUDE.md'yi okuyarak Agent 3 + Agent 4 pipeline'ini yonetir.
     """
     config.init_account(hesap_key, marketplace)
-    session_id = f"queue_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{hesap_key}_{marketplace}"
     account_label = f"{hesap_key}/{marketplace}"
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    env = {**os.environ, "MAESTRO_SESSION_ID": session_id}
-
-    sdb = _get_sdb()
-
-    def _update_sdb(step, status, error_msg=None):
-        if sdb:
-            try:
-                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, step, status,
-                                        error_msg)
-                sdb.update_agent_status_detail(step.split("_")[0] if "_" in step else step, status)
-            except Exception:
-                pass
-
-    def _run_step(script_args, step_name, timeout_sec=600):
-        """Bir subprocess adimini calistir. Basari/basarisizlik doner."""
-        _save_log("info", f"{step_name} basliyor: {account_label}",
-                  step_name, hesap_key, marketplace, session_id)
-        _update_sdb(step_name, "running")
-        try:
-            result = subprocess.run(
-                [sys.executable] + script_args,
-                capture_output=True, text=True, timeout=timeout_sec,
-                cwd=config.BASE_DIR, env=env,
-            )
-            success = result.returncode == 0
-            status = "completed" if success else "failed"
-            log_msg = f"{step_name} {'tamamlandi' if success else 'basarisiz'}: {account_label}"
-            if not success and result.stderr:
-                log_msg += f" — {result.stderr[:200]}"
-            _save_log("info" if success else "error", log_msg,
-                      step_name, hesap_key, marketplace, session_id)
-            _update_sdb(step_name, status)
-            return success
-        except subprocess.TimeoutExpired:
-            _save_log("error", f"{step_name} timeout ({timeout_sec}s): {account_label}",
-                      step_name, hesap_key, marketplace, session_id)
-            _update_sdb(step_name, "failed", f"Timeout ({timeout_sec}s)")
-            return False
-        except Exception as e:
-            _save_log("error", f"{step_name} hatasi: {str(e)[:200]}",
-                      step_name, hesap_key, marketplace, session_id)
-            _update_sdb(step_name, "failed", str(e)[:500])
-            return False
-
     logger.info("=" * 60)
-    logger.info("  QUEUE PIPELINE BASLADI — %s", account_label)
+    logger.info("  QUEUE: MAESTRO CAGIRILIYOR — %s", account_label)
     logger.info("=" * 60)
 
-    # --- Adim 1: Agent 3 Execute (plan + API'ye gonder) ---
-    ok = _run_step(
-        [config.AGENT3_SCRIPT, hesap_key, marketplace, "--execute", "--date", today],
-        "agent3_execute", timeout_sec=600)
-    if not ok:
-        logger.error("Agent 3 execute basarisiz, pipeline durduruluyor: %s", account_label)
+    _save_log("info", f"Dashboard onayi alindi, Maestro baslatiliyor: {account_label}",
+              "maestro", hesap_key, marketplace)
+
+    try:
+        env_vars = {**os.environ,
+                    "HESAP_KEY": hesap_key,
+                    "MARKETPLACE": marketplace}
+        result = subprocess.run(
+            ["claude", "-p",
+             f"maestro resume {hesap_key} {marketplace}. Agent 3'ten devam et. "
+             f"Kullaniciya soru sorma, otomatik calis. Watch moduna gecme, bitince cik.",
+             "--dangerously-skip-permissions"],
+            capture_output=True, text=True, timeout=3600,
+            cwd=config.BASE_DIR, env=env_vars,
+        )
+        success = result.returncode == 0
+        if success:
+            logger.info("Maestro tamamlandi: %s", account_label)
+            _save_log("info", f"Maestro tamamlandi: {account_label}",
+                      "maestro", hesap_key, marketplace)
+        else:
+            logger.error("Maestro hatasi: %s — %s", account_label, result.stderr[:300])
+            _save_log("error", f"Maestro hatasi: {result.stderr[:200]}",
+                      "maestro", hesap_key, marketplace)
+        return success
+    except subprocess.TimeoutExpired:
+        logger.error("Maestro timeout (1 saat): %s", account_label)
+        _save_log("error", f"Maestro timeout: {account_label}",
+                  "maestro", hesap_key, marketplace)
         return False
-
-    # --- Adim 2: 5 dakika bekle ---
-    logger.info("5 dakika bekleniyor (API yansima suresi)...")
-    _update_sdb("agent3_verify_wait", "running")
-    time.sleep(300)
-
-    # --- Adim 3: Verify verileri cek ---
-    ok = _run_step(
-        [config.AGENT3_SCRIPT, hesap_key, marketplace, "--collect-verify"],
-        "agent3_collect_verify", timeout_sec=300)
-    if not ok:
-        logger.warning("Verify veri toplama basarisiz, verify atlaniyor: %s", account_label)
-        # Verify basarisiz olsa bile Agent 4'e devam et
-
-    # --- Adim 4: Dogrulama ---
-    if ok:
-        _run_step(
-            [config.AGENT3_SCRIPT, hesap_key, marketplace, "--verify", "--date", today],
-            "agent3_verify", timeout_sec=300)
-        # Verify sonucu ne olursa olsun devam et
-
-    # --- Adim 5: Agent 4 Optimizer ---
-    _run_step(
-        [config.AGENT4_SCRIPT, hesap_key, marketplace],
-        "agent4_optimize", timeout_sec=300)
-
-    logger.info("=" * 60)
-    logger.info("  QUEUE PIPELINE TAMAMLANDI — %s", account_label)
-    logger.info("=" * 60)
-
-    _update_sdb("pipeline_complete", "completed")
-    return True
+    except FileNotFoundError:
+        logger.error("claude komutu bulunamadi. Claude Code kurulu mu?")
+        _save_log("error", "claude komutu bulunamadi",
+                  "maestro", hesap_key, marketplace)
+        return False
+    except Exception as e:
+        logger.error("Maestro beklenmeyen hata: %s — %s", account_label, e)
+        _save_log("error", f"Maestro hatasi: {str(e)[:200]}",
+                  "maestro", hesap_key, marketplace)
+        return False
 
 
 def watch_queue(interval_minutes=5):

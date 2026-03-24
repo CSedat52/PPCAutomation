@@ -37,7 +37,6 @@ Her hesap+marketplace kombinasyonu kendi izole klasorune sahiptir:
 
 ### Kimlik Bilgileri
 - `config/accounts.json` — Tum hesaplarin credential'lari, profile_id'leri, API endpoint'leri
-- `.mcp.json` — Sadece MCP server komutu (env var YOK, hersey accounts.json'dan)
 - `.env` — Sadece Maestro e-posta ayarlari
 
 ---
@@ -46,7 +45,6 @@ Her hesap+marketplace kombinasyonu kendi izole klasorune sahiptir:
 
 ```
 amazon-ppc-automation/
-+-- .mcp.json                            # MCP server config (env var yok)
 +-- .env                                 # Maestro e-posta ayarlari
 +-- CLAUDE.md                            # Bu dosya
 +-- log_utils.py                         # Ortak hata taksonomisi ve log yardimci fonksiyonlari
@@ -63,8 +61,7 @@ amazon-ppc-automation/
 |   +-- vigowood_eu_UK/
 |   |   +-- ...
 |   +-- (her marketplace icin ayri config klasoru)
-+-- agent1/
-|   +-- amazon_ads_mcp.py               # Agent 1 v9 — MCP server (multi-account)
++-- agent1/                              # (bos — veri toplama parallel_collector.py'ye tasindi)
 +-- agent2/
 |   +-- analyst.py                       # Agent 2 v5 — Analiz scripti (multi-account)
 +-- agent3/
@@ -114,25 +111,14 @@ amazon-ppc-automation/
 
 ## Agent Listesi
 
-### Agent 1: Data Collector v9 (Multi-Account)
-MCP tool: `amazon_ads_collect_all_data`
-Kaynak kod: `agent1/amazon_ads_mcp.py`
+### Agent 1: Data Collector (parallel_collector.py)
+Script: `parallel_collector.py`
+Cagiris: `python parallel_collector.py <hesap_key>:<marketplace> [...]`
+Ornek: `python parallel_collector.py vigowood_na:US vigowood_eu:DE`
 Gorevi: Amazon API'den SP + SB + SD verilerini ceker.
 Hata logu: `data/{hesap}_{mp}/logs/agent1_errors.json`
 
-Cagiris sekli (zorunlu parametreler):
-```
-amazon_ads_collect_all_data({"hesap_key": "vigowood_na", "marketplace": "US"})
-```
-
-Diger tool'lar:
-```
-amazon_ads_list_accounts({})                                    # Tum hesaplari listele
-amazon_ads_get_profiles({"hesap_key": "vigowood_eu", "marketplace": "DE"})  # Profilleri goster
-amazon_ads_collect_verify_data({"hesap_key": "vigowood_na", "marketplace": "US"})  # Verify verisi
-```
-
-Teknik: accounts.json'dan credential okur. SP->sales14d/purchases14d, SB/SD->sales/purchases. Pagination destekli. 8 koruma mekanizmasi. Bos raporlara 1 retry, hatali raporlara 3 retry.
+Teknik: accounts.json'dan credential okur. Farkli hesaplari PARALEL, ayni hesaptaki marketplace'leri 2'li BATCH calistirir.
 
 ### Agent 2: Analyst v5 (Multi-Account)
 Script: `agent2/analyst.py`
@@ -149,7 +135,7 @@ Ornek: `python agent3/executor.py vigowood_na US`                   (dry-run)
 Ornek: `python agent3/executor.py vigowood_na US --execute`          (plan + dogrudan API'ye gonder)
 Ornek: `python agent3/executor.py vigowood_na US --collect-verify`   (verify verileri cek)
 Ornek: `python agent3/executor.py vigowood_na US --verify`           (dogrulama yap)
-Gorevi: Onaylanmis kararlari Amazon API uzerinden uygular. MCP server'a bagimlilik YOK.
+Gorevi: Onaylanmis kararlari Amazon API uzerinden uygular.
 Hata logu: `data/{hesap}_{mp}/logs/agent3_errors.json`
 
 ### Agent 4: Optimizer & Learning Agent v2 (Multi-Account)
@@ -220,8 +206,7 @@ Kayit formati (tum agentlarda ayni):
 ### session_id Korelasyonu
 Pipeline calistiginda Maestro her agent'a session_id iletir:
 - Maestro: Kendi hatalarinda dogrudan `session_id` yazar
-- Agent 2/3: `MAESTRO_SESSION_ID` env var ile alir (subprocess cagrisinda iletilir)
-- Agent 1: MCP tool olarak calisir, session_id almaz (Maestro kendi tarafindan loglar)
+- Agent 1/2/3: `MAESTRO_SESSION_ID` env var ile alir (subprocess cagrisinda iletilir)
 - Manuel calistirmada: session_id `None` olur — sorun yaratmaz
 
 ### Log Rotasyonu
@@ -266,13 +251,8 @@ Bu tarih Agent 2 raporlari, Agent 3 execution plan, verify ve Agent 4'te kullani
 Gece yarisi gecilse bile tarih DEGISMEZ — pipeline bastan sona ayni tarihle calisir.
 
 **ADIM 1: Agent 1 — Paralel Veri Toplama**
-Birden fazla hesap/marketplace secildiyse `parallel_collector.py` kullan:
 ```
 python parallel_collector.py vigowood_na:US vigowood_na:CA vigowood_eu:UK vigowood_eu:DE ...
-```
-Tek hesap+marketplace secildiyse MCP tool kullanabilirsin:
-```
-amazon_ads_collect_all_data({"hesap_key": "vigowood_na", "marketplace": "US"})
 ```
 
 parallel_collector farkli hesaplari PARALEL, ayni hesaptaki marketplace'leri 2'li BATCH calistirir.
@@ -290,17 +270,15 @@ Veriler toplandiktan sonra her hesap icin sirayla (bir hesap hata verse bile son
   - Tum marketplace'ler TAMAMLANDI → devam et.
   - Hata varsa → PROBLEM COZME MODUNA GIR.
 
-**ADIM 3: Watch Modu — Dashboard Onay Bekleme (her hesap icin)**
-- Agent 2 bittikten sonra Maestro otomatik WATCH moduna girer.
-- Watch modu her 5 dakikada bir Supabase `execution_queue` tablosunu kontrol eder.
+**ADIM 3: Dashboard Onay Bekleme (ayri daemon)**
+- Watch modu artik Maestro pipeline icinde DEGIL, ayri bir daemon olarak calisir
+  (`python -m maestro.maestro_agent watch`).
+- Daemon her 5 dakikada bir Supabase `execution_queue` tablosunu kontrol eder.
 - Dashboard'dan kullanici "Agent3'u Calistir" butonuna bastiginda `execution_queue`'ya
   `status='pending', command='agent3_execute'` kaydi eklenir.
-- Watch modu bu kaydi aldiginda otomatik olarak tam pipeline'i baslatir:
-  1. Agent 3 `--execute` (plan + API'ye gonder)
-  2. 5 dakika bekleme
-  3. Agent 3 `--collect-verify` (verify verileri cek)
-  4. Agent 3 `--verify` (dogrulama)
-  5. Agent 4 optimizer
+- Daemon bu kaydi aldiginda Claude Code'u cagirarak Maestro'yu baslatir:
+  `claude -p "maestro resume HESAP MP. Agent 3'ten devam et..." --dangerously-skip-permissions`
+- Claude Code CLAUDE.md'yi okuyarak Agent 3 + Agent 4 pipeline'ini yonetir.
 - 24 saatten eski pending kayitlar otomatik expire edilir.
 
 **ALTERNATIF: Manuel Onay (Maestro watch modu disinda)**
@@ -309,7 +287,7 @@ Veriler toplandiktan sonra her hesap icin sirayla (bir hesap hata verse bile son
 
 **ADIM 4: Agent 3 — Execution (manuel mod veya watch icinde otomatik)**
 - `python agent3/executor.py HESAP MP --execute --date PIPELINE_DATE` calistir.
-  (Bu komut plan olusturur VE dogrudan Amazon API'ye gonderir. MCP tool gerekmez.)
+  (Bu komut plan olusturur VE dogrudan Amazon API'ye gonderir.)
 - 5 dakika bekle.
 - Verify verileri cek: `python agent3/executor.py HESAP MP --collect-verify`
 - `python agent3/executor.py HESAP MP --verify --date PIPELINE_DATE` calistir.
@@ -353,8 +331,7 @@ Herhangi bir agent hata verdiginde Maestro su adimlari izler:
 **4. ONEMLI KURALLAR**
    - Tahmini duzeltme yapma — once kesin teshis, sonra duzeltme.
    - Her duzeltmeyi logla — ne, nerede, neden.
-   - Agent 1 (MCP server) kodu degistiginde kullaniciya restart bildirimi yap.
-   - Agent 2, 3, 4 normal Python scriptleri — restart gerekmez.
+   - Tum agentlar normal Python scriptleri — restart gerekmez.
 
 ---
 
@@ -362,9 +339,8 @@ Herhangi bir agent hata verdiginde Maestro su adimlari izler:
 
 ### "verileri topla" veya "agent 1'i calistir" dediginde:
 1. Hangi hesap+marketplace icin oldugunu sor
-2. Tek hesap icin: `amazon_ads_collect_all_data({"hesap_key": "...", "marketplace": "..."})` cagir
-3. Birden fazla hesap icin: `python parallel_collector.py vigowood_na:US vigowood_eu:DE ...` calistir
-4. Sonucu raporla
+2. `python parallel_collector.py HESAP1:MP1 [HESAP2:MP2 ...]` calistir
+3. Sonucu raporla
 
 ### "analiz et" veya "agent 2'yi calistir" dediginde:
 1. Hangi hesap+marketplace icin oldugunu sor
@@ -382,10 +358,10 @@ Herhangi bir agent hata verdiginde Maestro su adimlari izler:
 5. 5 dk bekle → verify
 
 ### "hesaplari goster" dediginde:
-`amazon_ads_list_accounts({})` tool'unu cagir.
+`python -m maestro.maestro_agent accounts` calistir.
 
 ### "profilleri goster" dediginde:
-`amazon_ads_get_profiles({"hesap_key": "...", "marketplace": "..."})` tool'unu cagir.
+`config/accounts.json` dosyasindan profile bilgilerini oku ve goster.
 
 ---
 
@@ -433,6 +409,21 @@ MAESTRO_NOTIFY_EMAIL=your@gmail.com
 
 ---
 
+## VPS Otonom Mod
+
+Pipeline headless modda (-p flag ile) calistiginda su kurallar gecerlidir:
+
+1. Kullaniciya HICBIR SORU SORMA. Tum hesaplar icin otomatik calis.
+2. Agent 1 icin parallel_collector.py'yi subprocess olarak calistir.
+3. Agent 2 bittikten sonra watch moduna GECME — ayri bir Python daemon
+   (maestro watch) zaten execution_queue'yu dinliyor.
+4. Agent 2 tamamlandiginda ozet raporla ve CIK.
+5. Dashboard'dan onay geldiginde watch daemon Claude Code'u tekrar cagirir
+   ve Agent 3+4 pipeline'i baslar.
+6. Agent 3+4 pipeline'i da bitince CIK. Watch moduna gecme.
+
+---
+
 ## Temel Kurallar
 1. Agent 1 ve Agent 2 sadece veri OKUR, degisiklik YAPMAZ
 2. Agent 3 varsayilan DRY-RUN — Manuel modda kullanici onayi olmadan uygulamaz
@@ -441,15 +432,14 @@ MAESTRO_NOTIFY_EMAIL=your@gmail.com
 5. Hata olursa once KENDIN COZ — kodu oku, teshis et, duzelt, tekrar dene
 6. Max 3 duzeltme denemesi. Cozemezsen kullaniciya detayli rapor ver
 7. Kullanicinin parasini yoneten bir sistem — her hata ciddi, gormezden gelme
-8. MCP server kodu degistiginde kullaniciya restart bildirimi yap
-9. ASLA `python -c "..."` ile cok satirli veya karmasik kod calistirma. Bunun yerine gecici bir .py dosyasi olustur, calistir, sonra sil.
-10. Analiz periyodu 3 gundur
-11. Rakamlari okunakli formatta goster ($1,234.56)
-12. Her agent cagirisinda hesap_key + marketplace ZORUNLU parametre
-13. Hesaplar arasi veri izolasyonu — yanlis klasorden okuma/yazma yapma
-14. Pipeline bir hesapta hata verse bile sonraki hesaba gecmeli
-15. Uzun suren background komutlarini (parallel_collector, agent3 execute vb.) takip ederken ASLA TaskOutput kullanma. TaskOutput her seferinde TUM ciktiyi bastan dondurur ve context'i gereksiz sisirir. Bunun yerine `tail -20` veya `tail -30` kullan.
-16. Birden fazla marketplace icin Agent 2 calistirirken `python parallel_analyzer.py` kullan. Tek komut, tek kompakt ozet.
+8. ASLA `python -c "..."` ile cok satirli veya karmasik kod calistirma. Bunun yerine gecici bir .py dosyasi olustur, calistir, sonra sil.
+9. Analiz periyodu 3 gundur
+10. Rakamlari okunakli formatta goster ($1,234.56)
+11. Her agent cagirisinda hesap_key + marketplace ZORUNLU parametre
+12. Hesaplar arasi veri izolasyonu — yanlis klasorden okuma/yazma yapma
+13. Pipeline bir hesapta hata verse bile sonraki hesaba gecmeli
+14. Uzun suren background komutlarini (parallel_collector, agent3 execute vb.) takip ederken ASLA TaskOutput kullanma. TaskOutput her seferinde TUM ciktiyi bastan dondurur ve context'i gereksiz sisirir. Bunun yerine `tail -20` veya `tail -30` kullan.
+15. Birden fazla marketplace icin Agent 2 calistirirken `python parallel_analyzer.py` kullan. Tek komut, tek kompakt ozet.
 
 ---
 
@@ -471,4 +461,4 @@ git diff --stat
 git reset --hard
 ```
 
-Bu modda Claude Code HICBIR soru sormaz. Tum bash komutlari, MCP tool cagrilari ve dosya islemleri otomatik onaylanir.
+Bu modda Claude Code HICBIR soru sormaz. Tum bash komutlari ve dosya islemleri otomatik onaylanir.

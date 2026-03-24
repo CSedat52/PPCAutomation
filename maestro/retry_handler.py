@@ -166,7 +166,7 @@ def get_error_suggestion(error_type):
         ),
         "auth_error": (
             "Amazon API kimlik dogrulama hatasi. "
-            ".mcp.json dosyasindaki AMAZON_REFRESH_TOKEN'in gecerli oldugundan emin olun. "
+            "config/accounts.json dosyasindaki AMAZON_REFRESH_TOKEN'in gecerli oldugundan emin olun. "
             "Token sureleri dolmus olabilir — yeniden olusturmaniz gerekebilir."
         ),
         "network": (
