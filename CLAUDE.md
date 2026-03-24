@@ -425,21 +425,22 @@ Pipeline headless modda (-p flag ile) calistiginda su kurallar gecerlidir:
 ---
 
 ## Temel Kurallar
-1. Agent 1 ve Agent 2 sadece veri OKUR, degisiklik YAPMAZ
-2. Agent 3 varsayilan DRY-RUN — Manuel modda kullanici onayi olmadan uygulamaz
-3. Agent 4 sadece ANALIZ + ONERI uretir — hicbir dosyayi otomatik degistirmez
-4. Maestro modunda dry-run → otomatik execute → verify → Agent 4 (soru SORMA)
-5. Hata olursa once KENDIN COZ — kodu oku, teshis et, duzelt, tekrar dene
-6. Max 3 duzeltme denemesi. Cozemezsen kullaniciya detayli rapor ver
-7. Kullanicinin parasini yoneten bir sistem — her hata ciddi, gormezden gelme
-8. ASLA `python -c "..."` ile cok satirli veya karmasik kod calistirma. Bunun yerine gecici bir .py dosyasi olustur, calistir, sonra sil.
-9. Analiz periyodu 3 gundur
-10. Rakamlari okunakli formatta goster ($1,234.56)
-11. Her agent cagirisinda hesap_key + marketplace ZORUNLU parametre
-12. Hesaplar arasi veri izolasyonu — yanlis klasorden okuma/yazma yapma
-13. Pipeline bir hesapta hata verse bile sonraki hesaba gecmeli
-14. Uzun suren background komutlarini (parallel_collector, agent3 execute vb.) takip ederken ASLA TaskOutput kullanma. TaskOutput her seferinde TUM ciktiyi bastan dondurur ve context'i gereksiz sisirir. Bunun yerine `tail -20` veya `tail -30` kullan.
-15. Birden fazla marketplace icin Agent 2 calistirirken `python parallel_analyzer.py` kullan. Tek komut, tek kompakt ozet.
+1. Kullanicinin parasini yoneten bir sistem — her hata ciddi, gormezden gelme
+2. Hesaplar arasi veri izolasyonu — yanlis klasorden okuma/yazma yapma
+3. Her agent cagirisinda hesap_key + marketplace ZORUNLU parametre
+4. Agent 1 ve Agent 2 sadece veri OKUR, degisiklik YAPMAZ
+5. Agent 3 varsayilan DRY-RUN — Manuel modda kullanici onayi olmadan uygulamaz
+6. Agent 4 sadece ANALIZ + ONERI uretir — hicbir dosyayi otomatik degistirmez
+7. Maestro modunda dry-run → otomatik execute → verify → Agent 4 (soru SORMA)
+8. Hata olursa once KENDIN COZ — kodu oku, teshis et, duzelt, tekrar dene
+9. Max 3 duzeltme denemesi. Cozemezsen kullaniciya detayli rapor ver
+10. Pipeline bir hesapta hata verse bile sonraki hesaba gecmeli
+11. Uzun suren islemleri (parallel_collector, agent3 execute vb.) takip ederken EN AZ 10 DAKIKA arayla kontrol et. Her kontrol token harcar. Collector ortalama 90-120 dakika surer.
+12. Uzun suren background komutlarini takip ederken ASLA TaskOutput kullanma. TaskOutput her seferinde TUM ciktiyi bastan dondurur ve context'i gereksiz sisirir. Bunun yerine `tail -20` veya `tail -30` kullan.
+13. ASLA `python -c "..."` ile cok satirli veya karmasik kod calistirma. Bunun yerine gecici bir .py dosyasi olustur, calistir, sonra sil.
+14. Birden fazla marketplace icin Agent 2 calistirirken `python parallel_analyzer.py` kullan. Tek komut, tek kompakt ozet.
+15. Analiz periyodu 3 gundur
+16. Rakamlari okunakli formatta goster ($1,234.56)
 
 ---
 
