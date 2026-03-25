@@ -332,6 +332,8 @@ Herhangi bir agent hata verdiginde Maestro su adimlari izler:
    - Tahmini duzeltme yapma — once kesin teshis, sonra duzeltme.
    - Her duzeltmeyi logla — ne, nerede, neden.
    - Tum agentlar normal Python scriptleri — restart gerekmez.
+   - Agent 3 "BOS" donerse bu hata DEGILDIR — Problem Cozme Moduna girme.
+     Kullanici dashboard'dan onay verene kadar Agent 3 calistirilmaz.
 
 ---
 
@@ -413,6 +415,13 @@ MAESTRO_NOTIFY_EMAIL=your@gmail.com
 
 Pipeline headless modda (-p flag ile) calistiginda su kurallar gecerlidir:
 
+**!!! KRITIK GUVENLIK KURALI — AGENT 3 KORUMASI !!!**
+Agent 3'u (executor.py --execute) ASLA dogrudan calistirma.
+Agent 3 SADECE watch daemon uzerinden tetiklenir:
+  watch daemon → execution_queue'da pending bulur → _run_agent3_from_queue() cagirir
+Bu kural hicbir kosulda ihlal edilemez. "BOS" sonucu hata DEGILDIR —
+kullanicinin henuz onay vermedigi anlamina gelir. Tekrar deneme YAPMA.
+
 1. Kullaniciya HICBIR SORU SORMA. Tum hesaplar icin otomatik calis.
 2. Agent 1 icin parallel_collector.py'yi subprocess olarak calistir.
 3. Agent 2 bittikten sonra watch moduna GECME — ayri bir Python daemon
@@ -441,6 +450,9 @@ Pipeline headless modda (-p flag ile) calistiginda su kurallar gecerlidir:
 14. Birden fazla marketplace icin Agent 2 calistirirken `python parallel_analyzer.py` kullan. Tek komut, tek kompakt ozet.
 15. Analiz periyodu 3 gundur
 16. Rakamlari okunakli formatta goster ($1,234.56)
+17. Agent 3 "BOS" veya "0 onaylanmis islem" donerse bu HATA DEGILDIR. Kullanici henuz
+    onay vermemis demektir. Problem Cozme Moduna GIRME, tekrar deneme YAPMA. Pipeline'i
+    "ONAY_BEKLIYOR" statusuyle sonlandir.
 
 ---
 

@@ -161,48 +161,24 @@ def start_pipeline(hesap_key, marketplace, force=False):
         except Exception:
             pass
 
-    # Otomatik watch modu — 5 dakikada bir execution_queue kontrol et (ulke bazli)
+    # ===== GUVENLIK KILIDI =====
+    # Agent 3'e gecis SADECE watch daemon (maestro watch) uzerinden yapilir.
+    # start_pipeline() Agent 2 bittikten sonra DURUR.
+    # Dashboard'dan onay geldiginde watch daemon execution_queue'yu algilayip
+    # _run_agent3_from_queue() cagirir.
     logger.info("=" * 60)
-    logger.info("  WATCH MODU AKTIF — %s — Dashboard'dan Agent3 komutu bekleniyor", account_label)
-    logger.info("  Her 5 dakikada bir execution_queue kontrol edilecek")
+    logger.info("  PIPELINE DURUYOR — Agent 2 tamamlandi, dashboard onayi bekleniyor")
+    logger.info("  Watch daemon (maestro watch) execution_queue'yu izliyor")
     logger.info("=" * 60)
 
-    watch_interval = 5 * 60  # 5 dakika
-    while True:
-        try:
-            # Sadece bu hesap/marketplace icin pending komutlari izle
-            results = poll_execution_queue(filter_hesap=hesap_key, filter_marketplace=marketplace)
-            if results:
-                for r in results:
-                    logger.info("  Queue sonucu: %s — %s", r.get("hesap"), r.get("status"))
+    _send_completion_email(state, session_id)
 
-                # Pipeline tamamlandi
-                state_manager.update_session_status(state, "completed")
-                logger.info("=" * 60)
-                logger.info("PIPELINE TAMAMLANDI — %s — Session: %s", account_label, session_id)
-                logger.info("=" * 60)
-
-                if sdb:
-                    try:
-                        sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "completed", "completed")
-                    except Exception:
-                        pass
-                _save_log("info", f"Pipeline tamamlandi: {hesap_key}/{marketplace}",
-                          "maestro", hesap_key, marketplace, session_id)
-
-                _send_completion_email(state, session_id)
-                state_manager.archive_session(state)
-
-                return {
-                    "durum": "TAMAMLANDI",
-                    "hesap": account_label,
-                    "session_id": session_id,
-                    "mesaj": f"Pipeline basariyla tamamlandi ({account_label}).",
-                }
-        except Exception as e:
-            logger.error("Watch dongusu hatasi: %s", e)
-
-        time.sleep(watch_interval)
+    return {
+        "durum": "ONAY_BEKLIYOR",
+        "hesap": account_label,
+        "session_id": session_id,
+        "mesaj": f"Agent 1+2 tamamlandi. Dashboard'dan onay bekleniyor ({account_label}).",
+    }
 
 
 def run_all_pipelines(force=False):
@@ -245,9 +221,10 @@ def run_all_pipelines(force=False):
     return {"pipelines": results, "basarili": basarili, "hatali": hatali}
 
 
-def resume_pipeline(hesap_key, marketplace):
+def resume_pipeline(hesap_key, marketplace, allow_agent3=False):
     """
     Hata sonrasi kaldigi yerden devam eder.
+    allow_agent3=True sadece watch daemon (_run_agent3_from_queue) tarafindan kullanilir.
     """
     config.init_account(hesap_key, marketplace)
     account_label = config.CURRENT_ACCOUNT["label"]
@@ -278,6 +255,15 @@ def resume_pipeline(hesap_key, marketplace):
         last_step = "agent2"
 
     if last_step == "agent2":
+        if not allow_agent3:
+            # Guvenlik kilidi: Agent 3'e gecis sadece watch daemon uzerinden yapilir
+            logger.info("Agent 2 tamamlanmis, allow_agent3=False — pipeline duruyor.")
+            return {
+                "durum": "ONAY_BEKLIYOR",
+                "hesap": account_label,
+                "session_id": session_id,
+                "mesaj": f"Agent 1+2 tamamlandi. Dashboard'dan onay bekleniyor ({account_label}).",
+            }
         current_status = session.get("status", "")
         if current_status == "waiting_approval":
             approval_result = _wait_for_approval(state, session_id)
@@ -290,6 +276,14 @@ def resume_pipeline(hesap_key, marketplace):
                 return _build_waiting_result(state, session_id, account_label)
 
     if session["agent3"]["status"] != "completed":
+        if not allow_agent3:
+            logger.info("Agent 3 henuz tamamlanmamis ama allow_agent3=False — pipeline duruyor.")
+            return {
+                "durum": "ONAY_BEKLIYOR",
+                "hesap": account_label,
+                "session_id": session_id,
+                "mesaj": f"Agent 3 icin onay gerekli. Dashboard'dan onay bekleniyor ({account_label}).",
+            }
         success = _run_agent3(state, session_id, hesap_key, marketplace)
         if not success:
             return _build_error_result(state, session_id, "Agent 3", account_label)

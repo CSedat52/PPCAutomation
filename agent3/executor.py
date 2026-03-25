@@ -999,8 +999,8 @@ def build_targeting_lookup(today=None):
                 agid = str(e.get("adGroupId", ""))
                 entity_info = {"entity_id": eid, "entity_type": "KEYWORD", "ad_type": ad_type,
                                "campaign_id": cid, "ad_group_id": agid, "state": e.get("state", "enabled"), "bid": e.get("bid", 0)}
-                lookup[(cid, text.lower(), mt.upper())] = entity_info
-                key2 = (cid, text.lower(), "TARGETING")
+                lookup[(cid, (text or "").lower(), (mt or "").upper())] = entity_info
+                key2 = (cid, (text or "").lower(), "TARGETING")
                 if key2 not in lookup:
                     lookup[key2] = entity_info
 
@@ -1033,7 +1033,7 @@ def build_targeting_lookup(today=None):
                             lookup[(cid, rapor_adi, "TARGETING")] = entity_info
                         lookup[(cid, agid, rapor_adi)] = entity_info
                 elif isinstance(expression, str) and expression:
-                    lookup[(cid, expression.lower(), "TARGETING")] = entity_info
+                    lookup[(cid, (expression or "").lower(), "TARGETING")] = entity_info
 
     # ---- SB THEME ENTITY'LER ----
     THEME_TYPE_TO_REPORT = {
@@ -1050,7 +1050,7 @@ def build_targeting_lookup(today=None):
             cid = str(t.get("campaignId", ""))
             agid = str(t.get("adGroupId", ""))
             theme_type = t.get("themeType", "")
-            report_text = THEME_TYPE_TO_REPORT.get(theme_type, theme_type.lower())
+            report_text = THEME_TYPE_TO_REPORT.get(theme_type, (theme_type or "").lower())
 
             entity_info = {
                 "entity_id": tid,
@@ -1087,6 +1087,8 @@ def _extract_value_from_targeting(targeting_text):
       'close-match'                 → 'close-match'
       'lap desk'                    → 'lap desk'
     """
+    if targeting_text is None:
+        return ""
     text = str(targeting_text).strip()
     # Tirnak icindeki degeri cikar: asin="VALUE" veya asin-expanded="VALUE"
     m = re.search(r'"([^"]+)"', text)
@@ -1148,7 +1150,7 @@ def resolve_targeting_entity(action, campaign_id, targeting_lookup, campaign_loo
                     return targeting_lookup[key5], None
 
     # ---- BULUNAMADI: Sebebi tespit et ----
-    if "asin-expanded" in raw_hedefleme.lower():
+    if "asin-expanded" in (raw_hedefleme or "").lower():
         return None, (
             f"Amazon auto-expanded hedefleme (bid ayarlanamaz): {raw_hedefleme} "
             f"(kampanya: {campaign_id}). Bu ASIN icin Amazon entity olusturmamis, "
@@ -2117,7 +2119,7 @@ def process_verification_results(verification_report, actual_data):
 
     for task in report["gorevler"]["negatif_kontrolleri"]:
         campaign_id = task["campaign_id"]
-        hedefleme = task["hedefleme"].lower()
+        hedefleme = (task.get("hedefleme") or "").lower()
         tip = task["tip"]
 
         sonuc = {
@@ -2128,7 +2130,7 @@ def process_verification_results(verification_report, actual_data):
         }
 
         if tip == "NEGATIF_KEYWORD":
-            neg_list = [kw.lower() for kw in neg_keywords.get(campaign_id, [])]
+            neg_list = [(kw or "").lower() for kw in neg_keywords.get(campaign_id, [])]
             if hedefleme in neg_list:
                 sonuc["durum"] = "DOGRULANDI"
                 report["ozet"]["dogrulanan"] += 1
@@ -2143,7 +2145,7 @@ def process_verification_results(verification_report, actual_data):
                     "sebep": "Negatif keyword eklenmemis",
                 })
         elif tip == "NEGATIF_ASIN":
-            neg_list = [a.lower() for a in neg_targets.get(campaign_id, [])]
+            neg_list = [(a or "").lower() for a in neg_targets.get(campaign_id, [])]
             if hedefleme in neg_list:
                 sonuc["durum"] = "DOGRULANDI"
                 report["ozet"]["dogrulanan"] += 1
@@ -3400,11 +3402,19 @@ def _sync_agent3_to_supabase(hesap_key, marketplace, today,
 
     try:
         mode = execution_report.get("mod", "UYGULAMA")
-        plan_id = db.insert_execution_plan(
-            hesap_key, marketplace, today, mode,
-            execution_report.get("ozet", {}),
-            session_id=MAESTRO_SESSION_ID
-        )
+        # Tablo varlik kontrolu — yoksa sessizce atla
+        try:
+            plan_id = db.insert_execution_plan(
+                hesap_key, marketplace, today, mode,
+                execution_report.get("ozet", {}),
+                session_id=MAESTRO_SESSION_ID
+            )
+        except Exception as table_err:
+            if "execution_plans" in str(table_err) and ("does not exist" in str(table_err) or "UndefinedTable" in str(table_err)):
+                logger.warning("execution_plans tablosu Supabase'de yok — sync atlaniyor. "
+                               "Tablo olusturulunca otomatik calisacak.")
+                return
+            raise  # Baska hata ise yukari ilet
 
         items = []
         for op in bid_ops:
