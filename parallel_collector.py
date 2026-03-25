@@ -424,11 +424,85 @@ def build_report_payload(ad_product, report_type, group_by, columns, days_back,
     }
 
 
+def _check_report_exists_in_supabase(hesap_key, marketplace, report_name, today):
+    """
+    Supabase'de bu rapor bugunden veri var mi kontrol eder.
+    True donerse rapor ATLANIR (zaten cekilmis).
+    False donerse rapor cekilir.
+    Hata olursa False doner (guvenli taraf — cek).
+    """
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+
+        # targeting raporlari → targeting_reports tablosu (collection_date kullanir)
+        if "targeting" in report_name and "search" not in report_name:
+            ad_type = ""
+            if report_name.startswith("sp"):
+                ad_type = "SP"
+            elif report_name.startswith("sb"):
+                ad_type = "SB"
+            elif report_name.startswith("sd"):
+                ad_type = "SD"
+            if ad_type:
+                rows = db._fetch_all(
+                    """SELECT 1 FROM targeting_reports
+                       WHERE hesap_key = %s AND marketplace = %s
+                         AND collection_date = %s AND ad_type = %s
+                       LIMIT 1""",
+                    (hesap_key, marketplace, today, ad_type)
+                )
+                return bool(rows)
+
+        # search term raporlari → search_term_reports tablosu (collection_date kullanir)
+        elif "search_term" in report_name:
+            ad_type = ""
+            if report_name.startswith("sp"):
+                ad_type = "SP"
+            elif report_name.startswith("sb"):
+                ad_type = "SB"
+            if ad_type:
+                rows = db._fetch_all(
+                    """SELECT 1 FROM search_term_reports
+                       WHERE hesap_key = %s AND marketplace = %s
+                         AND collection_date = %s AND ad_type = %s
+                       LIMIT 1""",
+                    (hesap_key, marketplace, today, ad_type)
+                )
+                return bool(rows)
+
+        # campaign raporlari → kpi_daily tablosu (report_date kullanir)
+        elif "campaign" in report_name:
+            ct_prefix = ""
+            if report_name.startswith("sp"):
+                ct_prefix = "SP"
+            elif report_name.startswith("sb"):
+                ct_prefix = "SB"
+            elif report_name.startswith("sd"):
+                ct_prefix = "SD"
+            if ct_prefix:
+                rows = db._fetch_all(
+                    """SELECT 1 FROM kpi_daily
+                       WHERE hesap_key = %s AND marketplace = %s
+                         AND report_date = %s
+                         AND campaign_type LIKE %s
+                       LIMIT 1""",
+                    (hesap_key, marketplace, today, f"{ct_prefix}%")
+                )
+                return bool(rows)
+
+        return False
+    except Exception as e:
+        logger.warning("[%s/%s] Supabase rapor kontrol hatasi (%s): %s — rapor cekilecek",
+                       hesap_key, marketplace, report_name, e)
+        return False
+
+
 # ============================================================================
 # TEK MARKETPLACE VERI TOPLAMA
 # ============================================================================
 
-async def collect_marketplace(client, data_dir, label):
+async def collect_marketplace(client, data_dir, label, force=False):
     """Tek bir marketplace icin tum verileri toplar. Agent 1 ile ayni mantik."""
     today = datetime.utcnow().strftime("%Y-%m-%d")
     R = {"basarili": 0, "basarisiz": 0, "atlanan": 0, "hatalar": []}
@@ -675,6 +749,13 @@ async def collect_marketplace(client, data_dir, label):
                 skipped.append(key)
                 continue
 
+            # Supabase kontrolu: bu rapor bugunden zaten cekilmis mi?
+            if not force and _check_report_exists_in_supabase(_hk, _mp, name, today):
+                logger.info("[%s] SUPABASE-SKIP: %s zaten mevcut, atlaniyor", label, key)
+                R["atlanan"] += 1
+                skipped.append(key)
+                continue
+
             payload = build_report_payload(ap, rt, gb, cols, days, tunit)
             fire_coros.append(client.create_report_request(payload))
             fire_keys.append((key, (name, ap, rt, gb, cols, days, tunit)))
@@ -739,54 +820,6 @@ async def collect_marketplace(client, data_dir, label):
                 failed_tasks.append(task_tuple)
             elif status == "BOS":
                 empty_tasks.append(task_tuple)
-
-    # ----- RETRY: Bos raporlar 1 kez, hatali raporlar 3 kez -----
-    RETRY_DELAYS = [120, 240, 300]
-
-    if empty_tasks:
-        logger.info("[%s] BOS RETRY: %d rapor 1 kez tekrar deneniyor...", label, len(empty_tasks))
-        await asyncio.sleep(120)
-        for name, ap, rt, gb, cols, days, tunit in empty_tasks:
-            key = f"{name}_{days}d"
-            fname = f"{today}_{key}.json"
-            old_file = data_dir / fname
-            if old_file.exists():
-                old_file.unlink()
-            R["basarili"] -= 1  # onceki bos kaydi duzelt
-            _, status = await collect_report(name, ap, rt, gb, cols, days, tunit)
-            if status == "DOLU":
-                logger.info("[%s] BOS RETRY BASARILI: %s", label, key)
-            else:
-                logger.info("[%s] BOS RETRY: %s yine bos — gecerli kabul", label, key)
-
-    if failed_tasks:
-        logger.info("[%s] HATA RETRY: %d rapor tekrar deneniyor (max 3)...", label, len(failed_tasks))
-        for name, ap, rt, gb, cols, days, tunit in failed_tasks:
-            key = f"{name}_{days}d"
-            resolved = False
-            for attempt in range(len(RETRY_DELAYS)):
-                delay = RETRY_DELAYS[attempt]
-                logger.info("[%s] RETRY %d/3: %s — %ds bekleniyor...", label, attempt+1, key, delay)
-                await asyncio.sleep(delay)
-
-                fname = f"{today}_{key}.json"
-                old_file = data_dir / fname
-                if old_file.exists():
-                    old_file.unlink()
-
-                R["basarisiz"] -= 1
-                R["hatalar"] = [h for h in R["hatalar"] if key not in h]
-
-                _, status = await collect_report(name, ap, rt, gb, cols, days, tunit)
-                if status in ("DOLU", "BOS"):
-                    logger.info("[%s] RETRY %d/3 BASARILI: %s", label, attempt+1, key)
-                    resolved = True
-                    break
-                else:
-                    logger.warning("[%s] RETRY %d/3 BASARISIZ: %s", label, attempt+1, key)
-
-            if not resolved:
-                logger.error("[%s] RETRY TUKENDI: %s", label, key)
 
     toplam = R["basarili"] + R["basarisiz"] + R["atlanan"]
     logger.info("[%s] TAMAMLANDI — %d/%d basarili, %d hata, %d cache",
@@ -897,6 +930,10 @@ async def collect_marketplace(client, data_dir, label):
               "agent1", _hk, _mp, _session_id)
 
     await client.close()
+    R["hesap_key"] = _hk
+    R["marketplace"] = _mp
+    R["failed_tasks"] = failed_tasks
+    R["empty_tasks"] = empty_tasks
     return R
 
 
@@ -904,7 +941,7 @@ async def collect_marketplace(client, data_dir, label):
 # HESAP BAZLI PARALEL CALISTIRMA
 # ============================================================================
 
-async def run_account(hesap_key, hesap, lwa, mp_list):
+async def run_account(hesap_key, hesap, lwa, mp_list, force=False):
     """Bir hesabin TUM marketplace'lerini PARALEL calistirir (batch YOK)."""
     results = {}
     coros = []
@@ -925,7 +962,7 @@ async def run_account(hesap_key, hesap, lwa, mp_list):
         client = AmazonAdsClient(config)
         data_dir = get_data_dir(hesap_key, mp_code)
         label = f"{hesap_key}/{mp_code}"
-        coros.append(collect_marketplace(client, data_dir, label))
+        coros.append(collect_marketplace(client, data_dir, label, force=force))
         mp_codes.append(mp_code)
 
     all_results = await asyncio.gather(*coros, return_exceptions=True)
@@ -940,7 +977,7 @@ async def run_account(hesap_key, hesap, lwa, mp_list):
     return results
 
 
-async def run_all(targets=None):
+async def run_all(targets=None, force=False):
     """
     Hesaplari paralel calistirir.
 
@@ -948,6 +985,7 @@ async def run_all(targets=None):
         targets: None → tum aktif hesaplar
                  ["vigowood_na"] → tek hesabin tum marketplace'leri
                  ["vigowood_na:US", "vigowood_eu:DE", "vigowood_eu:UK"] → belirli kombinasyonlar
+        force: True ise Supabase ayni-gun kontrolu atlanir, tum raporlar yeniden cekilir
     """
     accounts = load_accounts()
     lwa = accounts["lwa_app"]
@@ -1011,7 +1049,7 @@ async def run_all(targets=None):
     coros = []
     hesap_keys = []
     for hesap_key, (hesap, mp_list) in account_tasks.items():
-        coros.append(run_account(hesap_key, hesap, lwa, mp_list))
+        coros.append(run_account(hesap_key, hesap, lwa, mp_list, force=force))
         hesap_keys.append(hesap_key)
 
     all_results = await asyncio.gather(*coros, return_exceptions=True)
@@ -1046,6 +1084,124 @@ async def run_all(targets=None):
     logger.info("  Toplam: %d basarili, %d hata", toplam_basarili, toplam_hata)
     logger.info("=" * 60)
 
+    # === TOPLU RETRY ===
+    # Tum marketplace'lerden basarisiz ve bos raporlari topla
+    all_failed = []
+    all_empty = []
+    for hesap_key, result in zip(hesap_keys, all_results):
+        if isinstance(result, Exception):
+            continue
+        for mp, r in result.items():
+            if not isinstance(r, dict):
+                continue
+            hk = r.get("hesap_key", hesap_key)
+            mplace = r.get("marketplace", mp)
+            for task in r.get("failed_tasks", []):
+                all_failed.append((hk, mplace, task))
+            for task in r.get("empty_tasks", []):
+                all_empty.append((hk, mplace, task))
+
+    if all_failed or all_empty:
+        logger.info("=" * 60)
+        logger.info("  TOPLU RETRY: %d basarisiz + %d bos rapor", len(all_failed), len(all_empty))
+        logger.info("=" * 60)
+
+        # API client cache — ayni hesap+mp icin tek client
+        _retry_clients = {}
+
+        async def _get_retry_client(hk, mplace):
+            cache_key = f"{hk}_{mplace}"
+            if cache_key not in _retry_clients:
+                hesap = accounts["hesaplar"][hk]
+                mp_config = hesap["marketplaces"][mplace]
+                cfg = {
+                    "client_id": lwa["client_id"],
+                    "client_secret": lwa["client_secret"],
+                    "refresh_token": hesap["refresh_token"],
+                    "marketplace": mplace,
+                    "profile_id": mp_config["profile_id"],
+                    "account_id": hesap["account_id"],
+                    "api_endpoint": hesap["api_endpoint"],
+                    "token_endpoint": hesap["token_endpoint"],
+                }
+                _retry_clients[cache_key] = AmazonAdsClient(cfg)
+            return _retry_clients[cache_key]
+
+        async def _retry_single_report(hk, mplace, name, ap, rt, gb, cols, days, tunit):
+            """Tek bir raporu retry et. Basarili ise True doner."""
+            cl = await _get_retry_client(hk, mplace)
+            dd = get_data_dir(hk, mplace)
+            today_str = datetime.utcnow().strftime("%Y-%m-%d")
+            key = f"{name}_{days}d"
+            fname = f"{today_str}_{key}.json"
+            old_file = dd / fname
+            if old_file.exists():
+                old_file.unlink()
+            try:
+                payload = build_report_payload(ap, rt, gb, cols, days, tunit)
+                rows = await cl.download_report(payload)
+                if is_error(rows):
+                    return False
+                save_json(fname, rows, dd)
+                return True
+            except Exception:
+                return False
+
+        # Bos raporlari 1 kez retry et (120s bekleme)
+        if all_empty:
+            logger.info("[TOPLU-RETRY] %d bos rapor 1 kez tekrar deneniyor (120s bekleme)...", len(all_empty))
+            await asyncio.sleep(120)
+            for hk, mplace, (name, ap, rt, gb, cols, days, tunit) in all_empty:
+                key = f"{name}_{days}d"
+                ok = await _retry_single_report(hk, mplace, name, ap, rt, gb, cols, days, tunit)
+                if ok:
+                    logger.info("[TOPLU-RETRY] BOS BASARILI: %s/%s — %s", hk, mplace, key)
+                    toplam_basarili += 1
+                else:
+                    logger.info("[TOPLU-RETRY] BOS: %s/%s — %s yine bos/hata — gecerli kabul", hk, mplace, key)
+
+        # Basarisiz raporlari max 3 kez retry et (artan bekleme)
+        if all_failed:
+            RETRY_DELAYS = [120, 240, 300]
+            still_failed = list(all_failed)
+
+            for attempt, delay in enumerate(RETRY_DELAYS):
+                if not still_failed:
+                    break
+                logger.info("[TOPLU-RETRY] Deneme %d/%d: %d rapor, %ds bekleniyor...",
+                            attempt + 1, len(RETRY_DELAYS), len(still_failed), delay)
+                await asyncio.sleep(delay)
+
+                next_round = []
+                for hk, mplace, (name, ap, rt, gb, cols, days, tunit) in still_failed:
+                    key = f"{name}_{days}d"
+                    ok = await _retry_single_report(hk, mplace, name, ap, rt, gb, cols, days, tunit)
+                    if ok:
+                        logger.info("[TOPLU-RETRY] Deneme %d BASARILI: %s/%s — %s", attempt + 1, hk, mplace, key)
+                        toplam_basarili += 1
+                        toplam_hata -= 1
+                    else:
+                        logger.warning("[TOPLU-RETRY] Deneme %d BASARISIZ: %s/%s — %s", attempt + 1, hk, mplace, key)
+                        next_round.append((hk, mplace, (name, ap, rt, gb, cols, days, tunit)))
+
+                still_failed = next_round
+
+            if still_failed:
+                logger.error("[TOPLU-RETRY] TUKENDI: %d rapor hala basarisiz", len(still_failed))
+                for hk, mplace, (name, _, _, _, _, days, _) in still_failed:
+                    logger.error("  — %s/%s: %s_%dd", hk, mplace, name, days)
+
+        # Retry client'larini kapat
+        for cl in _retry_clients.values():
+            await cl.close()
+
+        # Retry sonrasi guncel ozet
+        logger.info("=" * 60)
+        logger.info("  TOPLU RETRY SONRASI: %d basarili, %d hata", toplam_basarili, toplam_hata)
+        logger.info("=" * 60)
+    else:
+        logger.info("Toplu retry gerekmiyor — tum raporlar basarili")
+
     # Dashboard: Tum marketplace'ler bitti — agent1 durumunu guncelle
     _agent1_final = "completed" if toplam_hata == 0 else "failed" if toplam_basarili == 0 else "completed"
     _dashboard_status("agent1", _agent1_final, {
@@ -1065,5 +1221,9 @@ if __name__ == "__main__":
     #   python parallel_collector.py                          → tum hesaplar
     #   python parallel_collector.py vigowood_eu              → tek hesabin tum mp'leri
     #   python parallel_collector.py vigowood_na:US vigowood_eu:DE vigowood_eu:UK  → belirli kombinasyonlar
+    #   python parallel_collector.py --force vigowood_na:US   → Supabase ayni-gun kontrolunu atla
+    force_mode = "--force" in sys.argv
+    if force_mode:
+        sys.argv.remove("--force")
     targets = sys.argv[1:] if len(sys.argv) > 1 else None
-    asyncio.run(run_all(targets))
+    asyncio.run(run_all(targets, force=force_mode))
