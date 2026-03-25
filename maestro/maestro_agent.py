@@ -140,15 +140,29 @@ def start_pipeline(hesap_key, marketplace, force=False):
     _save_log("info", f"Pipeline basladi: {hesap_key}/{marketplace}",
               "maestro", hesap_key, marketplace, session_id)
 
-    # 3. Agent 1 calistir
-    success = _run_agent1(state, session_id, hesap_key, marketplace)
-    if not success:
-        return _build_error_result(state, session_id, "Agent 1", account_label)
+    try:
+        # 3. Agent 1 calistir
+        success = _run_agent1(state, session_id, hesap_key, marketplace)
+        if not success:
+            return _build_error_result(state, session_id, "Agent 1", account_label)
 
-    # 4. Agent 2 calistir
-    success = _run_agent2(state, session_id, hesap_key, marketplace)
-    if not success:
-        return _build_error_result(state, session_id, "Agent 2", account_label)
+        # 4. Agent 2 calistir
+        success = _run_agent2(state, session_id, hesap_key, marketplace)
+        if not success:
+            return _build_error_result(state, session_id, "Agent 2", account_label)
+
+    except Exception as exc:
+        # Beklenmeyen hata — pipeline'i "failed" olarak isaretle
+        logger.error("start_pipeline beklenmeyen hata: %s", exc, exc_info=True)
+        save_error_log("InternalError", f"Pipeline crash: {exc}", session_id=session_id,
+                       adim="start_pipeline", traceback_str=str(exc))
+        if sdb:
+            try:
+                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "pipeline_crash", "failed",
+                                        error_msg=str(exc)[:500])
+            except Exception:
+                pass
+        return _build_error_result(state, session_id, "Pipeline", account_label)
 
     # 5. Agent 2 tamamlandi — Dashboard onay bekleme + execution_queue watch
     logger.info("Agent 2 tamamlandi. Dashboard'dan onay bekleniyor...")
@@ -749,8 +763,24 @@ def _format_agent2_summary(summary):
 
 
 def _build_error_result(state, session_id, agent_name, account_label=""):
-    """Hata durumu icin sonuc dict'i olusturur."""
+    """Hata durumu icin sonuc dict'i olusturur + Supabase'de pipeline'i 'failed' olarak isaretler."""
     session = state.get("current_session", {})
+
+    # Pipeline durumunu Supabase'de "failed" olarak guncelle
+    # (_run_agentX icinde agent adimi zaten "failed" yazilmis olabilir
+    #  ama pipeline seviyesinde de "failed" garantilemek icin tekrar yaziyoruz)
+    sdb = _get_sdb()
+    if sdb and session_id:
+        try:
+            current = config.CURRENT_ACCOUNT or {}
+            hk = current.get("hesap_key", "")
+            mp = current.get("marketplace", "")
+            error_msg = f"{agent_name} basarisiz oldu"
+            sdb.upsert_pipeline_run(session_id, hk, mp, agent_name.lower().replace(" ", ""), "failed",
+                                    error_msg=error_msg)
+        except Exception:
+            pass
+
     return {
         "durum": "HATA",
         "hesap": account_label,
