@@ -47,6 +47,7 @@ Her hesap+marketplace kombinasyonu kendi izole klasorune sahiptir:
 amazon-ppc-automation/
 +-- .env                                 # Maestro e-posta ayarlari
 +-- CLAUDE.md                            # Bu dosya
++-- pipeline_runner.py                   # Saf Python pipeline ($0 maliyet — cron bunu cagirmali)
 +-- log_utils.py                         # Ortak hata taksonomisi ve log yardimci fonksiyonlari
 +-- parallel_collector.py                # Paralel veri toplayici (Agent 1 paralel)
 +-- parallel_analyzer.py                 # Paralel analizci (Agent 2 paralel)
@@ -430,6 +431,34 @@ kullanicinin henuz onay vermedigi anlamina gelir. Tekrar deneme YAPMA.
 5. Dashboard'dan onay geldiginde watch daemon Claude Code'u tekrar cagirir
    ve Agent 3+4 pipeline'i baslar.
 6. Agent 3+4 pipeline'i da bitince CIK. Watch moduna gecme.
+
+---
+
+## Maliyet Optimizasyonu
+
+Pipeline maliyeti:
+- Agent 1+2: $0 (saf Python, pipeline_runner.py)
+- Agent 3+4: $0.50-1.00 (Claude Code, watch daemon uzerinden)
+- Toplam: ~$0.50-1.00 / pipeline calismasi
+
+Cron `pipeline_runner.py`'yi cagiriyor, Claude Code'u DEGIL.
+Claude Code SADECE watch daemon uzerinden Agent 3+4 icin cagirilir.
+
+### pipeline_runner.py Akisi
+1. `parallel_collector.py` (Agent 1) → subprocess ($0)
+2. `parallel_analyzer.py` (Agent 2) → subprocess ($0)
+3. Supabase'den eksik rapor kontrolu
+4. Eksik varsa → `parallel_collector.py`'yi sadece eksik marketplace'ler icin tekrar cagir
+5. Durum raporu + e-posta
+6. CIK — Agent 3+4 icin watch daemon bekler
+
+### VPS Cron
+```
+0 2 */3 * * cd /home/ppc/amazon-ppc-automation && /usr/bin/python3 pipeline_runner.py >> /home/ppc/amazon-ppc-automation/maestro/logs/pipeline_runner.log 2>&1
+```
+
+ANTHROPIC_API_KEY cron'da GEREKMIYOR — pipeline_runner.py Claude Code cagirmaz.
+API key sadece watch daemon (systemd service) icin gerekli.
 
 ---
 
