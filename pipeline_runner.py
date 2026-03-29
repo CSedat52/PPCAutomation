@@ -98,19 +98,51 @@ def _build_status_report(collect_ok, analyze_ok, session_id, targets):
             pipelines = [p for p in pipelines
                          if (p["hesap_key"], p["marketplace"]) in target_set]
 
-        beklenen = [
-            ("sp_targeting", "targeting_reports", "SP"),
-            ("sp_search_term", "search_term_reports", "SP"),
-            ("sb_targeting", "targeting_reports", "SB"),
-            ("sb_search_term", "search_term_reports", "SB"),
-            ("sd_targeting", "targeting_reports", "SD"),
-        ]
+        def _count_campaigns(data_dir, prefix):
+            """Entity dosyasindan kampanya sayisini don. -1 = dosya yok (guvenli tarafta kal)."""
+            fpath = data_dir / f"{PIPELINE_DATE}_{prefix}.json"
+            if not fpath.exists():
+                from datetime import timedelta as _td
+                dun = (datetime.strptime(PIPELINE_DATE, "%Y-%m-%d") - _td(days=1)).strftime("%Y-%m-%d")
+                fpath = data_dir / f"{dun}_{prefix}.json"
+            if not fpath.exists():
+                return -1
+            try:
+                with open(fpath, "r") as f:
+                    data = json.load(f)
+                return len(data) if isinstance(data, list) else 0
+            except Exception:
+                return -1
 
         for p in pipelines:
             hk = p["hesap_key"]
             mp = p["marketplace"]
 
-            for rapor_adi, tablo, ad_type in beklenen:
+            # Smart-skip: entity dosyalarindan kampanya sayilarini kontrol et
+            data_dir = BASE_DIR / "data" / f"{hk}_{mp}"
+            sp_count = _count_campaigns(data_dir, "sp_campaigns")
+            sb_count = _count_campaigns(data_dir, "sb_campaigns")
+            sd_count = _count_campaigns(data_dir, "sd_campaigns")
+
+            beklenen_mp = []
+            if sp_count != 0:  # -1 (dosya yok) durumunda da bekle (guvenli taraf)
+                beklenen_mp.append(("sp_targeting", "targeting_reports", "SP"))
+                beklenen_mp.append(("sp_search_term", "search_term_reports", "SP"))
+            else:
+                logger.info("[%s/%s] SP kampanya=0 → SP raporlari smart-skip", hk, mp)
+
+            if sb_count != 0:
+                beklenen_mp.append(("sb_targeting", "targeting_reports", "SB"))
+                beklenen_mp.append(("sb_search_term", "search_term_reports", "SB"))
+            else:
+                logger.info("[%s/%s] SB kampanya=0 → SB raporlari smart-skip", hk, mp)
+
+            if sd_count != 0:
+                beklenen_mp.append(("sd_targeting", "targeting_reports", "SD"))
+            else:
+                logger.info("[%s/%s] SD kampanya=0 → SD raporlari smart-skip", hk, mp)
+
+            for rapor_adi, tablo, ad_type in beklenen_mp:
                 date_col = "collection_date"
                 rows = db._fetch_all(
                     f"SELECT 1 FROM {tablo} WHERE hesap_key = %s AND marketplace = %s "

@@ -609,6 +609,13 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
                                   retry_handler.get_error_suggestion(error_type))
         return False
 
+    # Execution basarili — pipeline_runs guncelle
+    if sdb:
+        try:
+            sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", "completed")
+        except Exception:
+            pass
+
     # Adim 3: 5 dk bekle + verify
     logger.info("Agent 3 — Adim 3: 5 dakika bekleniyor (dogrulama icin)...")
     time.sleep(300)
@@ -1013,6 +1020,15 @@ def _run_agent3_from_queue(hesap_key, marketplace):
     _save_log("info", f"Dashboard onayi alindi, Maestro baslatiliyor: {account_label}",
               "maestro", hesap_key, marketplace)
 
+    # Pipeline_runs'a Agent 3 basliyor yazisi — dashboard hemen gorsun
+    queue_session_id = f"queue_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{hesap_key}_{marketplace}"
+    sdb = _get_sdb()
+    if sdb:
+        try:
+            sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace, "agent3_execute", "running")
+        except Exception:
+            pass
+
     try:
         env_vars = {**os.environ,
                     "HESAP_KEY": hesap_key,
@@ -1034,11 +1050,25 @@ def _run_agent3_from_queue(hesap_key, marketplace):
             logger.error("Maestro hatasi: %s — %s", account_label, result.stderr[:300])
             _save_log("error", f"Maestro hatasi: {result.stderr[:200]}",
                       "maestro", hesap_key, marketplace)
+            # Hata durumunda pipeline_runs guncelle
+            if sdb:
+                try:
+                    sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace,
+                                             "agent3_execute", "failed",
+                                             error_msg=result.stderr[:500])
+                except Exception:
+                    pass
         return success
     except subprocess.TimeoutExpired:
         logger.error("Maestro timeout (1 saat): %s", account_label)
         _save_log("error", f"Maestro timeout: {account_label}",
                   "maestro", hesap_key, marketplace)
+        if sdb:
+            try:
+                sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace,
+                                         "agent3_execute", "failed", error_msg="Maestro timeout (1 saat)")
+            except Exception:
+                pass
         return False
     except FileNotFoundError:
         logger.error("claude komutu bulunamadi. Claude Code kurulu mu?")
@@ -1049,6 +1079,12 @@ def _run_agent3_from_queue(hesap_key, marketplace):
         logger.error("Maestro beklenmeyen hata: %s — %s", account_label, e)
         _save_log("error", f"Maestro hatasi: {str(e)[:200]}",
                   "maestro", hesap_key, marketplace)
+        if sdb:
+            try:
+                sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace,
+                                         "agent3_execute", "failed", error_msg=str(e)[:500])
+            except Exception:
+                pass
         return False
 
 
