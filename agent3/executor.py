@@ -80,8 +80,8 @@ def _dashboard_status(agent_name, status, health_detail=None):
         from supabase.db_client import SupabaseClient
         db = SupabaseClient()
         db.update_agent_status_detail(agent_name, status, health_detail)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Supabase yazim hatasi: %s", e)
 
 
 def _dashboard_pipeline(session_id, hesap_key, marketplace, step, status, error_msg=None):
@@ -92,8 +92,8 @@ def _dashboard_pipeline(session_id, hesap_key, marketplace, step, status, error_
         from supabase.db_client import SupabaseClient
         db = SupabaseClient()
         db.upsert_pipeline_run(session_id, hesap_key, marketplace, step, status, error_msg)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Supabase yazim hatasi: %s", e)
 
 # Bu degiskenler init_paths() ile set edilir
 DATA_DIR = None
@@ -955,8 +955,8 @@ def build_targeting_lookup(today=None):
                 if isinstance(expr, str):
                     try:
                         expr = json.loads(expr)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("Supabase yazim hatasi: %s", e)
 
                 if isinstance(expr, list) and expr:
                     first = expr[0] if isinstance(expr[0], dict) else {}
@@ -1201,8 +1201,8 @@ def find_advertised_asin(campaign_id, ad_group_id, today=None):
                         sku = ad.get("sku", "")
                         if asin:
                             return _format_asin(asin), sku, "Ad group eslesmedi, kampanyadaki ilk ASIN kullanildi"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
 
     # Yontem 2: JSON product_ads fallback
     fpath = DATA_DIR / f"{today}_sp_product_ads.json"
@@ -3502,8 +3502,8 @@ def _sync_agent3_to_supabase(hesap_key, marketplace, today,
                 "hata_mesaji": f"Supabase sync hatasi: {e}"[:500],
                 "adim": "supabase_sync",
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
 
 
 # ============================================================================
@@ -3518,8 +3518,8 @@ if __name__ == "__main__":
         try:
             sys.stdout.reconfigure(encoding='utf-8')
             sys.stderr.reconfigure(encoding='utf-8')
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
 
     # Kullanim: python agent3/executor.py <hesap_key> <marketplace> [--execute] [--verify] [--collect-verify] [--date YYYY-MM-DD]
     if len(sys.argv) < 3:

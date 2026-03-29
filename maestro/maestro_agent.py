@@ -95,7 +95,8 @@ def _rotate_old_logs():
             if (now - mtime).days > 30:
                 f.unlink()
                 logger.info("Eski log silindi: %s", f.name)
-        except Exception:
+        except Exception as e:
+            logger.warning("Log rotasyon hatasi: %s", e)
             continue
 
 
@@ -135,8 +136,8 @@ def start_pipeline(hesap_key, marketplace, force=False):
     if sdb:
         try:
             sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "starting", "running")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
     _save_log("info", f"Pipeline basladi: {hesap_key}/{marketplace}",
               "maestro", hesap_key, marketplace, session_id)
 
@@ -160,8 +161,8 @@ def start_pipeline(hesap_key, marketplace, force=False):
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "pipeline_crash", "failed",
                                         error_msg=str(exc)[:500])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Supabase yazim hatasi: %s", e)
         return _build_error_result(state, session_id, "Pipeline", account_label)
 
     # 5. Agent 2 tamamlandi — Dashboard onay bekleme + execution_queue watch
@@ -172,8 +173,8 @@ def start_pipeline(hesap_key, marketplace, force=False):
     if sdb:
         try:
             sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "waiting_approval", "running")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
 
     # ===== GUVENLIK KILIDI =====
     # Agent 3'e gecis SADECE watch daemon (maestro watch) uzerinden yapilir.
@@ -329,8 +330,8 @@ def _run_agent1(state, session_id, hesap_key, marketplace):
     if sdb:
         try:
             sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "running")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
 
     today = datetime.utcnow().strftime(config.DATE_FORMAT)
     data_dir = Path(config.ACCOUNT_DATA_DIR)
@@ -345,8 +346,8 @@ def _run_agent1(state, session_id, hesap_key, marketplace):
         if sdb:
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "completed")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Supabase yazim hatasi: %s", e)
         return True
 
     # parallel_collector.py'yi subprocess olarak calistir
@@ -379,8 +380,8 @@ def _run_agent1(state, session_id, hesap_key, marketplace):
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "completed")
                 sdb.update_agent_status_detail("agent1", "completed", {"tasks": len(files)})
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Supabase yazim hatasi: %s", e)
         return True
     else:
         error_msg = error_info.get("error_message", "Bilinmeyen hata") if error_info else "Bilinmeyen hata"
@@ -393,8 +394,8 @@ def _run_agent1(state, session_id, hesap_key, marketplace):
         if sdb:
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "failed", error_msg=error_msg)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Supabase yazim hatasi: %s", e)
         email_handler.send_error(session_id, "Agent 1", error_msg,
             suggestion=retry_handler.get_error_suggestion(error_type))
         return False
@@ -411,8 +412,8 @@ def _run_agent2(state, session_id, hesap_key, marketplace):
     if sdb:
         try:
             sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent2", "running")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
 
     def run_agent2_script():
         env = {**os.environ,
@@ -459,8 +460,8 @@ def _run_agent2(state, session_id, hesap_key, marketplace):
                 sdb.update_agent_status_detail("agent2", "completed", {
                     "tasks": summary.get("toplam_hedef", 0) if isinstance(summary, dict) else 0,
                 })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Supabase yazim hatasi: %s", e)
         return True
     else:
         error_msg = error_info.get("error_message", "Bilinmeyen hata") if error_info else "Bilinmeyen hata"
@@ -479,8 +480,8 @@ def _run_agent2(state, session_id, hesap_key, marketplace):
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent2", "failed", error_msg=error_msg)
                 sdb.update_agent_status_detail("agent2", "failed")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Supabase yazim hatasi: %s", e)
 
         suggestion = retry_handler.get_error_suggestion(error_type)
         email_handler.send_error(session_id, "Agent 2", error_msg, suggestion)
@@ -498,8 +499,8 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
     if sdb:
         try:
             sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", "running")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
 
     # Adim 1: Dry-run
     logger.info("Agent 3 — Adim 1: Dry-run")
@@ -540,8 +541,8 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", "failed", error_msg=error_msg)
                 sdb.update_agent_status_detail("agent3", "failed")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Supabase yazim hatasi: %s", e)
         suggestion = retry_handler.get_error_suggestion(error_type)
         email_handler.send_error(session_id, "Agent 3 (dry-run)", error_msg, suggestion)
         return False
@@ -603,8 +604,8 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
             try:
                 sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", "failed", error_msg=error_msg)
                 sdb.update_agent_status_detail("agent3", "failed")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Supabase yazim hatasi: %s", e)
         email_handler.send_error(session_id, "Agent 3 (execute)", error_msg,
                                   retry_handler.get_error_suggestion(error_type))
         return False
@@ -613,8 +614,8 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
     if sdb:
         try:
             sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent3_execute", "completed")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
 
     # Adim 3: 5 dk bekle + verify
     logger.info("Agent 3 — Adim 3: 5 dakika bekleniyor (dogrulama icin)...")
@@ -665,8 +666,8 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
             sdb.update_agent_status_detail("agent3", "completed", {
                 "tasks": exec_result.get("ozet", {}).get("toplam", 0) if isinstance(exec_result, dict) else 0,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
 
     logger.info("Agent 3 tamamlandi: %s", exec_summary)
     return True
@@ -785,8 +786,8 @@ def _build_error_result(state, session_id, agent_name, account_label=""):
             error_msg = f"{agent_name} basarisiz oldu"
             sdb.upsert_pipeline_run(session_id, hk, mp, agent_name.lower().replace(" ", ""), "failed",
                                     error_msg=error_msg)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
 
     return {
         "durum": "HATA",
@@ -824,8 +825,8 @@ def _send_completion_email(state, session_id):
                 minutes = int(delta.total_seconds() // 60)
                 seconds = int(delta.total_seconds() % 60)
                 return f"{minutes}dk {seconds}sn"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Supabase yazim hatasi: %s", e)
         return "-"
 
     summary = {
@@ -1026,8 +1027,8 @@ def _run_agent3_from_queue(hesap_key, marketplace):
     if sdb:
         try:
             sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace, "agent3_execute", "running")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
 
     try:
         env_vars = {**os.environ,
@@ -1056,8 +1057,8 @@ def _run_agent3_from_queue(hesap_key, marketplace):
                     sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace,
                                              "agent3_execute", "failed",
                                              error_msg=result.stderr[:500])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Supabase yazim hatasi: %s", e)
         return success
     except subprocess.TimeoutExpired:
         logger.error("Maestro timeout (1 saat): %s", account_label)
@@ -1067,8 +1068,8 @@ def _run_agent3_from_queue(hesap_key, marketplace):
             try:
                 sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace,
                                          "agent3_execute", "failed", error_msg="Maestro timeout (1 saat)")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Supabase yazim hatasi: %s", e)
         return False
     except FileNotFoundError:
         logger.error("claude komutu bulunamadi. Claude Code kurulu mu?")
@@ -1083,8 +1084,8 @@ def _run_agent3_from_queue(hesap_key, marketplace):
             try:
                 sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace,
                                          "agent3_execute", "failed", error_msg=str(e)[:500])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Supabase yazim hatasi: %s", e)
         return False
 
 

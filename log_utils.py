@@ -7,15 +7,25 @@ hata kayitlari olusturur.
 Kullanim:
   from log_utils import save_error_log, classify_error_type, ERROR_TYPES
 
+Strateji (v4):
+  1. Supabase agent_logs tablosuna yaz (birincil)
+  2. Supabase basarisiz olursa lokal JSON dosyasina fallback yaz
+  3. Her iki yontem de basarisiz olursa stderr'e yaz (son care)
+
 Dosya konumu: Proje koku (BASE_DIR)
 """
 
 import json
 import logging
+import sys
 from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger("log_utils")
+
+# Fallback log dizini (proje koku / logs / error_fallback)
+_FALLBACK_DIR = Path(__file__).parent / "logs" / "error_fallback"
+
 
 # ============================================================================
 # ORTAK HATA TAKSONOMISI
@@ -57,48 +67,32 @@ _EXCEPTION_MAP = {
 def classify_error_type(error_str):
     """
     Hata mesajindan veya exception sinif adindan ortak hata tipini belirler.
-
-    Args:
-        error_str: Exception sinif adi veya hata mesaji
-
-    Returns:
-        str: ERROR_TYPES'taki degerlerden biri
     """
     error_lower = str(error_str).lower()
 
-    # HTTP status kodlarina gore
     if any(k in error_lower for k in ["429", "rate limit", "too many requests", "throttl"]):
         return "RateLimit"
-
     if any(k in error_lower for k in ["401", "403", "unauthorized", "forbidden", "token expired"]):
         return "AuthError"
-
     if any(k in error_lower for k in ["400", "bad request", "validation", "malformed"]):
         return "ApiError"
-
     if any(k in error_lower for k in ["500", "502", "503", "504", "internal server",
                                        "bad gateway", "service unavail", "gateway timeout"]):
         return "ServerError"
-
     if any(k in error_lower for k in ["timeout", "connection", "network", "dns",
                                        "refused", "reset", "broken pipe", "eof", "ssl"]):
         return "NetworkError"
-
     if any(k in error_lower for k in ["not found", "no such file", "filenotfound",
                                        "dosya bulunamadi", "bulunamadi"]):
         return "FileNotFound"
-
     if any(k in error_lower for k in ["parse", "decode", "invalid", "format",
                                        "keyerror", "valueerror", "typeerror"]):
         return "DataError"
-
     if any(k in error_lower for k in ["preflight", "on kontrol", "on_kontrol"]):
         return "Preflight"
-
     if any(k in error_lower for k in ["rapor basarisiz", "report failed", "report error"]):
         return "ReportFailed"
 
-    # Python exception sinif adi eslestirme
     exc_name = str(error_str).split(":")[0].strip().split(".")[-1]
     if exc_name in _EXCEPTION_MAP:
         return _EXCEPTION_MAP[exc_name]
@@ -107,25 +101,13 @@ def classify_error_type(error_str):
 
 
 def normalize_error_type(hata_tipi):
-    """
-    Eski formattaki hata tiplerini yeni taksonomiye normalize eder.
-    Geriye uyumluluk icin — Agent 4 ErrorAnalyzer bu fonksiyonu kullanir.
-
-    Args:
-        hata_tipi: Eski veya yeni formattaki hata tipi string
-
-    Returns:
-        str: Normalize edilmis hata tipi
-    """
-    # Zaten yeni taksonomideyse aynen don
+    """Eski formattaki hata tiplerini yeni taksonomiye normalize eder."""
     if hata_tipi in ERROR_TYPES:
         return hata_tipi
 
-    # Eski Agent 1 formatlari
     mapping = {
         "ApiError_400":  "ApiError",
         "Timeout":       "NetworkError",
-        # retry_handler formatlari (kucuk harf + underscore)
         "rate_limit":    "RateLimit",
         "auth_error":    "AuthError",
         "data_error":    "DataError",
@@ -137,11 +119,55 @@ def normalize_error_type(hata_tipi):
     if hata_tipi in mapping:
         return mapping[hata_tipi]
 
-    # Python exception isimleri
     if hata_tipi in _EXCEPTION_MAP:
         return _EXCEPTION_MAP[hata_tipi]
 
     return hata_tipi
+
+
+# ============================================================================
+# JSON FALLBACK YAZICI
+# ============================================================================
+
+def _write_json_fallback(kayit, agent_name=None, log_dir=None):
+    """
+    Supabase basarisiz olunca lokal JSON dosyasina yaz.
+    Dosya: {log_dir}/{agent_name}_errors_fallback.json veya
+           logs/error_fallback/{agent_name}_errors.json
+    max 500 kayit, FIFO.
+    """
+    try:
+        if log_dir:
+            fallback_dir = Path(log_dir)
+        else:
+            fallback_dir = _FALLBACK_DIR
+        fallback_dir.mkdir(parents=True, exist_ok=True)
+
+        filename = f"{agent_name or 'unknown'}_errors_fallback.json"
+        filepath = fallback_dir / filename
+
+        # Mevcut kayitlari oku
+        kayitlar = []
+        if filepath.exists():
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    kayitlar = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                kayitlar = []
+
+        kayitlar.append(kayit)
+
+        # Max 500 kayit tut
+        if len(kayitlar) > 500:
+            kayitlar = kayitlar[-500:]
+
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(kayitlar, f, indent=2, ensure_ascii=False)
+
+        return True
+    except Exception as e:
+        print(f"[ERROR] JSON fallback da yazilamadi: {e}", file=sys.stderr)
+        return False
 
 
 # ============================================================================
@@ -155,75 +181,72 @@ def save_error_log(hata_tipi, hata_mesaji, log_dir=None,
                    hesap_key=None, marketplace=None):
     """
     Tum agentlar icin birlesik hata log fonksiyonu.
-    Sadece Supabase'e yazar (v3). JSON dosya yazimi kaldirildi.
-
-    Parametreler:
-        hata_tipi     : ERROR_TYPES'taki degerlerden biri
-        hata_mesaji   : Hata aciklamasi (max 500 char)
-        log_dir       : Kullanilmiyor (geriye uyumluluk icin)
-        traceback_str : traceback.format_exc() ciktisi (opsiyonel, max 1000 char)
-        adim          : Hatanin gerceklestigi adim (orn. "collect_list", "preflight")
-        extra         : Ek baglam dict (orn. {"endpoint": "/sp/campaigns", "status": 429})
-        session_id    : Pipeline session ID'si (korelasyon icin)
-        agent_name    : Agent adi ("agent1", "agent2", "agent3", "agent4", "maestro")
-        max_kayit     : Kullanilmiyor (geriye uyumluluk icin)
-        hesap_key     : Hesap anahtari (Supabase icin gerekli)
-        marketplace   : Marketplace kodu (Supabase icin gerekli)
+    Supabase birincil, JSON fallback, stderr son care (v4).
 
     Returns:
-        bool: Basarili ise True
+        bool: Herhangi bir yere yazildiysa True
     """
-    import sys as _sys
-
-    # Hata tipini normalize et
     hata_tipi = normalize_error_type(hata_tipi)
 
-    if not (hesap_key and agent_name):
-        # Supabase yazimi icin hesap_key ve agent_name zorunlu
-        print(f"[WARN] save_error_log: hesap_key/agent_name eksik — "
-              f"{hata_tipi}: {str(hata_mesaji)[:200]}", file=_sys.stderr)
-        return False
+    # Kayit objesi (Supabase ve JSON icin ortak)
+    kayit = {
+        "timestamp":   datetime.utcnow().isoformat(),
+        "hata_tipi":   hata_tipi,
+        "hata_mesaji":  str(hata_mesaji)[:500],
+        "adim":        adim or "bilinmiyor",
+        "agent":       agent_name or "unknown",
+        "hesap_key":   hesap_key or "",
+        "marketplace": marketplace or "",
+        "session_id":  session_id,
+    }
+    if traceback_str:
+        kayit["traceback"] = str(traceback_str)[:1000]
+    if extra:
+        kayit["extra"] = extra
 
-    try:
-        from pathlib import Path as _Path
-        _project_root = str(_Path(__file__).parent)
-        if _project_root not in _sys.path:
-            _sys.path.insert(0, _project_root)
-        from supabase.db_client import SupabaseClient
-        _sdb = SupabaseClient()
-        _sdb._execute(
-            """INSERT INTO agent_logs (agent_id, level, message, error_type,
-                hesap_key, marketplace, session_id, traceback, created_at)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
-            (agent_name, "error", str(hata_mesaji)[:500], hata_tipi,
-             hesap_key, marketplace, session_id,
-             str(traceback_str)[:1000] if traceback_str else None)
-        )
+    # 1. Supabase'e yaz (birincil)
+    if hesap_key and agent_name:
+        try:
+            _project_root = str(Path(__file__).parent)
+            if _project_root not in sys.path:
+                sys.path.insert(0, _project_root)
+            from supabase.db_client import SupabaseClient
+            _sdb = SupabaseClient()
+            _sdb._execute(
+                """INSERT INTO agent_logs (agent_id, level, message, error_type,
+                    hesap_key, marketplace, session_id, traceback, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
+                (agent_name, "error", str(hata_mesaji)[:500], hata_tipi,
+                 hesap_key, marketplace, session_id,
+                 str(traceback_str)[:1000] if traceback_str else None)
+            )
+            return True
+        except Exception as e:
+            logger.warning("save_error_log Supabase basarisiz: %s — JSON fallback", e)
+
+    # 2. JSON fallback (Supabase basarisiz veya hesap_key eksik)
+    json_ok = _write_json_fallback(kayit, agent_name, log_dir)
+    if json_ok:
         return True
-    except Exception as e:
-        # Hata loglamada hata — stderr'e yaz, pipeline'i durdurma
-        print(f"[WARN] save_error_log Supabase hatasi: {e} — "
-              f"{hata_tipi}: {str(hata_mesaji)[:200]}", file=_sys.stderr)
-        return False
+
+    # 3. Son care: stderr
+    print(f"[ERROR] Hata kaydi KAYIP — {hata_tipi}: {str(hata_mesaji)[:300]} "
+          f"(agent={agent_name}, hesap={hesap_key}/{marketplace})", file=sys.stderr)
+    return False
 
 
 def save_log(level, message, agent_name, hesap_key=None, marketplace=None,
              session_id=None, error_type=None, traceback_str=None, extra=None):
     """
     Genel log fonksiyonu — info, warn, error tum seviyeleri destekler.
-    Sadece Supabase agent_logs tablosuna yazar (lokal JSON'a YAZMAZ).
-    Dashboard gorunurlugu icin.
-
-    level: "info", "warn", "error"
+    Supabase birincil, stderr fallback (v4).
     """
     if not agent_name:
         return
     try:
-        from pathlib import Path as _Path
-        _project_root = str(_Path(__file__).parent)
-        import sys as _sys
-        if _project_root not in _sys.path:
-            _sys.path.insert(0, _project_root)
+        _project_root = str(Path(__file__).parent)
+        if _project_root not in sys.path:
+            sys.path.insert(0, _project_root)
         from supabase.db_client import SupabaseClient
         _sdb = SupabaseClient()
         _sdb._execute(
@@ -234,8 +257,10 @@ def save_log(level, message, agent_name, hesap_key=None, marketplace=None,
              hesap_key, marketplace, session_id,
              str(traceback_str)[:1000] if traceback_str else None)
         )
-    except Exception:
-        pass  # Dashboard gorunurlugu icin — basarisiz olursa agent calismaya devam eder
+    except Exception as e:
+        # Sessiz yutma DEGIL — stderr'e yaz
+        logger.warning("save_log Supabase basarisiz: %s — %s: %s",
+                        e, agent_name, str(message)[:100])
 
 
 # ============================================================================
@@ -243,17 +268,7 @@ def save_log(level, message, agent_name, hesap_key=None, marketplace=None,
 # ============================================================================
 
 def rotate_text_logs(log_dir, pattern="*.log", max_age_days=30):
-    """
-    Belirtilen gun sayisindan eski text log dosyalarini siler.
-
-    Args:
-        log_dir: Log klasoru
-        pattern: Dosya patterni (varsayilan *.log)
-        max_age_days: Maks gun (varsayilan 30)
-
-    Returns:
-        int: Silinen dosya sayisi
-    """
+    """Belirtilen gun sayisindan eski text log dosyalarini siler."""
     log_dir = Path(log_dir)
     if not log_dir.exists():
         return 0
@@ -263,14 +278,14 @@ def rotate_text_logs(log_dir, pattern="*.log", max_age_days=30):
 
     for f in log_dir.glob(pattern):
         try:
-            # Dosya yas kontrolu
             mtime = datetime.utcfromtimestamp(f.stat().st_mtime)
             age_days = (now - mtime).days
             if age_days > max_age_days:
                 f.unlink()
                 silinen += 1
                 logger.info("Eski log silindi: %s (%d gun)", f.name, age_days)
-        except Exception:
+        except Exception as e:
+            logger.warning("Log rotasyon hatasi (%s): %s", f.name, e)
             continue
 
     return silinen

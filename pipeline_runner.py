@@ -178,8 +178,8 @@ def _save_status_report(report):
         with open(rapor_path, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
         logger.info("Durum raporu lokal kaydedildi: %s", rapor_path)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Sessiz hata: %s", e)
 
     return rapor_path
 

@@ -265,8 +265,8 @@ class BidParamAnalyzer:
                     "max_degisim": float(max_d or 0.20),
                     "aktif": bool(aktif),
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Sessiz hata: %s", e)
 
         # Global tanh parametreleri
         try:
@@ -280,8 +280,8 @@ class BidParamAnalyzer:
                     "hassasiyet": tf.get("hassasiyet", 0.5),
                     "max_degisim": tf.get("max_degisim", 0.20),
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Sessiz hata: %s", e)
 
         if "_global" not in params:
             params["_global"] = {"hassasiyet": 0.5, "max_degisim": 0.20}

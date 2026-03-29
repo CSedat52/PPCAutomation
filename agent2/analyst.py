@@ -60,8 +60,8 @@ def _dashboard_status(agent_name, status, health_detail=None):
         from supabase.db_client import SupabaseClient
         db = SupabaseClient()
         db.update_agent_status_detail(agent_name, status, health_detail)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Supabase yazim hatasi: %s", e)
 
 
 def _dashboard_pipeline(session_id, hesap_key, marketplace, step, status, error_msg=None):
@@ -72,8 +72,8 @@ def _dashboard_pipeline(session_id, hesap_key, marketplace, step, status, error_
         from supabase.db_client import SupabaseClient
         db = SupabaseClient()
         db.upsert_pipeline_run(session_id, hesap_key, marketplace, step, status, error_msg)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Supabase yazim hatasi: %s", e)
 
 # ============================================================================
 # DOSYA YOLLARI — hesap_key + marketplace'den dinamik olusturulur
@@ -1992,8 +1992,8 @@ def _sync_agent2_to_supabase(hesap_key, marketplace, today,
                 "hata_mesaji": f"Supabase sync hatasi: {e}"[:500],
                 "adim": "supabase_sync",
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Supabase yazim hatasi: %s", e)
 
 
 if __name__ == "__main__":

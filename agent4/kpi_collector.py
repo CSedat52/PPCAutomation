@@ -247,8 +247,8 @@ class KPICollector:
                     hedefleme_id, karar_tarihi,
                     k["kpi_after"]
                 )
-            except Exception:
-                pass  # In-memory guncelleme yeterli, sync de yazacak
+            except Exception as e:
+                logger.warning("Sessiz hata: %s", e)  # In-memory guncelleme yeterli, sync de yazacak
 
             ozet["kpi_after_doldurulan"] += 1
 

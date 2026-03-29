@@ -74,8 +74,8 @@ class MaestroAnalyzer:
             """, (self.hesap_key, self.marketplace))
             for r in (hata_rows or []):
                 hata_sayac[r[0] or "bilinmiyor"] = r[1]
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Sessiz hata: %s", e)
 
         # Ardisik basarisiz session kontrolu (son 3)
         # rows DESC sirayla geldi, ilk 3 = en son 3

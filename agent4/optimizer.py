@@ -207,8 +207,8 @@ def _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor):
                 "duration": "?",
                 "errors_7d": 0,
             })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Sessiz hata: %s", e)
 
         logger.info("Supabase: Agent 4 verileri yazildi (%d karar)", len(kararlar))
 

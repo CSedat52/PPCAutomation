@@ -89,8 +89,8 @@ class ReportGenerator:
                     "esik_degerleri": set_row[1] if isinstance(set_row[1], dict) else {},
                     "segmentasyon_kurallari": set_row[2] if isinstance(set_row[2], dict) else {},
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Sessiz hata: %s", e)
 
         return {
             "tarih":              today,
@@ -175,8 +175,8 @@ class ReportGenerator:
                   AND status IN ('PENDING', 'BEKLIYOR')
             """, (self.hesap_key, self.marketplace))
             bekleyen_sayisi = row[0] if row else 0
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Sessiz hata: %s", e)
 
         return {
             "bekleyen_oneri_sayisi": bekleyen_sayisi,

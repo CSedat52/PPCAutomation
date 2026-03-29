@@ -176,8 +176,8 @@ class ErrorAnalyzer:
                     "tekrar":  sayi,
                     "oneri":   f"'{kamp}' kampanyasinin entity verilerini kontrol edin.",
                 })
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Sessiz hata: %s", e)
 
         return kaliplar
 
