@@ -1,13 +1,24 @@
 """
-Agent 4 — Optimizer & Learning Agent (v2 Multi-Account)
+Agent 4 — Optimizer & Learning Agent (v3 Multi-Account)
 =========================================================
+Yeni akis:
+  [1] DBManager (Supabase only)
+  [2] KPICollector (Supabase only)
+  [3] SegmentAnalyzer (Supabase only)
+  [4] ErrorAnalyzer (Supabase only)
+  [5] MaestroAnalyzer (Supabase only)
+  [6] BidParamAnalyzer (Supabase only)
+  → agent4_analysis.json ciktisi (Claude Code icin)
+
+PatternDetector ve AnomalyDetector kaldirildi — Claude Code devralir.
+
 Kullanim:
   python agent4/optimizer.py <hesap_key> <marketplace>
   python agent4/optimizer.py vigowood_na US
   python agent4/optimizer.py vigowood_na US oneri listele
   python agent4/optimizer.py vigowood_na US durum
 
-Versiyon: 2.0
+Versiyon: 3.0
 """
 
 import os
@@ -28,8 +39,7 @@ from agent4.kpi_collector   import KPICollector
 from agent4.analyzers.segment_analyzer  import SegmentAnalyzer
 from agent4.analyzers.error_analyzer    import ErrorAnalyzer
 from agent4.analyzers.maestro_analyzer  import MaestroAnalyzer
-from agent4.analyzers.pattern_detector  import PatternDetector
-from agent4.analyzers.anomaly_detector  import AnomalyDetector
+from agent4.bid_param_analyzer import BidParamAnalyzer
 from agent4.proposal_engine import ProposalEngine
 from agent4.report_generator import ReportGenerator
 from log_utils import save_error_log as _central_save_error_log
@@ -54,20 +64,14 @@ def get_dirs(hesap_key, marketplace):
 # HATA LOG
 # ============================================================================
 
-def save_error_log(hata_tipi, hata_mesaji, data_dir, traceback_str=None, adim=None,
-                   extra=None, session_id=None):
-    """Agent 4 hata logu — lokal + Supabase dual-write."""
-    from pathlib import Path
-    log_dir = Path(data_dir) / "logs"
-    dir_name = Path(data_dir).name
-    parts = dir_name.rsplit("_", 1)
-    hk = parts[0] if len(parts) == 2 else ""
-    mp = parts[1] if len(parts) == 2 else ""
+def save_error_log(hata_tipi, hata_mesaji, hesap_key="", marketplace="",
+                   traceback_str=None, adim=None, extra=None, session_id=None):
+    """Agent 4 hata logu — Supabase only."""
     return _central_save_error_log(
-        hata_tipi, hata_mesaji, log_dir,
+        hata_tipi, hata_mesaji,
         traceback_str=traceback_str, adim=adim, extra=extra,
         session_id=session_id, agent_name="agent4",
-        hesap_key=hk, marketplace=mp)
+        hesap_key=hesap_key, marketplace=marketplace)
 
 
 # ============================================================================
@@ -78,7 +82,7 @@ def run_optimizer(hesap_key, marketplace):
     today = datetime.utcnow().strftime("%Y-%m-%d")
     data_dir, config_dir = get_dirs(hesap_key, marketplace)
     logger.info("=" * 60)
-    logger.info("AGENT 4 OPTIMIZER v2 — %s/%s — %s", hesap_key, marketplace, today)
+    logger.info("AGENT 4 OPTIMIZER v3 — %s/%s — %s", hesap_key, marketplace, today)
     logger.info("=" * 60)
 
     try:
@@ -86,7 +90,8 @@ def run_optimizer(hesap_key, marketplace):
     except Exception as e:
         tb = traceback.format_exc()
         logger.error("BEKLENMEYEN HATA: %s", e)
-        save_error_log(type(e).__name__, str(e), data_dir, tb, adim="run_optimizer",
+        save_error_log(type(e).__name__, str(e), hesap_key, marketplace,
+                       tb, adim="run_optimizer",
                        extra={"hesap": f"{hesap_key}/{marketplace}"})
         return {
             "durum": "BASARISIZ",
@@ -100,80 +105,67 @@ def _run_optimizer_impl(today, data_dir, config_dir, hesap_key, marketplace):
     account_label = f"{hesap_key}/{marketplace}"
 
     # ---- 1. VERITABANI ----
-    logger.info("--- [1/7] Veritabani yukleniyor ---")
-    db = DBManager(data_dir)
+    logger.info("--- [1/6] Veritabani yukleniyor ---")
+    db = DBManager(hesap_key, marketplace)
     db.load()
 
     # ---- 2. KPI GUNCELLEME ----
-    logger.info("--- [2/7] KPI guncelleniyor ---")
-    kpi = KPICollector(data_dir, db)
+    logger.info("--- [2/6] KPI guncelleniyor ---")
+    kpi = KPICollector(hesap_key, marketplace, db)
     kpi_ozet = kpi.run(today)
     logger.info("KPI: %d yeni karar islendi, %d kpi_after dolduruldu",
                 kpi_ozet.get("yeni_karar", 0), kpi_ozet.get("kpi_after_doldurulan", 0))
 
-    # ---- 3. ANALIZLER ----
-    logger.info("--- [3/7] Segment analizi ---")
-    seg_analyzer = SegmentAnalyzer(db)
+    # ---- 3. SEGMENT ANALIZI ----
+    logger.info("--- [3/6] Segment analizi ---")
+    seg_analyzer = SegmentAnalyzer(hesap_key, marketplace, db)
     seg_sonuc = seg_analyzer.analyze()
 
-    logger.info("--- [4/7] Hata analizi ---")
-    err_analyzer = ErrorAnalyzer(data_dir, db)
+    # ---- 4. HATA ANALIZI ----
+    logger.info("--- [4/6] Hata analizi ---")
+    err_analyzer = ErrorAnalyzer(hesap_key, marketplace, db)
     err_sonuc = err_analyzer.analyze()
 
-    logger.info("--- [5/7] Maestro mudahale analizi ---")
-    maestro_analyzer = MaestroAnalyzer(BASE_DIR, db)
+    # ---- 5. MAESTRO ANALIZI ----
+    logger.info("--- [5/6] Maestro mudahale analizi ---")
+    maestro_analyzer = MaestroAnalyzer(hesap_key, marketplace, db)
     maestro_sonuc = maestro_analyzer.analyze()
 
-    logger.info("--- [6/7] Kalip tespiti ve anomali ---")
-    pattern_detector = PatternDetector(db)
-    pattern_sonuc = pattern_detector.detect()
+    # ---- 6. BID PARAMETRE ANALIZI ----
+    logger.info("--- [6/6] Bid parametre analizi ---")
+    bid_param_analyzer = BidParamAnalyzer(hesap_key, marketplace, config_dir)
+    bid_param_sonuc = bid_param_analyzer.analyze()
 
-    anomaly_detector = AnomalyDetector(db)
-    anomaly_sonuc = anomaly_detector.detect()
-
-    # ---- 4. ONERI MOTORU ----
-    logger.info("--- [7/7] Oneri motoru ---")
-    engine = ProposalEngine(data_dir, config_dir, db, {
-        "segment": seg_sonuc,
-        "hata":    err_sonuc,
-        "maestro": maestro_sonuc,
-        "kalip":   pattern_sonuc,
-        "anomali": anomaly_sonuc,
-    })
-    oneriler = engine.run(today)
-    logger.info("Oneri motoru: %d yeni oneri uretildi", len(oneriler))
-
-    # ---- 5. RAPOR ----
-    generator = ReportGenerator(data_dir, db)
+    # ---- RAPOR ----
+    generator = ReportGenerator(hesap_key, marketplace, data_dir, db)
     rapor = generator.generate(today, {
-        "kpi":     kpi_ozet,
-        "segment": seg_sonuc,
-        "hata":    err_sonuc,
-        "maestro": maestro_sonuc,
-        "kalip":   pattern_sonuc,
-        "anomali": anomaly_sonuc,
-        "oneriler": oneriler,
+        "kpi":       kpi_ozet,
+        "segment":   seg_sonuc,
+        "hata":      err_sonuc,
+        "maestro":   maestro_sonuc,
+        "bid_param": bid_param_sonuc,
+        "oneriler":  [],   # Artik Claude Code uretecek
     })
 
-    # ---- 6. VERITABANI KAYDET ----
+    # ---- VERITABANI KAYDET ----
     db.save()
 
-    # ---- 7. SUPABASE SYNC ----
-    _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor, oneriler)
+    # ---- SUPABASE SYNC ----
+    _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor)
 
     logger.info("=" * 60)
-    logger.info("AGENT 4 TAMAMLANDI — %s — Rapor: %s", account_label, rapor.get("rapor_dosyasi", ""))
-    logger.info("Bekleyen oneri sayisi: %d", len(oneriler))
+    logger.info("AGENT 4 TAMAMLANDI — %s", account_label)
+    logger.info("analysis_dosyasi: %s", rapor.get("analysis_dosyasi", ""))
+    logger.info("Claude Code bu dosyayi okuyarak dinamik analiz yapacak.")
     logger.info("=" * 60)
 
     return rapor
 
 
-def _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor, oneriler):
+def _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor):
     """Agent 4 verilerini Supabase'e senkronize et."""
     try:
-        import sys as _sys
-        _sys.path.insert(0, str(BASE_DIR))
+        sys.path.insert(0, str(BASE_DIR))
         from supabase.db_client import SupabaseClient
         sdb = SupabaseClient()
     except Exception as e:
@@ -204,40 +196,24 @@ def _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor, oneriler)
         for kalip in db._data.get("kalip_kutuphanesi", {}).get("kaliplar", []):
             sdb.insert_pattern(hesap_key, marketplace, kalip)
 
-        # Oneriler
-        for oneri in oneriler:
-            sdb.upsert_proposal(hesap_key, marketplace, oneri)
-
-        # Durum raporu
+        # Durum raporu (zaten generate() icinde de yaziliyor, burada tekrar)
         rapor_data = rapor.get("rapor_data", rapor)
         sdb.insert_status_report(hesap_key, marketplace, rapor_data)
 
         # Agent 4 status guncelle
         try:
             sdb.update_agent_status_detail("agent4", "completed", {
-                "tasks": len(kararlar) + len(oneriler),
+                "tasks": len(kararlar),
                 "duration": "?",
                 "errors_7d": 0,
             })
         except Exception:
             pass
 
-        logger.info("Supabase: Agent 4 verileri yazildi (%d karar, %d oneri)",
-                     len(kararlar), len(oneriler))
+        logger.info("Supabase: Agent 4 verileri yazildi (%d karar)", len(kararlar))
 
     except Exception as e:
         logger.error("Supabase sync hatasi (optimizer devam eder): %s", e)
-        save_error_log("InternalError", f"Supabase sync: {e}", data_dir,
-                       traceback.format_exc(), adim="supabase_sync",
-                       extra={"hesap": f"{hesap_key}/{marketplace}"})
-        try:
-            sdb.insert_error_log(hesap_key, marketplace, "agent4", {
-                "hata_tipi": "InternalError",
-                "hata_mesaji": f"Supabase sync hatasi: {e}"[:500],
-                "adim": "supabase_sync",
-            })
-        except Exception:
-            pass
 
 
 # ============================================================================
@@ -245,8 +221,6 @@ def _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor, oneriler)
 # ============================================================================
 
 if __name__ == "__main__":
-    import sys
-
     args = sys.argv[1:]
 
     if len(args) < 2:
@@ -259,18 +233,17 @@ if __name__ == "__main__":
     hesap_key = args[0]
     marketplace = args[1]
     sub_args = args[2:]
-    data_dir, config_dir = get_dirs(hesap_key, marketplace)
 
     # Oneri komutlari
     if len(sub_args) >= 2 and sub_args[0] == "oneri":
         from agent4.proposal_engine import cmd_oneri
-        cmd_oneri(data_dir, config_dir, sub_args[1:])
+        cmd_oneri(hesap_key, marketplace, sub_args[1:])
         sys.exit(0)
 
     # Durum raporu
     if sub_args and sub_args[0] == "durum":
         from agent4.report_generator import cmd_durum
-        cmd_durum(data_dir)
+        cmd_durum(hesap_key, marketplace)
         sys.exit(0)
 
     # Normal calistirma

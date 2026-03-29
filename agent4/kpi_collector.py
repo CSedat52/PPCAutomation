@@ -1,31 +1,32 @@
 """
-Agent 4 — KPI Collector
-=========================
-decisions.json + rollback.json dosyalarını eşleştirir.
-Yeni kararları DB'ye ekler, 3 gün önce uygulanan kararların
-kpi_after değerlerini güncel Agent 1 verileriyle doldurur.
+Agent 4 — KPI Collector (v3 — Supabase Only)
+===============================================
+bid_recommendations + execution_items + targeting_reports
+tablolarindan okur. JSON dosya bagimliligi kaldirildi.
 
 KPI Penceresi:
-  Gün 0: Karar verilir (decisions.json) + uygulanır (rollback.json)
-  Gün 3: Bir sonraki Agent 1 çalışmasında yeni metrikler gelir
-         Agent 4 bu metrikleri kpi_after olarak işler
+  Gun 0: Karar verilir (bid_recommendations APPROVED) + uygulanir (execution_items)
+  Gun N: Agent 1 yeni targeting_reports toplar
+         KPI Collector bu metrikleri kpi_after olarak isler
+  Sure siniri YOK — ilk uygun rapor bulundugunda doldurulur.
 """
 
-import json
 import logging
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 
 logger = logging.getLogger("agent4.kpi")
 
 
 class KPICollector:
 
-    def __init__(self, data_dir, db):
-        self.data_dir      = Path(data_dir)
-        self.decisions_dir = self.data_dir / "decisions"
-        self.log_dir       = self.data_dir / "logs"
-        self.db            = db
+    def __init__(self, hesap_key: str, marketplace: str, db):
+        self.hesap_key = hesap_key
+        self.marketplace = marketplace
+        self.db = db
+
+    def _get_sdb(self):
+        from supabase.db_client import SupabaseClient
+        return SupabaseClient()
 
     # ------------------------------------------------------------------ run
     def run(self, today: str) -> dict:
@@ -37,14 +38,14 @@ class KPICollector:
             "rollback_eslestirilen": 0,
         }
 
-        # 1. Bugunun decisions.json → DB'ye ekle
+        # 1. Onaylanmis bid_recommendations -> DB'ye ekle
         self._isle_decisions(today, ozet)
 
-        # 2. Rollback.json ile karar_durumu'nu guncelle
+        # 2. execution_items ile karar_durumu guncelle
         self._isle_rollback(today, ozet)
 
-        # 3. 3 gun onceki kararlar icin kpi_after doldur
-        self._doldur_kpi_after(today, ozet)
+        # 3. kpi_after doldur (sure siniri YOK)
+        self._doldur_kpi_after(ozet)
 
         # 4. ASIN profillerini guncelle
         self._guncelle_asin_profilleri()
@@ -52,39 +53,75 @@ class KPICollector:
         logger.info("KPI Collector ozeti: %s", ozet)
         return ozet
 
-    # ----------------------------------------------- decisions.json isleme
+    # ----------------------------------------------- bid_recommendations isleme
     def _isle_decisions(self, today: str, ozet: dict):
-        decisions_path = self.decisions_dir / f"{today}_decisions.json"
-        if not decisions_path.exists():
-            logger.warning("decisions.json bulunamadi: %s", decisions_path)
+        """Onaylanmis bid_recommendations'i DB'ye ekler."""
+        try:
+            sdb = self._get_sdb()
+            rows = sdb._fetch_all("""
+                SELECT analysis_date, ad_type, campaign_id, campaign_name,
+                       keyword_id, target_id, keyword_text, targeting,
+                       match_type, segment, current_bid, recommended_bid,
+                       decision_bid, bid_change_pct,
+                       impressions, clicks, cost, sales, orders, acos, cvr, cpc,
+                       portfolio, decision
+                FROM bid_recommendations
+                WHERE hesap_key = %s AND marketplace = %s
+                  AND analysis_date = %s
+                  AND decision IN ('APPROVED', 'MODIFIED')
+            """, (self.hesap_key, self.marketplace, today))
+        except Exception as e:
+            logger.warning("bid_recommendations okunamadi: %s", e)
             return
 
-        with open(decisions_path, "r", encoding="utf-8") as f:
-            decisions = json.load(f)
+        if not rows:
+            logger.info("Bugun icin onaylanmis karar yok: %s", today)
+            return
 
         mevcut_idler = {
             f"{k['tarih']}_{k['hedefleme_id']}"
             for k in self.db.get("karar_gecmisi")["kararlar"]
         }
 
-        for d in decisions:
-            uid = f"{d['tarih']}_{d['hedefleme_id']}"
+        for row in rows:
+            (analysis_date, ad_type, campaign_id, campaign_name,
+             keyword_id, target_id, keyword_text, targeting,
+             match_type, segment, current_bid, recommended_bid,
+             decision_bid, bid_change_pct,
+             impressions, clicks, cost, sales, orders, acos, cvr, cpc,
+             portfolio, decision) = row
+
+            hedefleme_id = str(keyword_id or target_id or "")
+            tarih = str(analysis_date)
+            yeni_bid = float(decision_bid or recommended_bid or 0)
+
+            uid = f"{tarih}_{hedefleme_id}"
+
             karar = {
-                "tarih":          d["tarih"],
-                "hedefleme_id":   d["hedefleme_id"],
-                "reklam_tipi":    d.get("reklam_tipi", ""),
-                "hedefleme":      d.get("hedefleme", ""),
-                "kampanya":       d.get("kampanya", ""),
-                "portfolio_id":   d.get("portfolio_id", ""),
-                "asin":           d.get("asin", ""),
-                "segment":        d.get("segment", ""),
-                "onceki_bid":     d.get("onceki_bid", 0),
-                "yeni_bid":       d.get("yeni_bid", 0),
-                "degisim_yuzde":  d.get("degisim_yuzde", 0),
-                "sebep":          d.get("sebep", ""),
-                "metrikler":      d.get("metrikler", {}),
-                "karar_durumu":   d.get("karar_durumu", "ONAY_BEKLIYOR"),
-                "kpi_after":      None,   # 3 gun sonra doldurulacak
+                "tarih":          tarih,
+                "hedefleme_id":   hedefleme_id,
+                "reklam_tipi":    ad_type or "",
+                "hedefleme":      keyword_text or targeting or "",
+                "kampanya":       campaign_name or "",
+                "portfolio_id":   portfolio or "",
+                "asin":           "",
+                "segment":        segment or "",
+                "onceki_bid":     float(current_bid or 0),
+                "yeni_bid":       yeni_bid,
+                "degisim_yuzde":  float(bid_change_pct or 0),
+                "sebep":          "",
+                "metrikler": {
+                    "impressions": int(impressions or 0),
+                    "clicks":      int(clicks or 0),
+                    "spend":       float(cost or 0),
+                    "sales":       float(sales or 0),
+                    "orders":      int(orders or 0),
+                    "acos":        float(acos) if acos is not None else None,
+                    "cvr":         float(cvr) if cvr is not None else None,
+                    "cpc":         float(cpc) if cpc is not None else None,
+                },
+                "karar_durumu":   "ONAY_BEKLIYOR",
+                "kpi_after":      None,
                 "kpi_after_tarih": None,
             }
 
@@ -97,85 +134,122 @@ class KPICollector:
         logger.info("%d yeni karar, %d mevcut guncellendi",
                     ozet["yeni_karar"], ozet["guncellenen_karar"])
 
-    # ----------------------------------------------- rollback.json eslestirme
+    # ----------------------------------------------- execution_items eslestirme
     def _isle_rollback(self, today: str, ozet: dict):
-        rollback_path = self.log_dir / f"{today}_rollback.json"
-        if not rollback_path.exists():
-            logger.info("rollback.json bulunamadi (dry-run veya bos onay): %s", rollback_path)
+        """execution_items'dan uygulanan islemleri eslestir."""
+        try:
+            sdb = self._get_sdb()
+            rows = sdb._fetch_all("""
+                SELECT keyword_id, target_id, targeting, new_bid
+                FROM execution_items
+                WHERE hesap_key = %s AND marketplace = %s
+                  AND item_type = 'BID_CHANGE' AND status = 'SUCCESS'
+                  AND created_at::date = %s
+            """, (self.hesap_key, self.marketplace, today))
+        except Exception as e:
+            logger.warning("execution_items okunamadi: %s", e)
             return
 
-        with open(rollback_path, "r", encoding="utf-8") as f:
-            rollback = json.load(f)
+        if not rows:
+            logger.info("Bugun icin uygulanan islem yok: %s", today)
+            return
 
-        islemler = rollback.get("islemler", [])
-        # Uygulanan bid degisikliklerini hedefleme ile eslestir
-        uygulanan = {
-            op["hedefleme"]: op
-            for op in islemler
-            if op.get("tip") == "BID_DEGISIKLIGI"
-        }
+        uygulanan = set()
+        for kw_id, tgt_id, targeting, new_bid in rows:
+            eid = str(kw_id or tgt_id or "")
+            uygulanan.add(eid)
 
         kararlar = self.db.get("karar_gecmisi")["kararlar"]
         for k in kararlar:
             if k["tarih"] == today and k["karar_durumu"] == "ONAY_BEKLIYOR":
-                hedefleme = k.get("hedefleme", "")
-                if hedefleme in uygulanan:
+                hid = k.get("hedefleme_id", "")
+                if hid in uygulanan:
                     k["karar_durumu"] = "UYGULANDI"
-                    k["uygulama_entity_id"] = uygulanan[hedefleme].get("entity_id", "")
                     ozet["rollback_eslestirilen"] += 1
 
         logger.info("%d karar UYGULANDI olarak isaretlendi", ozet["rollback_eslestirilen"])
 
     # ----------------------------------------------- kpi_after doldurma
-    def _doldur_kpi_after(self, today: str, ozet: dict):
+    def _doldur_kpi_after(self, ozet: dict):
         """
-        3 gun once uygulanan ve kpi_after=None olan kararlar icin
-        bugunun Agent 1 raporlarindan (targeting_14d) metrikleri ceker.
+        UYGULANDI + kpi_after=None olan kararlar icin
+        targeting_reports tablosundan metrikleri ceker.
+        Sure siniri YOK — collection_date > karar_tarihi olan ilk rapor kullanilir.
         """
         bos_kararlar = self.db.get_kpi_after_bos()
         if not bos_kararlar:
-            logger.info("Doldurlacak kpi_after yok.")
+            logger.info("Doldurulacak kpi_after yok.")
             return
 
-        # Bugunun SP ve SB targeting raporlarini yukle
-        sp_rapor  = self._yukle_rapor(today, "sp_targeting_14d")
-        sb_rapor  = self._yukle_rapor(today, "sb_targeting_14d")
-        sd_rapor  = self._yukle_rapor(today, "sd_targeting_14d")
-
-        # Hedefleme_id ile hizli arama icin index olustur
-        rapor_index = {}
-        for satir in (sp_rapor + sb_rapor + sd_rapor):
-            tid = self._get_targeting_id(satir)
-            if tid:
-                rapor_index[tid] = satir
-
-        today_dt = datetime.strptime(today, "%Y-%m-%d")
+        try:
+            sdb = self._get_sdb()
+        except Exception as e:
+            logger.warning("Supabase baglantisi kurulamadi: %s", e)
+            return
 
         for k in bos_kararlar:
-            karar_tarihi = datetime.strptime(k["tarih"], "%Y-%m-%d")
-            gun_farki    = (today_dt - karar_tarihi).days
+            hedefleme_id = k.get("hedefleme_id", "")
+            karar_tarihi = k.get("tarih", "")
 
-            # En az 3 gun gecmis olmali
-            if gun_farki < 3:
+            if not hedefleme_id or not karar_tarihi:
                 continue
 
-            satir = rapor_index.get(k["hedefleme_id"])
-            if not satir:
+            try:
+                row = sdb._fetch_one("""
+                    SELECT impressions, clicks, cost, sales, purchases,
+                           acos, collection_date
+                    FROM targeting_reports
+                    WHERE hesap_key = %s AND marketplace = %s
+                      AND (keyword_id = %s OR target_id = %s)
+                      AND collection_date > %s
+                    ORDER BY collection_date ASC
+                    LIMIT 1
+                """, (self.hesap_key, self.marketplace,
+                      hedefleme_id, hedefleme_id, karar_tarihi))
+            except Exception:
                 continue
 
-            reklam_tipi = k.get("reklam_tipi", "SP")
+            if not row:
+                continue
+
+            impressions, clicks, cost, sales, purchases, acos, collection_date = row
+            spend = float(cost or 0)
+            sales_val = float(sales or 0)
+            clicks_val = int(clicks or 0)
+            orders_val = int(purchases or 0)
+
+            calculated_acos = None
+            if acos is not None:
+                calculated_acos = float(acos)
+            elif sales_val > 0:
+                calculated_acos = round((spend / sales_val) * 100, 2)
+
             k["kpi_after"] = {
-                "impressions": satir.get("impressions", 0),
-                "clicks":      satir.get("clicks", 0),
-                "spend":       satir.get("spend", 0.0),
-                "sales":       self._get_sales(satir, reklam_tipi),
-                "orders":      self._get_orders(satir, reklam_tipi),
-                "acos":        self._hesapla_acos(satir, reklam_tipi),
-                "cvr":         self._hesapla_cvr(satir),
-                "cpc":         self._hesapla_cpc(satir),
+                "impressions": int(impressions or 0),
+                "clicks":      clicks_val,
+                "spend":       spend,
+                "sales":       sales_val,
+                "orders":      orders_val,
+                "acos":        calculated_acos,
+                "cvr":         round((orders_val / clicks_val) * 100, 2) if clicks_val > 0 else 0.0,
+                "cpc":         round(spend / clicks_val, 3) if clicks_val > 0 else 0.0,
             }
-            k["kpi_after_tarih"]  = today
-            k["kpi_after_gun_farki"] = gun_farki
+            k["kpi_after_tarih"] = str(collection_date)
+            k["kpi_after_gun_farki"] = (
+                datetime.strptime(str(collection_date), "%Y-%m-%d") -
+                datetime.strptime(karar_tarihi, "%Y-%m-%d")
+            ).days
+
+            # decision_history tablosunu da dogrudan guncelle
+            try:
+                sdb.update_decision_kpi(
+                    self.hesap_key, self.marketplace,
+                    hedefleme_id, karar_tarihi,
+                    k["kpi_after"]
+                )
+            except Exception:
+                pass  # In-memory guncelleme yeterli, sync de yazacak
+
             ozet["kpi_after_doldurulan"] += 1
 
         logger.info("%d karar icin kpi_after dolduruldu", ozet["kpi_after_doldurulan"])
@@ -231,59 +305,3 @@ class KPICollector:
                 "ortalama_acos_sonrasi":   round(avg_after, 2)  if avg_after  else None,
                 "segment_sayilari":        d["segment_sayilari"],
             })
-
-    # ----------------------------------------------------------------- utils
-    def _yukle_rapor(self, today: str, rapor_adi: str) -> list:
-        path = self.data_dir / f"{today}_{rapor_adi}.json"
-        if not path.exists():
-            # Gece yarisi gecisi icin bir onceki gunu de kontrol et
-            onceki = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-            path = self.data_dir / f"{onceki}_{rapor_adi}.json"
-            if not path.exists():
-                return []
-            logger.info("Rapor bugunun tarihiyle bulunamadi, onceki gun kullaniliyor: %s", path.name)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
-
-    def _get_targeting_id(self, satir: dict) -> str:
-        """SP: keywordId veya targetId, SB: keywordId, SD: targetId"""
-        return (
-            satir.get("keywordId") or
-            satir.get("targetId")  or
-            satir.get("keyword_id") or
-            ""
-        )
-
-    def _get_sales(self, satir: dict, reklam_tipi: str) -> float:
-        if reklam_tipi == "SP":
-            return float(satir.get("sales14d", satir.get("sales", 0)) or 0)
-        return float(satir.get("sales", 0) or 0)
-
-    def _get_orders(self, satir: dict, reklam_tipi: str) -> int:
-        if reklam_tipi == "SP":
-            return int(satir.get("purchases14d", satir.get("purchases", 0)) or 0)
-        return int(satir.get("purchases", 0) or 0)
-
-    def _hesapla_acos(self, satir: dict, reklam_tipi: str) -> float:
-        spend = float(satir.get("spend", 0) or 0)
-        sales = self._get_sales(satir, reklam_tipi)
-        if sales > 0:
-            return round((spend / sales) * 100, 2)
-        return None
-
-    def _hesapla_cvr(self, satir: dict) -> float:
-        clicks = int(satir.get("clicks", 0) or 0)
-        orders = int(satir.get("purchases14d", satir.get("purchases", 0)) or 0)
-        if clicks > 0:
-            return round((orders / clicks) * 100, 2)
-        return 0.0
-
-    def _hesapla_cpc(self, satir: dict) -> float:
-        clicks = int(satir.get("clicks", 0) or 0)
-        spend  = float(satir.get("spend", 0) or 0)
-        if clicks > 0:
-            return round(spend / clicks, 3)
-        return 0.0

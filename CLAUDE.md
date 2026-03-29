@@ -68,18 +68,17 @@ amazon-ppc-automation/
 +-- agent3/
 |   +-- executor.py                      # Agent 3 v3 — Executor scripti (multi-account)
 +-- agent4/
-|   +-- optimizer.py                     # Agent 4 v2 — Optimizer (multi-account)
-|   +-- db_manager.py
-|   +-- kpi_collector.py
-|   +-- proposal_engine.py
-|   +-- report_generator.py
+|   +-- optimizer.py                     # Agent 4 v3 — Optimizer (multi-account, Supabase only)
+|   +-- db_manager.py                    # v3 — Supabase only, JSON kaldirildi
+|   +-- kpi_collector.py                 # v3 — Supabase only (bid_recommendations, targeting_reports)
+|   +-- bid_param_analyzer.py            # v3 — ASIN bazli bid param etki analizi (NEW)
+|   +-- proposal_engine.py              # v3 — Sadece writer, statik kurallar kaldirildi
+|   +-- report_generator.py             # v3 — agent4_analysis.json ciktisi ekle
 |   +-- analyzers/
 |       +-- __init__.py
-|       +-- segment_analyzer.py
-|       +-- error_analyzer.py            # v2 — normalize mapping, session bazli analiz
-|       +-- maestro_analyzer.py          # v2 — state + maestro_errors.json birlesik analiz
-|       +-- pattern_detector.py
-|       +-- anomaly_detector.py
+|       +-- segment_analyzer.py          # v3 — decision_history tablosundan okur
+|       +-- error_analyzer.py            # v3 — error_logs tablosundan okur
+|       +-- maestro_analyzer.py          # v3 — pipeline_runs tablosundan okur
 +-- maestro/
 |   +-- __init__.py
 |   +-- config.py                        # v2 — init_account(), get_active_pipelines()
@@ -139,13 +138,41 @@ Ornek: `python agent3/executor.py vigowood_na US --verify`           (dogrulama 
 Gorevi: Onaylanmis kararlari Amazon API uzerinden uygular.
 Hata logu: `data/{hesap}_{mp}/logs/agent3_errors.json`
 
-### Agent 4: Optimizer & Learning Agent v2 (Multi-Account)
+### Agent 4: Optimizer & Learning Agent v3 (Multi-Account, Supabase Only)
 Script: `agent4/optimizer.py`
 Cagiris: `python agent4/optimizer.py <hesap_key> <marketplace>`
 Ornek: `python agent4/optimizer.py vigowood_na US`
-Gorevi: Agent performansini analiz eder, hata kaliplarini tespit eder, bid parametresi onerisi uretir.
-Hata logu: `data/{hesap}_{mp}/logs/agent4_errors.json`
+Gorevi: 3 ana gorev — bid param optimizasyonu, hata tespiti & cozum, sistem iyilestirme.
 Calisma zamani: Agent 3 verify tamamlandiktan HEMEN SONRA.
+
+**Yeni v3 Akisi:**
+```
+Python (pure, $0 maliyet)                    Claude Code (dinamik zeka)
+═══════════════════════════                   ═══════════════════════════
+[1] DBManager (Supabase only)
+[2] KPICollector (Supabase only)
+[3] SegmentAnalyzer (Supabase only)
+[4] ErrorAnalyzer (Supabase only)
+[5] MaestroAnalyzer (Supabase only)
+[6] BidParamAnalyzer (Supabase only)
+        │
+        ▼
+  agent4_analysis.json ──────────────────────→ Claude Code okur
+  (tum analiz ciktilari tek dosya)              │
+                                                ▼
+                                          Dinamik Analiz:
+                                              - Pattern tespiti
+                                              - Anomali tespiti
+                                              - Bid param onerileri degerlendirme
+                                              - Hata cozum onerileri
+                                              - Sistem iyilestirme onerileri
+                                                │
+                                                ▼
+                                          proposals tablosuna yazar
+                                          (onay bekler, auto-apply YOK)
+```
+
+Tum veri Supabase'den okunur, JSON dosya fallback kaldirildi.
 
 Oneri yonetimi:
 ```bash
@@ -181,15 +208,16 @@ Tum agentlar ayni hata tiplerini kullanir. Agent 4 ErrorAnalyzer bu tipleri norm
 | InternalError | Beklenmeyen Python exception |
 
 ### Log Dosyalari
-Her agent kendi `save_error_log()` fonksiyonuyla structured JSON kaydeder:
+Tum agentlar `save_error_log()` ile Supabase'e structured log yazar.
+JSON dosya yazimi v3'te kaldirildi — tek kaynak Supabase.
 
-| Kaynak | Dosya Yolu | Icerik |
-|--------|-----------|--------|
-| Agent 1 | `data/{hesap}_{mp}/logs/agent1_errors.json` | API hatalari, entity/rapor toplama |
-| Agent 2 | `data/{hesap}_{mp}/logs/agent2_errors.json` | Analiz hatalari, preflight |
-| Agent 3 | `data/{hesap}_{mp}/logs/agent3_errors.json` | Execution + verification hatalari |
-| Agent 4 | `data/{hesap}_{mp}/logs/agent4_errors.json` | Optimizer hatalari |
-| Maestro | `maestro/logs/{hesap}_{mp}_maestro_errors.json` | Pipeline-seviye hatalar, agent failure, email |
+| Kaynak | Supabase Tablosu | Icerik |
+|--------|-----------------|--------|
+| Agent 1 | `agent_logs` (agent_id='agent1') | API hatalari, entity/rapor toplama |
+| Agent 2 | `agent_logs` (agent_id='agent2') | Analiz hatalari, preflight |
+| Agent 3 | `agent_logs` (agent_id='agent3') | Execution + verification hatalari |
+| Agent 4 | `agent_logs` (agent_id='agent4') | Optimizer hatalari |
+| Maestro | `maestro_errors` | Pipeline-seviye hatalar, agent failure, email |
 
 Kayit formati (tum agentlarda ayni):
 ```json
@@ -293,8 +321,14 @@ Veriler toplandiktan sonra her hesap icin sirayla (bir hesap hata verse bile son
 - Verify verileri cek: `python agent3/executor.py HESAP MP --collect-verify`
 - `python agent3/executor.py HESAP MP --verify --date PIPELINE_DATE` calistir.
 
-**ADIM 5: Agent 4 — Optimizer (her hesap icin)**
+**ADIM 5: Agent 4 — Optimizer + Claude Code Dinamik Analiz (her hesap icin)**
 - `python agent4/optimizer.py HESAP MP` calistir.
+  Python adimi bittikten sonra `data/{hesap}_{mp}/agent4/agent4_analysis.json` dosyasi olusur.
+- BU DOSYAYI OKU ve dinamik analiz yap:
+  1. **Bid param onerileri**: Python'un basit onerilerini degerlendir, cross-ASIN/marketplace insight uret.
+  2. **Hata cozum onerileri**: Tekrarlayan hata kaliplarini yorumla, kok neden analizi, cozum oner.
+  3. **Sistem iyilestirme**: Pattern/anomali tespiti, segment strateji onerileri, pipeline optimizasyonu.
+- Uretilen onerileri `proposals` tablosuna yaz (ProposalEngine.write_proposals() veya dogrudan Supabase).
 - bekleyen_oneri_sayisi > 0 → Kullaniciya bildir.
 - ardisik_hata_alarmi = true → KRITIK UYARI.
 - Hata varsa → Problem Cozme Moduna gir.

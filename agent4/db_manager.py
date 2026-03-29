@@ -1,118 +1,84 @@
 """
-Agent 4 — DB Manager
-======================
-Kumülatif veritabanı dosyalarını okur ve yazar.
-
-Dosyalar (data/agent4/db/):
-  karar_gecmisi.json       — Tüm bid kararları + kpi_after sonuçları
-  segment_istatistikleri.json — Segment başarı/başarısızlık oranları
-  asin_profilleri.json     — ASIN bazında öğrenilmiş profiller
-  anomali_gecmisi.json     — Tespit edilen anomaliler
-  kalip_kutuphanesi.json   — Tekrar eden kalıplar
+Agent 4 — DB Manager (v3 — Supabase Only)
+===========================================
+Kumülatif veritabanı: Supabase agent4_learning_db tablosu.
+JSON dosya fallback kaldırıldı.
 """
 
-import os
 import json
 import logging
 from datetime import datetime
-from pathlib import Path
 
 logger = logging.getLogger("agent4.db")
 
 
 class DBManager:
 
-    DB_FILES = {
-        "karar_gecmisi":        "karar_gecmisi.json",
-        "segment_istatistikleri": "segment_istatistikleri.json",
-        "asin_profilleri":      "asin_profilleri.json",
-        "anomali_gecmisi":      "anomali_gecmisi.json",
-        "kalip_kutuphanesi":    "kalip_kutuphanesi.json",
-    }
+    DB_KEYS = [
+        "karar_gecmisi",
+        "segment_istatistikleri",
+        "asin_profilleri",
+        "anomali_gecmisi",
+        "kalip_kutuphanesi",
+    ]
 
-    def __init__(self, data_dir):
-        self.data_dir = Path(data_dir)
-        self.db_dir   = self.data_dir / "agent4" / "db"
-        self.db_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, hesap_key: str, marketplace: str):
+        self.hesap_key = hesap_key
+        self.marketplace = marketplace
         self._data = {}
+
+    def _get_sdb(self):
+        from supabase.db_client import SupabaseClient
+        return SupabaseClient()
 
     # ------------------------------------------------------------------ load
     def load(self):
-        hk = os.environ.get("HESAP_KEY", "")
-        mp = os.environ.get("MARKETPLACE", "")
+        """Supabase agent4_learning_db tablosundan yükle."""
+        try:
+            sdb = self._get_sdb()
+            rows = sdb._fetch_all(
+                "SELECT db_key, db_data FROM agent4_learning_db "
+                "WHERE hesap_key = %s AND marketplace = %s",
+                (self.hesap_key, self.marketplace)
+            )
+            for db_key, db_data in (rows or []):
+                if db_key in self.DB_KEYS:
+                    self._data[db_key] = db_data if isinstance(db_data, dict) else json.loads(db_data)
+                    logger.info("DB Supabase'den yuklendi: %s (%d kayit)",
+                                db_key, self._record_count(db_key))
+        except Exception as e:
+            logger.error("Agent4 DB Supabase'den okunamadi: %s", e)
+            raise
 
-        # Supabase'den yukle
-        if hk and mp:
-            try:
-                from supabase.db_client import SupabaseClient
-                from psycopg2.extras import Json
-                db = SupabaseClient()
-                conn = db._conn()
-                cur = conn.cursor()
-                cur.execute("SELECT db_key, db_data FROM agent4_learning_db WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
-                rows = cur.fetchall()
-                cur.close()
-                conn.close()
-                if rows:
-                    for db_key, db_data in rows:
-                        if db_key in self.DB_FILES:
-                            self._data[db_key] = db_data if isinstance(db_data, dict) else json.loads(db_data)
-                            logger.info("DB Supabase'den yuklendi: %s (%d kayit)", db_key, self._record_count(db_key))
-                    # Eksik tablolar icin bos baslat
-                    for key in self.DB_FILES:
-                        if key not in self._data:
-                            self._data[key] = self._empty(key)
-                    return self
-            except Exception as e:
-                logger.warning("Agent4 DB Supabase'den okunamadi, dosyaya fallback: %s", e)
-
-        # JSON dosyalarina fallback
-        for key, filename in self.DB_FILES.items():
-            path = self.db_dir / filename
-            if path.exists():
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        self._data[key] = json.load(f)
-                    logger.info("DB dosyadan yuklendi: %s (%d kayit)", filename, self._record_count(key))
-                except (json.JSONDecodeError, IOError) as e:
-                    logger.warning("DB okunamadi %s: %s — bos baslaniyor", filename, e)
-                    self._data[key] = self._empty(key)
-            else:
+        # Eksik anahtarlar icin bos baslat
+        for key in self.DB_KEYS:
+            if key not in self._data:
                 self._data[key] = self._empty(key)
         return self
 
     # ------------------------------------------------------------------ save
     def save(self):
-        # JSON dosyalarina yaz (fallback)
-        for key, filename in self.DB_FILES.items():
-            path = self.db_dir / filename
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(self._data[key], f, indent=2, ensure_ascii=False)
-
-        # Supabase'e yaz
-        hk = os.environ.get("HESAP_KEY", "")
-        mp = os.environ.get("MARKETPLACE", "")
-        if hk and mp:
-            try:
-                from supabase.db_client import SupabaseClient
-                from psycopg2.extras import Json
-                db = SupabaseClient()
-                conn = db._conn()
-                cur = conn.cursor()
-                for key in self.DB_FILES:
-                    cur.execute("""
-                        INSERT INTO agent4_learning_db (hesap_key, marketplace, db_key, db_data, updated_at)
-                        VALUES (%s, %s, %s, %s, NOW())
-                        ON CONFLICT (hesap_key, marketplace, db_key) DO UPDATE SET db_data = EXCLUDED.db_data, updated_at = NOW()
-                    """, (hk, mp, key, Json(self._data.get(key, {}))))
-                conn.commit()
-                cur.close()
-                conn.close()
-                logger.info("DB Supabase'e kaydedildi (%d tablo)", len(self.DB_FILES))
-            except Exception as e:
-                logger.warning("Agent4 DB Supabase'e yazilamadi: %s", e)
-
-        logger.info("DB kaydedildi (%d tablo)", len(self.DB_FILES))
+        """Supabase agent4_learning_db tablosuna yaz."""
+        try:
+            from psycopg2.extras import Json
+            sdb = self._get_sdb()
+            conn = sdb._conn()
+            cur = conn.cursor()
+            for key in self.DB_KEYS:
+                cur.execute("""
+                    INSERT INTO agent4_learning_db (hesap_key, marketplace, db_key, db_data, updated_at)
+                    VALUES (%s, %s, %s, %s, NOW())
+                    ON CONFLICT (hesap_key, marketplace, db_key)
+                    DO UPDATE SET db_data = EXCLUDED.db_data, updated_at = NOW()
+                """, (self.hesap_key, self.marketplace, key,
+                      Json(self._data.get(key, {}))))
+            conn.commit()
+            cur.close()
+            conn.close()
+            logger.info("DB Supabase'e kaydedildi (%d tablo)", len(self.DB_KEYS))
+        except Exception as e:
+            logger.error("Agent4 DB Supabase'e yazilamadi: %s", e)
+            raise
 
     # ----------------------------------------------------------- accessors
     def get(self, key):
@@ -126,7 +92,6 @@ class DBManager:
         """Yeni karar ekler. Ayni hedefleme_id+tarih varsa gunceller."""
         kg = self._data["karar_gecmisi"]
         uid = f"{karar['tarih']}_{karar['hedefleme_id']}"
-        # Guncelleme: varsa degistir, yoksa ekle
         for i, k in enumerate(kg["kararlar"]):
             if f"{k['tarih']}_{k['hedefleme_id']}" == uid:
                 kg["kararlar"][i] = karar
@@ -134,7 +99,7 @@ class DBManager:
         kg["kararlar"].append(karar)
 
     def get_kararlar(self, hedefleme_id=None, asin=None, son_n=None):
-        """Filtrelenmiş karar listesi döner."""
+        """Filtrelenmis karar listesi doner."""
         kararlar = self._data["karar_gecmisi"]["kararlar"]
         if hedefleme_id:
             kararlar = [k for k in kararlar if k.get("hedefleme_id") == hedefleme_id]
@@ -145,7 +110,7 @@ class DBManager:
         return kararlar
 
     def get_kpi_after_bos(self):
-        """kpi_after henüz doldurulmamış kararları döner."""
+        """kpi_after henuz doldurulmamis kararlari doner."""
         return [
             k for k in self._data["karar_gecmisi"]["kararlar"]
             if k.get("kpi_after") is None and k.get("karar_durumu") == "UYGULANDI"
@@ -181,7 +146,6 @@ class DBManager:
     # --------------------------------------------------- kalip helpers
     def add_kalip(self, kalip: dict):
         kk = self._data["kalip_kutuphanesi"]
-        # Ayni tip+tanim varsa guncelle
         for i, k in enumerate(kk["kaliplar"]):
             if k.get("tip") == kalip.get("tip") and k.get("tanim") == kalip.get("tanim"):
                 kk["kaliplar"][i]["tekrar_sayisi"] = k.get("tekrar_sayisi", 1) + 1
@@ -216,7 +180,6 @@ class DBManager:
     # ----------------------------------------------------------------- utils
     def _record_count(self, key):
         d = self._data.get(key, {})
-        # Her tablonun ana listesi farkli isimde
         for liste_adi in ("kararlar", "segmentler", "profiller", "anomaliler", "kaliplar"):
             if liste_adi in d:
                 v = d[liste_adi]
@@ -226,27 +189,27 @@ class DBManager:
     def _empty(self, key):
         templates = {
             "karar_gecmisi": {
-                "_aciklama": "Tüm bid kararları ve kpi_after sonuçları",
+                "_aciklama": "Tum bid kararlari ve kpi_after sonuclari",
                 "son_guncelleme": None,
                 "kararlar": [],
             },
             "segment_istatistikleri": {
-                "_aciklama": "Segment bazında başarı/başarısızlık oranları",
+                "_aciklama": "Segment bazinda basari/basarisizlik oranlari",
                 "son_guncelleme": None,
                 "segmentler": {},
             },
             "asin_profilleri": {
-                "_aciklama": "ASIN bazında öğrenilmiş davranış profilleri",
+                "_aciklama": "ASIN bazinda ogrenilmis davranis profilleri",
                 "son_guncelleme": None,
                 "profiller": {},
             },
             "anomali_gecmisi": {
-                "_aciklama": "Tespit edilen tüm anomaliler",
+                "_aciklama": "Tespit edilen tum anomaliler",
                 "son_guncelleme": None,
                 "anomaliler": [],
             },
             "kalip_kutuphanesi": {
-                "_aciklama": "Tekrar eden kalıplar ve çıkarılan kurallar",
+                "_aciklama": "Tekrar eden kaliplar ve cikarilan kurallar",
                 "son_guncelleme": None,
                 "kaliplar": [],
             },

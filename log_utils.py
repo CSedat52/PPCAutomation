@@ -148,98 +148,63 @@ def normalize_error_type(hata_tipi):
 # ORTAK save_error_log FONKSIYONU
 # ============================================================================
 
-def save_error_log(hata_tipi, hata_mesaji, log_dir,
+def save_error_log(hata_tipi, hata_mesaji, log_dir=None,
                    traceback_str=None, adim=None, extra=None,
                    session_id=None, agent_name=None,
                    max_kayit=200,
                    hesap_key=None, marketplace=None):
     """
     Tum agentlar icin birlesik hata log fonksiyonu.
+    Sadece Supabase'e yazar (v3). JSON dosya yazimi kaldirildi.
 
     Parametreler:
         hata_tipi     : ERROR_TYPES'taki degerlerden biri
         hata_mesaji   : Hata aciklamasi (max 500 char)
-        log_dir       : Log dosyasinin yazilacagi klasor (Path)
-                        Dosya adi: {agent_name}_errors.json
+        log_dir       : Kullanilmiyor (geriye uyumluluk icin)
         traceback_str : traceback.format_exc() ciktisi (opsiyonel, max 1000 char)
         adim          : Hatanin gerceklestigi adim (orn. "collect_list", "preflight")
         extra         : Ek baglam dict (orn. {"endpoint": "/sp/campaigns", "status": 429})
         session_id    : Pipeline session ID'si (korelasyon icin)
-        agent_name    : Agent adi (dosya adi icin: "agent1", "agent2", "agent3", "agent4", "maestro")
-        max_kayit     : Dosyadaki max kayit sayisi (varsayilan 200)
+        agent_name    : Agent adi ("agent1", "agent2", "agent3", "agent4", "maestro")
+        max_kayit     : Kullanilmiyor (geriye uyumluluk icin)
+        hesap_key     : Hesap anahtari (Supabase icin gerekli)
+        marketplace   : Marketplace kodu (Supabase icin gerekli)
 
     Returns:
         bool: Basarili ise True
     """
-    log_dir = Path(log_dir)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    # Dosya adi belirle
-    if agent_name:
-        filename = f"{agent_name}_errors.json"
-    else:
-        filename = "errors.json"
-
-    log_path = log_dir / filename
-
-    try:
-        with open(log_path, "r", encoding="utf-8") as f:
-            kayitlar = json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        kayitlar = []
+    import sys as _sys
 
     # Hata tipini normalize et
     hata_tipi = normalize_error_type(hata_tipi)
 
-    kayit = {
-        "timestamp":  datetime.utcnow().isoformat(),
-        "hata_tipi":  hata_tipi,
-        "hata_mesaji": str(hata_mesaji)[:500],
-        "adim":       adim or "bilinmiyor",
-    }
-
-    if traceback_str:
-        kayit["traceback"] = str(traceback_str)[:1000]
-    if extra:
-        kayit["extra"] = extra
-    if session_id:
-        kayit["session_id"] = session_id
-
-    kayitlar.append(kayit)
-
-    # Eski kayitlari temizle
-    if len(kayitlar) > max_kayit:
-        kayitlar = kayitlar[-max_kayit:]
-
-    try:
-        with open(log_path, "w", encoding="utf-8") as f:
-            json.dump(kayitlar, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.error("Hata logu yazilamadi %s: %s", log_path, e)
+    if not (hesap_key and agent_name):
+        # Supabase yazimi icin hesap_key ve agent_name zorunlu
+        print(f"[WARN] save_error_log: hesap_key/agent_name eksik — "
+              f"{hata_tipi}: {str(hata_mesaji)[:200]}", file=_sys.stderr)
         return False
 
-    # ---- Supabase dual-write ----
-    if hesap_key and agent_name:
-        try:
-            from pathlib import Path as _Path
-            _project_root = str(_Path(__file__).parent)
-            import sys as _sys
-            if _project_root not in _sys.path:
-                _sys.path.insert(0, _project_root)
-            from supabase.db_client import SupabaseClient
-            _sdb = SupabaseClient()
-            _sdb._execute(
-                """INSERT INTO agent_logs (agent_id, level, message, error_type,
-                    hesap_key, marketplace, session_id, traceback, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
-                (agent_name, "error", str(hata_mesaji)[:500], hata_tipi,
-                 hesap_key, marketplace, session_id,
-                 str(traceback_str)[:1000] if traceback_str else None)
-            )
-        except Exception:
-            pass  # Supabase yazamazsa lokal zaten yazildi, sessizce devam et
-
-    return True
+    try:
+        from pathlib import Path as _Path
+        _project_root = str(_Path(__file__).parent)
+        if _project_root not in _sys.path:
+            _sys.path.insert(0, _project_root)
+        from supabase.db_client import SupabaseClient
+        _sdb = SupabaseClient()
+        _sdb._execute(
+            """INSERT INTO agent_logs (agent_id, level, message, error_type,
+                hesap_key, marketplace, session_id, traceback, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
+            (agent_name, "error", str(hata_mesaji)[:500], hata_tipi,
+             hesap_key, marketplace, session_id,
+             str(traceback_str)[:1000] if traceback_str else None)
+        )
+        return True
+    except Exception as e:
+        # Hata loglamada hata — stderr'e yaz, pipeline'i durdurma
+        print(f"[WARN] save_error_log Supabase hatasi: {e} — "
+              f"{hata_tipi}: {str(hata_mesaji)[:200]}", file=_sys.stderr)
+        return False
 
 
 def save_log(level, message, agent_name, hesap_key=None, marketplace=None,

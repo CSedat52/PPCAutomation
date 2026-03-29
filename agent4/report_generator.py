@@ -1,13 +1,10 @@
 """
-Agent 4 — Report Generator
-============================
-Tum analiz sonuclarini birlestirerek durum raporu uretir.
-
-Cikti: data/agent4/raporlar/{tarih}_durum_raporu.json
-
-Rapor iki bolumden olusur:
-  1. SISTEM SAGLIGI — Pipeline, agent basari oranlari, anomaliler
-  2. ONAY BEKLIYOR  — Uretilen oneriler ve ozet bilgi
+Agent 4 — Report Generator (v3)
+==================================
+Tum analiz sonuclarini birlestirerek:
+  1. agent4_analysis.json — Claude Code icin (dinamik analiz girdisi)
+  2. Supabase status_reports tablosu
+  3. Konsol ozeti
 """
 
 import json
@@ -20,60 +17,119 @@ logger = logging.getLogger("agent4.report")
 
 class ReportGenerator:
 
-    def __init__(self, data_dir, db):
+    def __init__(self, hesap_key: str, marketplace: str, data_dir, db):
+        self.hesap_key   = hesap_key
+        self.marketplace = marketplace
         self.data_dir    = Path(data_dir)
         self.rapor_dir   = self.data_dir / "agent4" / "raporlar"
         self.rapor_dir.mkdir(parents=True, exist_ok=True)
         self.db          = db
 
+    def _get_sdb(self):
+        from supabase.db_client import SupabaseClient
+        return SupabaseClient()
+
     def generate(self, today: str, sonuclar: dict) -> dict:
         rapor = {
             "tarih":           today,
             "olusturma":       datetime.utcnow().isoformat(),
-            "versiyon":        "1.0",
+            "versiyon":        "3.0",
             "sistem_sagligi":  self._sistem_sagligi(sonuclar),
             "onay_bekliyor":   self._onay_bekliyor(sonuclar),
             "ozet":            self._ozet(sonuclar),
         }
 
-        rapor_path = self.rapor_dir / f"{today}_durum_raporu.json"
-        with open(rapor_path, "w", encoding="utf-8") as f:
-            json.dump(rapor, f, indent=2, ensure_ascii=False)
+        # agent4_analysis.json — Claude Code icin
+        analysis_data = self._build_analysis_json(today, sonuclar)
+        analysis_path = self.data_dir / "agent4" / "agent4_analysis.json"
+        analysis_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(analysis_path, "w", encoding="utf-8") as f:
+            json.dump(analysis_data, f, indent=2, ensure_ascii=False)
+        rapor["analysis_dosyasi"] = str(analysis_path)
+        logger.info("agent4_analysis.json kaydedildi: %s", analysis_path)
 
-        rapor["rapor_dosyasi"] = str(rapor_path)
-        logger.info("Durum raporu kaydedildi: %s", rapor_path)
+        # Supabase status_reports
+        try:
+            sdb = self._get_sdb()
+            sdb.insert_status_report(self.hesap_key, self.marketplace, rapor)
+        except Exception as e:
+            logger.warning("Status raporu Supabase'e yazilamadi: %s", e)
 
-        # Konsol ozeti yazdir
+        # Konsol ozeti
         self._yazdir_ozet(rapor)
         return rapor
+
+    # ------------------------------------------ agent4_analysis.json builder
+    def _build_analysis_json(self, today: str, sonuclar: dict) -> dict:
+        """Claude Code'un okuyacagi tum analiz verilerini tek dosyaya yaz."""
+
+        # Mevcut bid_functions ve settings
+        mevcut_bf = {}
+        mevcut_settings = {}
+        try:
+            sdb = self._get_sdb()
+            bf_row = sdb._fetch_one("""
+                SELECT tanh_formulu, segment_parametreleri, asin_parametreleri
+                FROM bid_functions WHERE hesap_key = %s AND marketplace = %s
+            """, (self.hesap_key, self.marketplace))
+            if bf_row:
+                mevcut_bf = {
+                    "tanh_formulu": bf_row[0] if isinstance(bf_row[0], dict) else {},
+                    "segment_parametreleri": bf_row[1] if isinstance(bf_row[1], dict) else {},
+                    "asin_parametreleri": bf_row[2] if isinstance(bf_row[2], dict) else {},
+                }
+
+            set_row = sdb._fetch_one("""
+                SELECT genel_ayarlar, esik_degerleri, segmentasyon_kurallari
+                FROM settings WHERE hesap_key = %s AND marketplace = %s
+            """, (self.hesap_key, self.marketplace))
+            if set_row:
+                mevcut_settings = {
+                    "genel_ayarlar": set_row[0] if isinstance(set_row[0], dict) else {},
+                    "esik_degerleri": set_row[1] if isinstance(set_row[1], dict) else {},
+                    "segmentasyon_kurallari": set_row[2] if isinstance(set_row[2], dict) else {},
+                }
+        except Exception:
+            pass
+
+        return {
+            "tarih":              today,
+            "hesap_key":          self.hesap_key,
+            "marketplace":        self.marketplace,
+            "kpi_ozet":           sonuclar.get("kpi", {}),
+            "segment_sonuclari":  sonuclar.get("segment", {}),
+            "hata_analizi":       sonuclar.get("hata", {}),
+            "maestro_analizi":    sonuclar.get("maestro", {}),
+            "bid_param_analizi":  sonuclar.get("bid_param", []),
+            "mevcut_bid_functions": mevcut_bf,
+            "mevcut_settings":    mevcut_settings,
+        }
 
     # ------------------------------------------ Sistem sagligi bolumu
     def _sistem_sagligi(self, sonuclar: dict) -> dict:
         maestro = sonuclar.get("maestro", {})
         hata    = sonuclar.get("hata", {})
         kpi     = sonuclar.get("kpi", {})
-        anomali = sonuclar.get("anomali", {})
         segment = sonuclar.get("segment", {})
 
-        # Genel saglik skoru hesapla (0-100)
         skor = 100
 
-        # Maestro hata orani
-        maestro_hata = maestro.get("hata_orani", 0)
+        # Maestro basari orani
+        maestro_basari = maestro.get("basari_orani", 1.0)
+        maestro_hata = 1.0 - maestro_basari
         if maestro_hata > 0.30:
             skor -= 30
         elif maestro_hata > 0.15:
             skor -= 15
 
-        # Ardisik hata alarmi
         if maestro.get("ardisik_hata_alarmi"):
             skor -= 25
 
-        # Aktif anomali sayisi
-        aktif_anomali = anomali.get("aktif_anomali", 0)
+        # Aktif anomaliler (in-memory DB'den)
+        aktif_anomali = len(self.db.get_aktif_anomaliler())
         skor -= min(aktif_anomali * 5, 20)
 
-        # Segment basari orani dusuk
+        # Segment dusuk performans
         dusuk_performans = segment.get("dusuk_performans", [])
         skor -= min(len(dusuk_performans) * 5, 15)
 
@@ -99,9 +155,7 @@ class ReportGenerator:
                 "kpi_after_doldurulan": kpi.get("kpi_after_doldurulan", 0),
             },
             "anomaliler": {
-                "aktif":      anomali.get("aktif_anomali", 0),
-                "yeni":       anomali.get("yeni_anomali", 0),
-                "detaylar":   anomali.get("yeni_detaylar", []),
+                "aktif": aktif_anomali,
             },
             "segment_sagligi": {
                 "olculebilir_karar":  segment.get("olculebilir_karar", 0),
@@ -109,47 +163,37 @@ class ReportGenerator:
             },
         }
 
-    # ------------------------------------------ Onay bekliyor bölümü
+    # ------------------------------------------ Onay bekliyor
     def _onay_bekliyor(self, sonuclar: dict) -> dict:
-        oneriler   = sonuclar.get("oneriler", [])
-        proposals_dir = self.data_dir / "agent4" / "proposals" / "bekleyen"
-
-        # Mevcut bekleyen dosyalari say
-        bekleyen_dosyalar = sorted(proposals_dir.glob("ONR-*.json")) if proposals_dir.exists() else []
-        bekleyen_sayisi   = len(bekleyen_dosyalar)
-
-        oneri_ozet = []
-        for d in bekleyen_dosyalar[:10]:   # Max 10 göster
-            try:
-                with open(d, encoding="utf-8") as f:
-                    o = json.load(f)
-                oneri_ozet.append({
-                    "id":       o["id"],
-                    "kategori": o["kategori"],
-                    "ne":       o["ne"],
-                    "kazanim":  o["kazanim"],
-                })
-            except Exception:
-                continue
+        oneriler = sonuclar.get("oneriler", [])
+        bekleyen_sayisi = 0
+        try:
+            sdb = self._get_sdb()
+            row = sdb._fetch_one("""
+                SELECT COUNT(*) FROM proposals
+                WHERE hesap_key = %s AND marketplace = %s
+                  AND status IN ('PENDING', 'BEKLIYOR')
+            """, (self.hesap_key, self.marketplace))
+            bekleyen_sayisi = row[0] if row else 0
+        except Exception:
+            pass
 
         return {
             "bekleyen_oneri_sayisi": bekleyen_sayisi,
             "bu_calisma_uretilen":   len(oneriler),
-            "goruntuleme_komutu":    "python agent4/optimizer.py oneri listele",
-            "oneriler":              oneri_ozet,
+            "goruntuleme_komutu":    f"python agent4/optimizer.py {self.hesap_key} {self.marketplace} oneri listele",
         }
 
     # ------------------------------------------ Kisa ozet
     def _ozet(self, sonuclar: dict) -> str:
-        maestro = sonuclar.get("maestro", {})
-        anomali = sonuclar.get("anomali", {})
+        maestro  = sonuclar.get("maestro", {})
+        kpi      = sonuclar.get("kpi", {})
         oneriler = sonuclar.get("oneriler", [])
-        kpi     = sonuclar.get("kpi", {})
 
         parcalar = []
         parcalar.append(f"Pipeline: {maestro.get('tamamlanan', 0)}/{maestro.get('toplam_session', 0)} session basarili")
         parcalar.append(f"KPI: {kpi.get('kpi_after_doldurulan', 0)} karar guncellendi")
-        parcalar.append(f"Anomali: {anomali.get('aktif_anomali', 0)} aktif")
+        parcalar.append(f"Anomali: {len(self.db.get_aktif_anomaliler())} aktif")
         parcalar.append(f"Oneri: {len(oneriler)} yeni")
 
         if maestro.get("ardisik_hata_alarmi"):
@@ -173,7 +217,7 @@ class ReportGenerator:
               f"Agent2={sg['hata_ozeti']['agent2_toplam']} "
               f"Agent3={sg['hata_ozeti']['agent3_toplam']} "
               f"Kalip={sg['hata_ozeti']['tekrar_eden_kalip']}")
-        print(f"  Anomali        : {sg['anomaliler']['aktif']} aktif, {sg['anomaliler']['yeni']} yeni")
+        print(f"  Anomali        : {sg['anomaliler']['aktif']} aktif")
 
         if sg["pipeline"]["ardisik_hata"]:
             print("  [!] KRITIK: Son 3 session ardisik hata!")
@@ -202,21 +246,25 @@ class ReportGenerator:
 
 
 # ------------------------------------------------------------------ CLI
-def cmd_durum(data_dir):
-    """Son durum raporunu konsola yazdirir."""
-    rapor_dir = Path(data_dir) / "agent4" / "raporlar"
-    if not rapor_dir.exists():
-        print("Henuz durum raporu yok. Once Agent 4'u calistirin.")
-        return
+def cmd_durum(hesap_key, marketplace):
+    """Son durum raporunu Supabase'den okuyarak konsola yazdirir."""
+    try:
+        from supabase.db_client import SupabaseClient
+        sdb = SupabaseClient()
+        row = sdb._fetch_one("""
+            SELECT report_date, health_score, health_status, report_text
+            FROM status_reports
+            WHERE hesap_key = %s AND marketplace = %s
+            ORDER BY report_date DESC LIMIT 1
+        """, (hesap_key, marketplace))
 
-    dosyalar = sorted(rapor_dir.glob("*_durum_raporu.json"))
-    if not dosyalar:
-        print("Henuz durum raporu yok.")
-        return
+        if not row:
+            print("Henuz durum raporu yok. Once Agent 4'u calistirin.")
+            return
 
-    son_rapor = dosyalar[-1]
-    with open(son_rapor, encoding="utf-8") as f:
-        rapor = json.load(f)
-
-    print(f"\nSon rapor: {son_rapor.name}")
-    print(json.dumps(rapor["ozet"], indent=2, ensure_ascii=False))
+        print(f"\nSon rapor: {row[0]}")
+        print(f"Saglik: {row[1]}/100 [{row[2]}]")
+        if row[3]:
+            print(row[3])
+    except Exception as e:
+        print(f"Supabase hatasi: {e}")
