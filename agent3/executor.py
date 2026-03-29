@@ -1180,12 +1180,35 @@ def find_advertised_asin(campaign_id, ad_group_id, today=None):
     if today is None:
         today = datetime.utcnow().strftime("%Y-%m-%d")
 
-    # Yontem 1: SP Product Ads (en guvenilir)
+    # Yontem 1: Supabase product_ads (en guvenilir)
+    hk = os.environ.get("HESAP_KEY", "")
+    mp = os.environ.get("MARKETPLACE", "")
+    if hk and mp:
+        try:
+            from data_loader import load_product_ads
+            ads = load_product_ads(hk, mp, str(DATA_DIR), today)
+            if ads:
+                for ad in ads:
+                    if str(ad.get("campaignId", "")) == campaign_id:
+                        if ad_group_id and str(ad.get("adGroupId", "")) == ad_group_id:
+                            asin = ad.get("asin", "")
+                            sku = ad.get("sku", "")
+                            if asin:
+                                return _format_asin(asin), sku, None
+                for ad in ads:
+                    if str(ad.get("campaignId", "")) == campaign_id:
+                        asin = ad.get("asin", "")
+                        sku = ad.get("sku", "")
+                        if asin:
+                            return _format_asin(asin), sku, "Ad group eslesmedi, kampanyadaki ilk ASIN kullanildi"
+        except Exception:
+            pass
+
+    # Yontem 2: JSON product_ads fallback
     fpath = DATA_DIR / f"{today}_sp_product_ads.json"
     if fpath.exists():
         with open(fpath, "r", encoding="utf-8") as f:
             ads = json.load(f)
-        # Oncelik: kampanya + ad group eslesmesi
         for ad in ads:
             if str(ad.get("campaignId", "")) == campaign_id:
                 if ad_group_id and str(ad.get("adGroupId", "")) == ad_group_id:
@@ -1193,7 +1216,6 @@ def find_advertised_asin(campaign_id, ad_group_id, today=None):
                     sku = ad.get("sku", "")
                     if asin:
                         return _format_asin(asin), sku, None
-        # Fallback: sadece kampanya eslesmesi
         for ad in ads:
             if str(ad.get("campaignId", "")) == campaign_id:
                 asin = ad.get("asin", "")
@@ -1201,7 +1223,7 @@ def find_advertised_asin(campaign_id, ad_group_id, today=None):
                 if asin:
                     return _format_asin(asin), sku, "Ad group eslesmedi, kampanyadaki ilk ASIN kullanildi"
 
-    # Yontem 2: SP Targeting raporundan advertisedAsin (fallback — SKU yok)
+    # Yontem 3: Targeting raporlarindan advertisedAsin (fallback — SKU yok)
     for suffix in ["sp_targeting_report_14d", "sp_search_term_report_30d"]:
         fpath = DATA_DIR / f"{today}_{suffix}.json"
         if not fpath.exists():
@@ -1212,7 +1234,7 @@ def find_advertised_asin(campaign_id, ad_group_id, today=None):
             if str(row.get("campaignId", "")) == campaign_id:
                 asin = row.get("advertisedAsin", row.get("advertised_asin", ""))
                 if asin:
-                    return _format_asin(asin), "", f"Product ads dosyasi bulunamadi, {suffix}'den alindi (SKU eksik olabilir)"
+                    return _format_asin(asin), "", f"Product ads'den bulunamadi, {suffix}'den alindi (SKU eksik olabilir)"
 
     return None, "", "Hedeflenen ASIN bulunamadi (product_ads + targeting raporlari kontrol edildi)"
 

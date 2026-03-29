@@ -98,31 +98,22 @@ def _build_status_report(collect_ok, analyze_ok, session_id, targets):
             pipelines = [p for p in pipelines
                          if (p["hesap_key"], p["marketplace"]) in target_set]
 
-        def _count_campaigns(data_dir, prefix):
-            """Entity dosyasindan kampanya sayisini don. -1 = dosya yok (guvenli tarafta kal)."""
-            fpath = data_dir / f"{PIPELINE_DATE}_{prefix}.json"
-            if not fpath.exists():
-                from datetime import timedelta as _td
-                dun = (datetime.strptime(PIPELINE_DATE, "%Y-%m-%d") - _td(days=1)).strftime("%Y-%m-%d")
-                fpath = data_dir / f"{dun}_{prefix}.json"
-            if not fpath.exists():
-                return -1
-            try:
-                with open(fpath, "r") as f:
-                    data = json.load(f)
-                return len(data) if isinstance(data, list) else 0
-            except Exception:
-                return -1
-
         for p in pipelines:
             hk = p["hesap_key"]
             mp = p["marketplace"]
 
-            # Smart-skip: entity dosyalarindan kampanya sayilarini kontrol et
+            # Smart-skip: Supabase-first kampanya sayisi kontrolu
             data_dir = BASE_DIR / "data" / f"{hk}_{mp}"
-            sp_count = _count_campaigns(data_dir, "sp_campaigns")
-            sb_count = _count_campaigns(data_dir, "sb_campaigns")
-            sd_count = _count_campaigns(data_dir, "sd_campaigns")
+            try:
+                from data_loader import count_campaigns as _count_camp
+                sp_count = _count_camp(hk, mp, "SP", str(data_dir), PIPELINE_DATE)
+                sb_count = _count_camp(hk, mp, "SB", str(data_dir), PIPELINE_DATE)
+                sd_count = _count_camp(hk, mp, "SD", str(data_dir), PIPELINE_DATE)
+            except Exception:
+                # data_loader import basarisiz — guvenli tarafta kal
+                sp_count = -1
+                sb_count = -1
+                sd_count = -1
 
             beklenen_mp = []
             if sp_count != 0:  # -1 (dosya yok) durumunda da bekle (guvenli taraf)

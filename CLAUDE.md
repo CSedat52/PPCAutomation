@@ -48,6 +48,7 @@ amazon-ppc-automation/
 +-- .env                                 # Maestro e-posta ayarlari
 +-- CLAUDE.md                            # Bu dosya
 +-- pipeline_runner.py                   # Saf Python pipeline ($0 maliyet — cron bunu cagirmali)
++-- data_loader.py                       # Supabase-first, JSON-fallback veri yukleme modulu
 +-- log_utils.py                         # Ortak hata taksonomisi ve log yardimci fonksiyonlari
 +-- parallel_collector.py                # Paralel veri toplayici (Agent 1 paralel)
 +-- parallel_analyzer.py                 # Paralel analizci (Agent 2 paralel)

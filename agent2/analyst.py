@@ -214,7 +214,28 @@ def load_json_file(filepath):
 
 
 def load_all_agent1_data():
-    """Agent 1'in tum dosyalarini yukler ve organize eder."""
+    """
+    Agent 1'in tum dosyalarini yukler ve organize eder.
+    Supabase-first: data_loader uzerinden Supabase raw_data'dan okur.
+    JSON fallback: Supabase basarisiz olursa JSON dosyalarina doner.
+    """
+    hk = os.environ.get("HESAP_KEY", "")
+    mp = os.environ.get("MARKETPLACE", "")
+
+    if hk and mp:
+        try:
+            from data_loader import load_all_agent1_data as _load_supabase
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            data = _load_supabase(hk, mp, str(DATA_DIR), today)
+            # Kritik kontrol: SP kampanya verisi var mi?
+            if data.get("sp", {}).get("campaigns"):
+                logger.info("Agent 1 verileri Supabase'den yuklendi (data_loader)")
+                return data
+            logger.warning("Supabase'den SP kampanya verisi bos, JSON fallback")
+        except Exception as e:
+            logger.warning("data_loader basarisiz, JSON fallback: %s", e)
+
+    # JSON fallback (eski yontem)
     data = {
         "portfolios": load_json_file(find_latest_data_file("portfolios")),
         "sp": {
@@ -238,7 +259,6 @@ def load_all_agent1_data():
         "reports": {},
     }
 
-    # v7: Sadece kullanilan raporlar (14 dosya toplam)
     report_files = [
         ("sp_targeting_report", 14),
         ("sp_search_term_report", 30),
@@ -1548,6 +1568,40 @@ def save_decisions(bid_results, today):
 # ============================================================================
 
 def preflight_check(today):
+    """
+    Supabase-first: Önce Supabase'de kritik veriler var mı kontrol et.
+    Fallback: JSON dosyalarını kontrol et.
+    """
+    hk = os.environ.get("HESAP_KEY", "")
+    mp = os.environ.get("MARKETPLACE", "")
+
+    # Supabase-first kontrol
+    if hk and mp:
+        try:
+            from data_loader import _fetch_count, check_report_exists
+            sp_camp = _fetch_count("campaigns", hk, mp, "AND ad_type = 'SP'")
+            sp_report = check_report_exists(hk, mp, "targeting_reports", "SP", today)
+
+            if sp_camp > 0 and sp_report:
+                logger.info("Preflight Supabase: SP kampanya=%d, targeting rapor=VAR", sp_camp)
+                uyarilar = []
+                # Opsiyonel kontroller
+                sb_camp = _fetch_count("campaigns", hk, mp, "AND ad_type = 'SB'")
+                sd_camp = _fetch_count("campaigns", hk, mp, "AND ad_type = 'SD'")
+                if sb_camp == 0:
+                    uyarilar.append("SB kampanya yok — SB analizi kisitli olabilir.")
+                if sd_camp == 0:
+                    uyarilar.append("SD kampanya yok — SD analizi kisitli olabilir.")
+                return True, f"On kontrol gecti (Supabase). SP={sp_camp} kampanya. Tarih: {today}", uyarilar
+
+            if sp_camp == 0:
+                logger.warning("Preflight Supabase: SP kampanya=0, JSON fallback deneniyor")
+            if not sp_report:
+                logger.warning("Preflight Supabase: SP targeting raporu yok, JSON fallback deneniyor")
+        except Exception as e:
+            logger.warning("Preflight Supabase basarisiz, JSON fallback: %s", e)
+
+    # JSON fallback
     kritik_dosyalar = [
         f"{today}_sp_campaigns.json",
         f"{today}_sp_targeting_report_14d.json",
@@ -1602,7 +1656,7 @@ def preflight_check(today):
 
     mevcut = len(kritik_dosyalar) + len(opsiyonel_dosyalar) - len(eksik_opsiyonel)
     toplam = len(kritik_dosyalar) + len(opsiyonel_dosyalar)
-    mesaj = f"On kontrol gecti. {mevcut}/{toplam} dosya mevcut. Tarih: {today}"
+    mesaj = f"On kontrol gecti (JSON fallback). {mevcut}/{toplam} dosya mevcut. Tarih: {today}"
 
     return True, mesaj, uyarilar
 
