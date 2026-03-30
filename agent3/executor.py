@@ -132,13 +132,14 @@ def load_settings():
             db = SupabaseClient()
             conn = db._conn()
             cur = conn.cursor()
-            cur.execute("SELECT genel_ayarlar, esik_degerleri, asin_hedefleri, segmentasyon_kurallari, agent3_ayarlari FROM settings WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+            cur.execute("SELECT genel_ayarlar, esik_degerleri, asin_hedefleri, segmentasyon_kurallari, agent3_ayarlari, ozel_kurallar, negatif_keyword_kurali, yeni_keyword_kurali, harvesting_ayarlari FROM settings WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
             row = cur.fetchone()
             cur.close()
             conn.close()
             if row:
                 result = {}
-                for i, key in enumerate(["genel_ayarlar", "esik_degerleri", "asin_hedefleri", "segmentasyon_kurallari", "agent3_ayarlari"]):
+                keys = ["genel_ayarlar", "esik_degerleri", "asin_hedefleri", "segmentasyon_kurallari", "agent3_ayarlari", "ozel_kurallar", "negatif_keyword_kurali", "yeni_keyword_kurali", "harvesting_ayarlari"]
+                for i, key in enumerate(keys):
                     if row[i]:
                         result[key] = row[i] if isinstance(row[i], dict) else json.loads(row[i])
                 logger.info("Settings Supabase'den yuklendi (%s/%s)", hk, mp)

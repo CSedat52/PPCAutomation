@@ -12,6 +12,7 @@ Kullanim:
 Cikti: Her marketplace icin tek satirlik ozet + toplam ozet tablo.
 """
 
+import os
 import sys
 import json
 import time
@@ -58,9 +59,12 @@ def parse_targets(args):
 def run_analyst(hesap_key, marketplace):
     """Tek bir marketplace icin agent2/analyst.py calistirir. Subprocess olarak."""
     try:
+        env = os.environ.copy()
+        env["HESAP_KEY"] = hesap_key
+        env["MARKETPLACE"] = marketplace
         result = subprocess.run(
             [sys.executable, str(BASE_DIR / "agent2" / "analyst.py"), hesap_key, marketplace],
-            capture_output=True, text=True, timeout=600, cwd=str(BASE_DIR)
+            capture_output=True, text=True, timeout=600, cwd=str(BASE_DIR), env=env
         )
 
         # analyst.py sonunda pretty-printed JSON ozet basar

@@ -130,17 +130,16 @@ def load_settings():
             db = SupabaseClient()
             conn = db._conn()
             cur = conn.cursor()
-            cur.execute("SELECT genel_ayarlar, esik_degerleri, asin_hedefleri, segmentasyon_kurallari, agent3_ayarlari FROM settings WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+            cur.execute("SELECT genel_ayarlar, esik_degerleri, asin_hedefleri, segmentasyon_kurallari, agent3_ayarlari, ozel_kurallar, negatif_keyword_kurali, yeni_keyword_kurali, harvesting_ayarlari FROM settings WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
             row = cur.fetchone()
             cur.close()
             conn.close()
             if row:
                 result = {}
-                if row[0]: result["genel_ayarlar"] = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-                if row[1]: result["esik_degerleri"] = row[1] if isinstance(row[1], dict) else json.loads(row[1])
-                if row[2]: result["asin_hedefleri"] = row[2] if isinstance(row[2], dict) else json.loads(row[2])
-                if row[3]: result["segmentasyon_kurallari"] = row[3] if isinstance(row[3], dict) else json.loads(row[3])
-                if row[4]: result["agent3_ayarlari"] = row[4] if isinstance(row[4], dict) else json.loads(row[4])
+                keys = ["genel_ayarlar", "esik_degerleri", "asin_hedefleri", "segmentasyon_kurallari", "agent3_ayarlari", "ozel_kurallar", "negatif_keyword_kurali", "yeni_keyword_kurali", "harvesting_ayarlari"]
+                for i, key in enumerate(keys):
+                    if row[i]:
+                        result[key] = row[i] if isinstance(row[i], dict) else json.loads(row[i])
                 logger.info("Settings Supabase'den yuklendi (%s/%s)", hk, mp)
                 return result
         except Exception as e:
@@ -2001,5 +2000,7 @@ if __name__ == "__main__":
         print("Kullanim: python agent2/analyst.py <hesap_key> <marketplace>")
         print("Ornek:    python agent2/analyst.py vigowood_na US")
         sys.exit(1)
+    os.environ.setdefault("HESAP_KEY", sys.argv[1])
+    os.environ.setdefault("MARKETPLACE", sys.argv[2])
     result = run_analysis(sys.argv[1], sys.argv[2])
     print(json.dumps(result, indent=2, ensure_ascii=False))
