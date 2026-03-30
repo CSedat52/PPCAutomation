@@ -198,6 +198,17 @@ def run(targets=None, force=False):
         force: True ise Supabase cache kontrolunu atla
     """
     session_id = f"runner_{PIPELINE_DATE}_{datetime.utcnow().strftime('%H%M%S')}"
+
+    # Agent status'leri sifirla — bugunun pipeline'i bastan basliyor
+    try:
+        from supabase.db_client import SupabaseClient
+        sdb = SupabaseClient()
+        for agent_name in ["agent1", "agent2", "agent3", "agent4"]:
+            sdb.update_agent_status_detail(agent_name, "idle")
+        logger.info("Agent status'leri sifirlandi")
+    except Exception as e:
+        logger.warning("Agent status sifirlama hatasi: %s", e)
+
     logger.info("=" * 60)
     logger.info("  PIPELINE RUNNER — %s", PIPELINE_DATE)
     logger.info("  Session: %s", session_id)

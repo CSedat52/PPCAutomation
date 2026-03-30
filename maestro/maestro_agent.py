@@ -949,10 +949,31 @@ def poll_execution_queue(filter_hesap=None, filter_marketplace=None):
         return []
 
     try:
-        # Eski pending kayitlari expire et (24 saatten eski)
+        # Kural: Gecmis gunlerden kalan pending → failed
         sdb._execute(
-            "UPDATE execution_queue SET status='expired', completed_at=NOW() "
-            "WHERE status='pending' AND requested_at < NOW() - INTERVAL '24 hours'")
+            "UPDATE execution_queue SET status='failed', completed_at=NOW(), "
+            "result='{\"error\": \"previous_day_pending\"}' "
+            "WHERE status='pending' AND requested_at::date < CURRENT_DATE")
+
+        # Kural: Stuck processing temizligi (1 saatten eski):
+        sdb._execute(
+            "UPDATE execution_queue SET status='failed', completed_at=NOW(), "
+            "result='{\"error\": \"stuck_processing_timeout\"}' "
+            "WHERE status='processing' AND started_at < NOW() - INTERVAL '1 hour'")
+
+        # Kural: Eski completed/failed kayitlari temizle (7 gunden eski):
+        sdb._execute(
+            "DELETE FROM execution_queue "
+            "WHERE status IN ('completed','failed','expired') "
+            "AND completed_at < NOW() - INTERVAL '7 days'")
+
+        # Kural: Agent log kayitlarini son 2000 ile sinirla (her agent icin):
+        for agent_id in ['agent1', 'agent2', 'agent3', 'agent4', 'maestro', 'pipeline_runner']:
+            sdb._execute(
+                "DELETE FROM agent_logs WHERE id IN ("
+                "  SELECT id FROM agent_logs WHERE agent_id = %s "
+                "  ORDER BY created_at DESC OFFSET 2000"
+                ")", (agent_id,))
 
         # Pending komutlari cek
         if filter_hesap and filter_marketplace:
@@ -1009,84 +1030,146 @@ def poll_execution_queue(filter_hesap=None, filter_marketplace=None):
 
 def _run_agent3_from_queue(hesap_key, marketplace):
     """
-    Dashboard onaylarindan Maestro'yu Claude Code uzerinden calistirir.
-    Claude Code CLAUDE.md'yi okuyarak Agent 3 + Agent 4 pipeline'ini yonetir.
+    Dashboard onaylarindan Agent 3 + Agent 4'u calistirir.
+    Agent 3: direkt Python (_run_agent3 fonksiyonu).
+    Agent 4 Asama 1: Python (optimizer.py subprocess).
+    Agent 4 Asama 2: Claude Code (CLAUDE.md'deki talimatlari okur).
     """
     config.init_account(hesap_key, marketplace)
     account_label = f"{hesap_key}/{marketplace}"
     logger.info("=" * 60)
-    logger.info("  QUEUE: MAESTRO CAGIRILIYOR — %s", account_label)
+    logger.info("  QUEUE: AGENT 3+4 BASLATILIYOR — %s", account_label)
     logger.info("=" * 60)
 
-    _save_log("info", f"Dashboard onayi alindi, Maestro baslatiliyor: {account_label}",
+    _save_log("info", f"Dashboard onayi alindi, Agent 3+4 baslatiliyor: {account_label}",
               "maestro", hesap_key, marketplace)
 
-    # Pipeline_runs'a Agent 3 basliyor yazisi — dashboard hemen gorsun
     queue_session_id = f"queue_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{hesap_key}_{marketplace}"
     sdb = _get_sdb()
+
+    # ===== AGENT 3 (direkt Python — Claude Code YOK) =====
+    state = state_manager.load_state()
+    if not state.get("current_session"):
+        session = state_manager.create_session(state)
+        session_id = session["session_id"]
+    else:
+        session_id = state["current_session"]["session_id"]
+
     if sdb:
         try:
             sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace, "agent3_execute", "running")
-        except Exception as e:
-            logger.warning("Supabase yazim hatasi: %s", e)
+        except Exception:
+            pass
 
+    agent3_success = _run_agent3(state, session_id, hesap_key, marketplace)
+
+    if not agent3_success:
+        logger.error("Agent 3 basarisiz: %s", account_label)
+        if sdb:
+            try:
+                sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace, "agent3_execute", "failed",
+                                         error_msg="Agent 3 basarisiz")
+            except Exception:
+                pass
+        return False
+
+    logger.info("Agent 3 tamamlandi: %s. Agent 4'e geciliyor...", account_label)
+
+    # ===== AGENT 4 ASAMA 1: Python Analiz ($0) =====
+    if sdb:
+        try:
+            sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace, "agent4", "running")
+            sdb.update_agent_status_detail("agent4", "running")
+        except Exception:
+            pass
+
+    agent4_python_ok = False
     try:
-        env_vars = {**os.environ,
-                    "HESAP_KEY": hesap_key,
-                    "MARKETPLACE": marketplace}
+        agent4_cmd = [
+            sys.executable,
+            os.path.join(config.BASE_DIR, "agent4", "optimizer.py"),
+            hesap_key, marketplace
+        ]
         result = subprocess.run(
-            ["claude", "-p",
-             f"maestro resume {hesap_key} {marketplace}. Agent 3'ten devam et. "
-             f"Kullaniciya soru sorma, otomatik calis. Watch moduna gecme, bitince cik.",
-             "--dangerously-skip-permissions"],
-            capture_output=True, text=True, timeout=3600,
-            cwd=config.BASE_DIR, env=env_vars,
+            agent4_cmd,
+            capture_output=True, text=True, timeout=600,
+            cwd=config.BASE_DIR,
+            env={**os.environ, "MAESTRO_SESSION_ID": session_id,
+                 "HESAP_KEY": hesap_key, "MARKETPLACE": marketplace},
         )
-        success = result.returncode == 0
-        if success:
-            logger.info("Maestro tamamlandi: %s", account_label)
-            _save_log("info", f"Maestro tamamlandi: {account_label}",
-                      "maestro", hesap_key, marketplace)
+        if result.returncode == 0:
+            agent4_python_ok = True
+            logger.info("Agent 4 Asama 1 (Python) basarili: %s", account_label)
         else:
-            logger.error("Maestro hatasi: %s — %s", account_label, result.stderr[:300])
-            _save_log("error", f"Maestro hatasi: {result.stderr[:200]}",
-                      "maestro", hesap_key, marketplace)
-            # Hata durumunda pipeline_runs guncelle
-            if sdb:
-                try:
-                    sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace,
-                                             "agent3_execute", "failed",
-                                             error_msg=result.stderr[:500])
-                except Exception as e:
-                    logger.warning("Supabase yazim hatasi: %s", e)
-        return success
+            logger.error("Agent 4 Python hata (exit %d): %s", result.returncode, result.stderr[-300:])
     except subprocess.TimeoutExpired:
-        logger.error("Maestro timeout (1 saat): %s", account_label)
-        _save_log("error", f"Maestro timeout: {account_label}",
-                  "maestro", hesap_key, marketplace)
-        if sdb:
-            try:
-                sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace,
-                                         "agent3_execute", "failed", error_msg="Maestro timeout (1 saat)")
-            except Exception as e:
-                logger.warning("Supabase yazim hatasi: %s", e)
-        return False
-    except FileNotFoundError:
-        logger.error("claude komutu bulunamadi. Claude Code kurulu mu?")
-        _save_log("error", "claude komutu bulunamadi",
-                  "maestro", hesap_key, marketplace)
-        return False
+        logger.error("Agent 4 Python timeout (10 dk): %s", account_label)
     except Exception as e:
-        logger.error("Maestro beklenmeyen hata: %s — %s", account_label, e)
-        _save_log("error", f"Maestro hatasi: {str(e)[:200]}",
-                  "maestro", hesap_key, marketplace)
-        if sdb:
+        logger.error("Agent 4 Python calistirilamadi: %s — %s", account_label, e)
+
+    # ===== AGENT 4 ASAMA 2: Claude Code Dinamik Analiz =====
+    # Python asamasi basariliysa ve agent4_analysis.json varsa Claude Code'u cagir.
+    # Claude Code CLAUDE.md'deki "Agent 4 Asama 2" bolumunu okuyarak ne yapacagini bilir.
+    # Claude Code basarisiz olursa pipeline DURMAZ — Python asamasinin sonuclari yeterli.
+    agent4_claude_ok = False
+    if agent4_python_ok:
+        analysis_path = os.path.join(
+            config.BASE_DIR, "data", f"{hesap_key}_{marketplace}",
+            "agent4", "agent4_analysis.json"
+        )
+        if os.path.exists(analysis_path):
+            logger.info("Agent 4 Asama 2 (Claude Code) baslatiliyor: %s", account_label)
             try:
-                sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace,
-                                         "agent3_execute", "failed", error_msg=str(e)[:500])
+                claude_prompt = (
+                    f"CLAUDE.md oku. 'Agent 4 — Asama 2: Claude Code Dinamik Analiz' "
+                    f"bolumundeki talimatlari takip et.\n"
+                    f"Hesap: {hesap_key}/{marketplace}\n"
+                    f"Analiz dosyasi: {analysis_path}\n"
+                    f"Kullaniciya soru sorma, otomatik calis, bitince cik."
+                )
+                result = subprocess.run(
+                    ["claude", "-p", claude_prompt, "--dangerously-skip-permissions"],
+                    capture_output=True, text=True, timeout=300,
+                    cwd=config.BASE_DIR,
+                    env={**os.environ, "MAESTRO_SESSION_ID": session_id,
+                         "HESAP_KEY": hesap_key, "MARKETPLACE": marketplace},
+                )
+                if result.returncode == 0:
+                    agent4_claude_ok = True
+                    logger.info("Agent 4 Asama 2 (Claude Code) basarili: %s", account_label)
+                else:
+                    logger.warning("Agent 4 Claude Code hata (exit %d) — Python sonuclari yeterli",
+                                    result.returncode)
+            except FileNotFoundError:
+                logger.warning("claude komutu bulunamadi — Asama 2 atlandi, Python sonuclari yeterli")
+            except subprocess.TimeoutExpired:
+                logger.warning("Agent 4 Claude Code timeout (5 dk) — Python sonuclari yeterli")
             except Exception as e:
-                logger.warning("Supabase yazim hatasi: %s", e)
-        return False
+                logger.warning("Agent 4 Claude Code hatasi: %s — Python sonuclari yeterli", e)
+        else:
+            logger.warning("agent4_analysis.json bulunamadi: %s — Asama 2 atlandi", analysis_path)
+
+    # Agent 4 status guncelle
+    if sdb:
+        try:
+            a4_status = "completed" if agent4_python_ok else "failed"
+            sdb.upsert_pipeline_run(queue_session_id, hesap_key, marketplace, "agent4", a4_status)
+            sdb.update_agent_status_detail("agent4", a4_status, {
+                "python_ok": agent4_python_ok,
+                "claude_ok": agent4_claude_ok,
+            })
+        except Exception:
+            pass
+
+    # Pipeline tamamlandi
+    _save_log("info",
+              f"Agent 3+4 tamamlandi: {account_label} "
+              f"(A3={'OK' if agent3_success else 'FAIL'}, "
+              f"A4-Python={'OK' if agent4_python_ok else 'FAIL'}, "
+              f"A4-Claude={'OK' if agent4_claude_ok else 'SKIP'})",
+              "maestro", hesap_key, marketplace)
+
+    return agent3_success  # Agent 4 hatasi pipeline'i FAIL yapmaz
 
 
 def watch_queue(interval_minutes=5):

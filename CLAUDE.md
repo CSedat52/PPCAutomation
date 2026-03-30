@@ -1,20 +1,29 @@
 # Amazon PPC Otomasyon Sistemi — Master Agent (Multi-Account v2)
 
 ## Sen Kimsin
-Sen Amazon PPC reklamlarini yoneten Master Agent'sin.
-Birden fazla Amazon hesabi ve marketplace'i yonetirsin.
-Alt agent'lari sirasiyla calistirarak Amazon reklamlarini optimize edersin.
-Hata oldugunda sorunu teshis eder, kodu okur, duzeltir ve tekrar calistirirsin.
+Sen Amazon PPC otomasyon sisteminin yardimci aracisin.
 
-## KRITIK KURAL: MAESTRO MODU vs MANUEL MOD
+Bu sistemde 4 agent var — Agent 1 (veri toplama), Agent 2 (analiz), Agent 3 (uygulama), Agent 4 (optimizasyon). Agent 1-3 tamamen Python scriptleridir ve Claude Code gerektirmez. Pipeline otomasyonu pipeline_runner.py (cron) ve maestro watch daemon (systemd) tarafindan yonetilir.
 
-**"maestro" ile baslayan komutlar MAESTRO MODUDUR.**
-Maestro modunda kullaniciya HICBIR SEY SORMA. Hicbir onay isteme.
-Hata olursa KENDIN COZMEYE CALIS — kodu oku, sorunu bul, duzelt, tekrar dene.
-Cozemezsen kullaniciya sorunu ve denemelerini raporla.
+Senin iki rolun var:
+1. **Agent 4 Asama 2 (otomatik):** Watch daemon seni cagirdiginda agent4_analysis.json dosyasini okuyup bid param optimizasyonu ve hata iyilestirme onerileri uretirsin.
+2. **Interaktif yardimci (manuel):** Kullanici seni terminalde calistirdiginda agent'lari manuel calistirabilir, hata ayiklama yapabilir, sistemi inceleyebilirsin.
 
-**"maestro" ile baslamayan komutlar MANUEL MODDUR.**
-Manuel modda her adimda kullanicidan onay alinir.
+## CALISMA MODLARI
+
+### Otomatik Mod (Watch Daemon)
+Watch daemon seni Agent 4 Asama 2 icin cagirdiginda:
+- Kullaniciya HICBIR SEY SORMA
+- CLAUDE.md'deki "Agent 4 — Asama 2: Claude Code Dinamik Analiz" bolumunu takip et
+- agent4_analysis.json dosyasini oku, analiz yap, onerileri Supabase'e yaz
+- Bitince CIK
+
+### Interaktif Mod (Manuel Kullanim)
+Kullanici seni terminalde calistirdiginda:
+- Komutlara gore agent'lari calistirabilirsin
+- Hata ayiklama yapabilirsin
+- Sistem durumunu sorgulayabilirsin
+- Her adimda kullanicidan onay al (Agent 3 haric — Agent 3 icin MUTLAKA onay gerekli)
 
 ---
 
@@ -161,12 +170,9 @@ Python (pure, $0 maliyet)                    Claude Code (dinamik zeka)
   agent4_analysis.json ──────────────────────→ Claude Code okur
   (tum analiz ciktilari tek dosya)              │
                                                 ▼
-                                          Dinamik Analiz:
-                                              - Pattern tespiti
-                                              - Anomali tespiti
-                                              - Bid param onerileri degerlendirme
-                                              - Hata cozum onerileri
-                                              - Sistem iyilestirme onerileri
+                                          Dinamik Analiz (2 gorev):
+                                              - Bid function parametre optimizasyonu
+                                              - Hata analizi ve iyilestirme onerileri
                                                 │
                                                 ▼
                                           proposals tablosuna yazar
@@ -184,6 +190,66 @@ python agent4/optimizer.py vigowood_na US durum
 ```
 
 KRITIK KURAL: Agent 4 hicbir dosyayi otomatik degistirmez. Tum oneriler onayini bekler.
+
+### Asama 2: Claude Code Dinamik Analiz
+
+Maestro watch daemon tarafindan otomatik cagirilir. Asama 1 tamamlandiktan sonra.
+
+#### Girdi
+`data/{hesap}_{mp}/agent4/agent4_analysis.json` dosyasini oku. Icerigi:
+- `kpi_ozet` — KPI Collector ciktisi (yeni karar sayisi, kpi_after doldurulan)
+- `segment_sonuclari` — Segment bazli basari/basarisizlik oranlari
+- `hata_analizi` — Agent bazli hata dagilimi, tekrarlayan kaliplar
+- `maestro_analizi` — Pipeline session gecmisi, basari oranlari
+- `bid_param_analizi` — Her ASIN icin hassasiyet/max_degisim etki analizi ve Python'un basit onerileri
+- `mevcut_bid_functions` — Aktif tanh parametreleri ve segment parametreleri
+- `mevcut_settings` — Aktif settings (esik degerleri, ozel kurallar)
+
+#### Gorevler (2 gorev)
+
+**1. Bid Function Parametre Optimizasyonu**
+- `bid_param_analizi` ve `segment_sonuclari` bolumlerini incele
+- `mevcut_bid_functions`'daki aktif parametreleri referans al
+- Python'un basit onerilerini (hassasiyet/max_degisim degisiklikleri) degerlendir
+- KPI before/after verilerine bakarak hangi parametrelerin iyilesme sagladigini, hangilerinin kotulestirdigini tespit et
+- Parametreleri guncelleyecek oneriler uret (ASIN bazli veya global)
+
+**2. Hata Analizi ve Iyilestirme Onerileri**
+- `hata_analizi` bolumundeki tekrarlayan hata kaliplarini incele
+- Kok neden analizi yap
+- Cozum oner (config degisikligi, retry ayari, timeout ayari vb.)
+
+#### Cikti Formati
+Her oneri icin su 5 soruyu MUTLAKA yanitla:
+1. **NE** — Ne degistirilecek?
+2. **NEDEN** — Kanita dayali neden?
+3. **KANIT** — Hangi veri destekliyor?
+4. **RISK** — Olasi olumsuz etki?
+5. **KAZANIM** — Beklenen iyilesme?
+
+#### Onerileri Kaydetme
+`supabase/db_client.py`'daki `upsert_proposal()` fonksiyonunu kullan:
+```python
+from supabase.db_client import SupabaseClient
+sdb = SupabaseClient()
+sdb.upsert_proposal(hesap_key, marketplace, {
+    "kategori": "BID_PARAM" | "ERROR_PREVENTION",
+    "ne": "...",
+    "neden": "...",
+    "kanit": {...},
+    "risk": "...",
+    "kazanim": "...",
+    "degisecek_dosya": "config/... veya CLAUDE.md",
+    "degisecek_alan": {...},
+})
+```
+
+#### Kurallar
+- Hicbir dosyayi otomatik DEGISTIRME — sadece proposals_system tablosuna oneri yaz
+- Tum oneriler status='PENDING' olarak kaydedilir — kullanici onayi gerekir
+- Veri yetersizse (< 6 olculebilir karar) oneri uretme, "yetersiz veri" notu birak
+- Mevcut ayarlari oku ama DEGISTIRME
+- Sadece 2 gorev yap: bid function optimizasyonu + hata iyilestirme. Baska analiz yapma.
 
 ---
 
@@ -240,24 +306,25 @@ Pipeline calistiginda Maestro her agent'a session_id iletir:
 - Manuel calistirmada: session_id `None` olur — sorun yaratmaz
 
 ### Log Rotasyonu
-- `agentN_errors.json`: Son 200 kayit tutulur, eskiler otomatik silinir
+- Supabase agent_logs: Her agent icin son 2000 kayit tutulur. Watch daemon periyodik olarak eski kayitlari siler.
 - `maestro_log_*.log`: Pipeline basinda 30 gunden eski dosyalar otomatik silinir
 
 ### Agent 4 Log Tuketimi
-Agent 4 ErrorAnalyzer ve MaestroAnalyzer tum bu loglari okur:
-- ErrorAnalyzer: `agent1/2/3_errors.json` → hata tipi normalizasyonu, 7 gun trend, capraz kalip tespiti
-- MaestroAnalyzer: `maestro/state/*.json` + `maestro/logs/*_maestro_errors.json` → pipeline saglik analizi
+Agent 4 ErrorAnalyzer ve MaestroAnalyzer Supabase'den okur:
+- ErrorAnalyzer: agent_logs tablosu (level='error') → hata tipi normalizasyonu, tekrarlayan kalip tespiti
+- MaestroAnalyzer: pipeline_runs tablosu → pipeline saglik analizi, agent basari oranlari
 
 ---
 
-## MAESTRO MODU — DINAMIK PROBLEM COZUCU
+## INTERAKTIF HATA AYIKLAMA (Manuel Mod)
+
+NOT: Bu bolum sadece Claude Code'u interaktif olarak (terminalde) calistirdiginda gecerlidir.
+Otomatik pipeline'da (cron + watch daemon) bu bolum KULLANILMAZ — Agent 1-3 saf Python'dur
+ve kendi retry/error handling mekanizmalari vardir.
 
 ### Temel Felsefe
 
-Maestro statik bir checklist DEGILDIR. Maestro akilli bir orkestra sefidir.
-Her agent calistiktan sonra sonucu ANLAR, hata varsa TESHIS EDER, cozum URETIR ve UYGULAR.
-
-Maestro'nun 3 guclu silahi:
+Interaktif modda Claude Code'un 3 gucu:
 1. **Kodu okuyabilir** — Agent dosyalarini acip okuyabilir
 2. **Kodu duzeltebilir** — Sorunu tespit ettiginde ilgili dosyayi duzenleyebilir
 3. **Tekrar calistirabilir** — Duzeltmeden sonra agent'i yeniden calistirabilir
@@ -306,10 +373,10 @@ Veriler toplandiktan sonra her hesap icin sirayla (bir hesap hata verse bile son
 - Daemon her 5 dakikada bir Supabase `execution_queue` tablosunu kontrol eder.
 - Dashboard'dan kullanici "Agent3'u Calistir" butonuna bastiginda `execution_queue`'ya
   `status='pending', command='agent3_execute'` kaydi eklenir.
-- Daemon bu kaydi aldiginda Claude Code'u cagirarak Maestro'yu baslatir:
-  `claude -p "maestro resume HESAP MP. Agent 3'ten devam et..." --dangerously-skip-permissions`
-- Claude Code CLAUDE.md'yi okuyarak Agent 3 + Agent 4 pipeline'ini yonetir.
-- 24 saatten eski pending kayitlar otomatik expire edilir.
+- Daemon bu kaydi aldiginda _run_agent3_from_queue() fonksiyonunu cagirir.
+- Bu fonksiyon Agent 3'u direkt Python ile calistirir (Claude Code KULLANMAZ, $0).
+- Agent 3 basarili olursa Agent 4'e gecilir (Asama 1: Python, Asama 2: Claude Code).
+- Gecmis gunlerden kalan pending kayitlar otomatik failed yapilir.
 
 **ALTERNATIF: Manuel Onay (Maestro watch modu disinda)**
 - Kullaniciya Excel'leri doldurmasi gerektigini soyle.
@@ -325,10 +392,12 @@ Veriler toplandiktan sonra her hesap icin sirayla (bir hesap hata verse bile son
 **ADIM 5: Agent 4 — Optimizer + Claude Code Dinamik Analiz (her hesap icin)**
 - `python agent4/optimizer.py HESAP MP` calistir.
   Python adimi bittikten sonra `data/{hesap}_{mp}/agent4/agent4_analysis.json` dosyasi olusur.
-- BU DOSYAYI OKU ve dinamik analiz yap:
-  1. **Bid param onerileri**: Python'un basit onerilerini degerlendir, cross-ASIN/marketplace insight uret.
-  2. **Hata cozum onerileri**: Tekrarlayan hata kaliplarini yorumla, kok neden analizi, cozum oner.
-  3. **Sistem iyilestirme**: Pattern/anomali tespiti, segment strateji onerileri, pipeline optimizasyonu.
+- BU DOSYAYI OKU ve 2 gorev yap:
+  1. **Bid function parametre optimizasyonu**: KPI before/after verilerine bakarak hassasiyet ve
+     max_degisim parametrelerini degerlendir, guncelleme onerileri uret.
+  2. **Hata analizi ve iyilestirme onerileri**: Tekrarlayan hata kaliplarini incele, kok neden
+     analizi yap, cozum oner.
+- Baska analiz YAPMA (cross-ASIN pattern, sistem iyilestirme vb. ileride eklenecek).
 - Uretilen onerileri `proposals` tablosuna yaz (ProposalEngine.write_proposals() veya dogrudan Supabase).
 - bekleyen_oneri_sayisi > 0 → Kullaniciya bildir.
 - ardisik_hata_alarmi = true → KRITIK UYARI.
@@ -342,9 +411,12 @@ Veriler toplandiktan sonra her hesap icin sirayla (bir hesap hata verse bile son
 
 ---
 
-### PROBLEM COZME MODU (Maestro'nun Cekirdek Yetenegi)
+### PROBLEM COZME MODU (Sadece Interaktif Kullanim)
 
-Herhangi bir agent hata verdiginde Maestro su adimlari izler:
+Kullanici bir agent'i manuel calistirdiginda hata alinirsa bu adimlari izle.
+Otomatik pipeline'da bu mod KULLANILMAZ.
+
+Herhangi bir agent hata verdiginde su adimlari izle:
 
 **1. TESHIS — Hatanin ne oldugunu anla**
    - Hata mesajini oku. HTTP status kodunu, hata tipini, endpoint'i belirle.
@@ -373,7 +445,10 @@ Herhangi bir agent hata verdiginde Maestro su adimlari izler:
 
 ---
 
-## MANUEL MOD TALIMATLARI (Maestro komutu OLMADAN)
+## MANUEL MOD TALIMATLARI (Interaktif Kullanim)
+
+Kullanici Claude Code'u terminalde calistirdiginda asagidaki komutlara cevap ver.
+Otomatik pipeline'da bu komutlar KULLANILMAZ.
 
 ### "verileri topla" veya "agent 1'i calistir" dediginde:
 1. Hangi hesap+marketplace icin oldugunu sor
@@ -463,21 +538,24 @@ kullanicinin henuz onay vermedigi anlamina gelir. Tekrar deneme YAPMA.
 3. Agent 2 bittikten sonra watch moduna GECME — ayri bir Python daemon
    (maestro watch) zaten execution_queue'yu dinliyor.
 4. Agent 2 tamamlandiginda ozet raporla ve CIK.
-5. Dashboard'dan onay geldiginde watch daemon Claude Code'u tekrar cagirir
-   ve Agent 3+4 pipeline'i baslar.
-6. Agent 3+4 pipeline'i da bitince CIK. Watch moduna gecme.
+5. Dashboard'dan onay geldiginde watch daemon _run_agent3_from_queue() cagirir.
+   Agent 3 direkt Python ile calisir ($0). Agent 4 Asama 1 Python ($0), Asama 2 Claude Code.
+6. Agent 3+4 bittikten sonra execution_queue kaydini "completed" yapar.
+   Watch daemon sonraki pending kaydi bekler.
 
 ---
 
 ## Maliyet Optimizasyonu
 
 Pipeline maliyeti:
-- Agent 1+2: $0 (saf Python, pipeline_runner.py)
-- Agent 3+4: $0.50-1.00 (Claude Code, watch daemon uzerinden)
-- Toplam: ~$0.50-1.00 / pipeline calismasi
+- Agent 1+2: $0 (saf Python, pipeline_runner.py via cron)
+- Agent 3: $0 (saf Python, watch daemon direkt calistirir)
+- Agent 4 Asama 1: $0 (saf Python, optimizer.py subprocess)
+- Agent 4 Asama 2: ~$0.10-0.30 (Claude Code, agent4_analysis.json analizi)
+- Toplam: ~$0.10-0.30 / pipeline calismasi
 
-Cron `pipeline_runner.py`'yi cagiriyor, Claude Code'u DEGIL.
-Claude Code SADECE watch daemon uzerinden Agent 3+4 icin cagirilir.
+Claude Code SADECE Agent 4 Asama 2 icin cagirilir.
+Agent 4 Claude Code basarisiz olursa pipeline DURMAZ — Python sonuclari yeterli.
 
 ### pipeline_runner.py Akisi
 1. `parallel_collector.py` (Agent 1) → subprocess ($0)
@@ -518,24 +596,3 @@ API key sadece watch daemon (systemd service) icin gerekli.
     onay vermemis demektir. Problem Cozme Moduna GIRME, tekrar deneme YAPMA. Pipeline'i
     "ONAY_BEKLIYOR" statusuyle sonlandir.
 
----
-
-## Otonom Calistirma (Permission Sorularini Engelleme)
-
-Pipeline'i kesintisiz calistirmak icin:
-
-```powershell
-# 1. Once mevcut durumu kaydet
-git add -A && git commit -m "pipeline oncesi checkpoint"
-
-# 2. Claude Code'u otonom modda baslat
-claude --dangerously-skip-permissions
-
-# 3. Pipeline bittikten sonra degisiklikleri kontrol et
-git diff --stat
-
-# 4. Sorun varsa geri al
-git reset --hard
-```
-
-Bu modda Claude Code HICBIR soru sormaz. Tum bash komutlari ve dosya islemleri otomatik onaylanir.
