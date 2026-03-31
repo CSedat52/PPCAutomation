@@ -48,6 +48,36 @@ if _maestro_base not in sys.path:
 from log_utils import save_error_log as _central_save_error_log, save_log as _save_log
 
 
+def _extract_outer_json(text):
+    """Son } karakterini bulup geriye dogru eslesme yaparak en distaki JSON objesini cikarir.
+    rfind('{') ic ice JSON'larda yanlis pozisyon buluyordu — bu yontem dogru eslestirir."""
+    end = text.rfind("}")
+    if end < 0:
+        return -1
+    depth = 0
+    in_string = False
+    escape_next = False
+    for i in range(end, -1, -1):
+        c = text[i]
+        if escape_next:
+            escape_next = False
+            continue
+        # Geriye dogru taramada bir onceki karakter backslash ise escape
+        if i > 0 and text[i - 1] == '\\' and in_string:
+            continue
+        if c == '"' and not escape_next:
+            in_string = not in_string
+        if in_string:
+            continue
+        if c == '}':
+            depth += 1
+        elif c == '{':
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
 def _get_sdb():
     """Supabase client al (hata olursa None don)."""
     try:
@@ -431,7 +461,7 @@ def _run_agent2(state, session_id, hesap_key, marketplace):
         # stdout'tan JSON sonucu parse et
         output = result.stdout.strip()
         # Son satirdan itibaren JSON bul
-        json_start = output.rfind("{")
+        json_start = _extract_outer_json(output)
         if json_start >= 0:
             return json.loads(output[json_start:])
         raise RuntimeError(f"Agent 2 JSON ciktisi alinamadi. Output: {output[:500]}")
@@ -517,7 +547,7 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
         if result.returncode != 0:
             raise RuntimeError(f"Agent 3 dry-run hatasi (code {result.returncode}): {result.stderr[:500]}")
         output = result.stdout.strip()
-        json_start = output.rfind("{")
+        json_start = _extract_outer_json(output)
         if json_start >= 0:
             return json.loads(output[json_start:])
         raise RuntimeError(f"Agent 3 dry-run JSON ciktisi alinamadi. Output: {output[:500]}")
@@ -580,7 +610,7 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
         if result.returncode != 0:
             raise RuntimeError(f"Agent 3 execution hatasi (code {result.returncode}): {result.stderr[:500]}")
         output = result.stdout.strip()
-        json_start = output.rfind("{")
+        json_start = _extract_outer_json(output)
         if json_start >= 0:
             return json.loads(output[json_start:])
         raise RuntimeError(f"Agent 3 execution JSON ciktisi alinamadi.")
@@ -633,7 +663,7 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
             cwd=config.BASE_DIR, env=env,
         )
         output = result.stdout.strip()
-        json_start = output.rfind("{")
+        json_start = _extract_outer_json(output)
         if json_start >= 0:
             return json.loads(output[json_start:])
         return {"durum": "DOGRULAMA_BILGI_YOK"}
