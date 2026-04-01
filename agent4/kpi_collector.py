@@ -175,10 +175,33 @@ class KPICollector:
         UYGULANDI + kpi_after=None olan kararlar icin
         targeting_reports tablosundan metrikleri ceker.
         Sure siniri YOK — collection_date > karar_tarihi olan ilk rapor kullanilir.
+        Max 50 karar islenir, tek batch sorgu ile.
         """
         bos_kararlar = self.db.get_kpi_after_bos()
         if not bos_kararlar:
             logger.info("Doldurulacak kpi_after yok.")
+            return
+
+        logger.info("kpi_after bos karar sayisi: %d (max 50 islenecek)", len(bos_kararlar))
+
+        # Max 50 karar isle
+        bos_kararlar = bos_kararlar[:50]
+
+        # Gecerli kararlari filtrele ve hedefleme_id'leri topla
+        gecerli_kararlar = []
+        tum_idler = set()
+        en_eski_tarih = None
+        for k in bos_kararlar:
+            hedefleme_id = k.get("hedefleme_id", "")
+            karar_tarihi = k.get("tarih", "")
+            if not hedefleme_id or not karar_tarihi:
+                continue
+            gecerli_kararlar.append(k)
+            tum_idler.add(hedefleme_id)
+            if en_eski_tarih is None or karar_tarihi < en_eski_tarih:
+                en_eski_tarih = karar_tarihi
+
+        if not gecerli_kararlar:
             return
 
         try:
@@ -187,41 +210,67 @@ class KPICollector:
             logger.warning("Supabase baglantisi kurulamadi: %s", e)
             return
 
-        for k in bos_kararlar:
-            hedefleme_id = k.get("hedefleme_id", "")
-            karar_tarihi = k.get("tarih", "")
+        # Tek batch sorgu ile tum targeting_reports verilerini cek
+        id_listesi = list(tum_idler)
+        placeholders = ",".join(["%s"] * len(id_listesi))
+        try:
+            rows = sdb._fetch_all("""
+                SELECT keyword_id, target_id, impressions, clicks, cost,
+                       sales, purchases, collection_date
+                FROM targeting_reports
+                WHERE hesap_key = %s AND marketplace = %s
+                  AND (keyword_id IN ({ph}) OR target_id IN ({ph}))
+                  AND collection_date > %s
+                ORDER BY collection_date ASC
+            """.format(ph=placeholders),
+                (self.hesap_key, self.marketplace,
+                 *id_listesi, *id_listesi, en_eski_tarih))
+        except Exception as e:
+            logger.warning("targeting_reports batch sorgu hatasi: %s", e)
+            return
 
-            if not hedefleme_id or not karar_tarihi:
+        if not rows:
+            logger.info("Hicbir karar icin targeting_reports verisi bulunamadi.")
+            return
+
+        # Sonuclari hedefleme_id -> collection_date sirali liste olarak indexle
+        # Her hedefleme_id icin en erken collection_date'i karar tarihine gore eslestirmek gerekiyor
+        rapor_map = {}  # hedefleme_id -> [(collection_date, row_data), ...]
+        for row in rows:
+            kw_id, tgt_id, impressions, clicks, cost, sales, purchases, collection_date = row
+            for rid in [str(kw_id or ""), str(tgt_id or "")]:
+                if rid and rid in tum_idler:
+                    if rid not in rapor_map:
+                        rapor_map[rid] = []
+                    rapor_map[rid].append((str(collection_date), impressions, clicks, cost, sales, purchases))
+
+        # Her karar icin eslestir
+        for k in gecerli_kararlar:
+            hedefleme_id = k["hedefleme_id"]
+            karar_tarihi = k["tarih"]
+
+            raporlar = rapor_map.get(hedefleme_id)
+            if not raporlar:
                 continue
 
-            try:
-                row = sdb._fetch_one("""
-                    SELECT impressions, clicks, cost, sales, purchases,
-                           acos, collection_date
-                    FROM targeting_reports
-                    WHERE hesap_key = %s AND marketplace = %s
-                      AND (keyword_id = %s OR target_id = %s)
-                      AND collection_date > %s
-                    ORDER BY collection_date ASC
-                    LIMIT 1
-                """, (self.hesap_key, self.marketplace,
-                      hedefleme_id, hedefleme_id, karar_tarihi))
-            except Exception:
+            # collection_date > karar_tarihi olan ilk raporu bul (liste zaten ASC sirali)
+            secilen = None
+            for rapor in raporlar:
+                if rapor[0] > karar_tarihi:
+                    secilen = rapor
+                    break
+
+            if not secilen:
                 continue
 
-            if not row:
-                continue
-
-            impressions, clicks, cost, sales, purchases, acos, collection_date = row
+            collection_date, impressions, clicks, cost, sales, purchases = secilen
             spend = float(cost or 0)
             sales_val = float(sales or 0)
             clicks_val = int(clicks or 0)
             orders_val = int(purchases or 0)
 
             calculated_acos = None
-            if acos is not None:
-                calculated_acos = float(acos)
-            elif sales_val > 0:
+            if sales_val > 0:
                 calculated_acos = round((spend / sales_val) * 100, 2)
 
             k["kpi_after"] = {
@@ -234,9 +283,9 @@ class KPICollector:
                 "cvr":         round((orders_val / clicks_val) * 100, 2) if clicks_val > 0 else 0.0,
                 "cpc":         round(spend / clicks_val, 3) if clicks_val > 0 else 0.0,
             }
-            k["kpi_after_tarih"] = str(collection_date)
+            k["kpi_after_tarih"] = collection_date
             k["kpi_after_gun_farki"] = (
-                datetime.strptime(str(collection_date), "%Y-%m-%d") -
+                datetime.strptime(collection_date, "%Y-%m-%d") -
                 datetime.strptime(karar_tarihi, "%Y-%m-%d")
             ).days
 
@@ -248,7 +297,7 @@ class KPICollector:
                     k["kpi_after"]
                 )
             except Exception as e:
-                logger.warning("Sessiz hata: %s", e)  # In-memory guncelleme yeterli, sync de yazacak
+                logger.warning("Sessiz hata: %s", e)
 
             ozet["kpi_after_doldurulan"] += 1
 
