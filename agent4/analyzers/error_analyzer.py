@@ -1,7 +1,7 @@
 """
 Agent 4 — Error Analyzer (v3 — Supabase Only)
 ================================================
-error_logs tablosundan okur, tekrar eden kaliplari tespit eder.
+agent_logs tablosundan (level='error') okur, tekrar eden kaliplari tespit eder.
 JSON dosya bagimliligi kaldirildi.
 """
 
@@ -60,8 +60,9 @@ class ErrorAnalyzer:
     def _analiz_agent(self, sdb, agent: str) -> dict:
         try:
             toplam_row = sdb._fetch_one("""
-                SELECT COUNT(*) FROM error_logs
-                WHERE hesap_key = %s AND marketplace = %s AND agent = %s
+                SELECT COUNT(*) FROM agent_logs
+                WHERE hesap_key = %s AND marketplace = %s AND agent_id = %s
+                  AND level = 'error'
             """, (self.hesap_key, self.marketplace, agent))
             toplam = toplam_row[0] if toplam_row else 0
 
@@ -71,39 +72,42 @@ class ErrorAnalyzer:
             sinir = (datetime.utcnow() - timedelta(days=30)).isoformat()
 
             son_30_row = sdb._fetch_one("""
-                SELECT COUNT(*) FROM error_logs
-                WHERE hesap_key = %s AND marketplace = %s AND agent = %s
-                  AND timestamp > %s
+                SELECT COUNT(*) FROM agent_logs
+                WHERE hesap_key = %s AND marketplace = %s AND agent_id = %s
+                  AND level = 'error' AND created_at > %s
             """, (self.hesap_key, self.marketplace, agent, sinir))
             son_30 = son_30_row[0] if son_30_row else 0
 
             tip_rows = sdb._fetch_all("""
-                SELECT error_type, COUNT(*) as cnt FROM error_logs
-                WHERE hesap_key = %s AND marketplace = %s AND agent = %s
+                SELECT error_type, COUNT(*) as cnt FROM agent_logs
+                WHERE hesap_key = %s AND marketplace = %s AND agent_id = %s
+                  AND level = 'error'
                 GROUP BY error_type ORDER BY cnt DESC LIMIT 10
             """, (self.hesap_key, self.marketplace, agent))
             tip_dagilimi = {r[0]: r[1] for r in (tip_rows or [])}
 
             adim_rows = sdb._fetch_all("""
-                SELECT step, COUNT(*) as cnt FROM error_logs
-                WHERE hesap_key = %s AND marketplace = %s AND agent = %s
-                GROUP BY step ORDER BY cnt DESC LIMIT 5
+                SELECT extra->>'step' as step, COUNT(*) as cnt FROM agent_logs
+                WHERE hesap_key = %s AND marketplace = %s AND agent_id = %s
+                  AND level = 'error'
+                GROUP BY extra->>'step' ORDER BY cnt DESC LIMIT 5
             """, (self.hesap_key, self.marketplace, agent))
             adim_dagilimi = {r[0]: r[1] for r in (adim_rows or [])}
 
             son_30_tip_rows = sdb._fetch_all("""
-                SELECT error_type, COUNT(*) as cnt FROM error_logs
-                WHERE hesap_key = %s AND marketplace = %s AND agent = %s
-                  AND timestamp > %s
+                SELECT error_type, COUNT(*) as cnt FROM agent_logs
+                WHERE hesap_key = %s AND marketplace = %s AND agent_id = %s
+                  AND level = 'error' AND created_at > %s
                 GROUP BY error_type ORDER BY cnt DESC LIMIT 5
             """, (self.hesap_key, self.marketplace, agent, sinir))
             son_30_tipler = {r[0]: r[1] for r in (son_30_tip_rows or [])}
 
             son_hata_row = sdb._fetch_one("""
-                SELECT timestamp, error_type, error_message, step
-                FROM error_logs
-                WHERE hesap_key = %s AND marketplace = %s AND agent = %s
-                ORDER BY timestamp DESC LIMIT 1
+                SELECT created_at, error_type, message, extra->>'step' as step
+                FROM agent_logs
+                WHERE hesap_key = %s AND marketplace = %s AND agent_id = %s
+                  AND level = 'error'
+                ORDER BY created_at DESC LIMIT 1
             """, (self.hesap_key, self.marketplace, agent))
             en_son_hata = None
             if son_hata_row:
@@ -159,9 +163,10 @@ class ErrorAnalyzer:
         try:
             kamp_rows = sdb._fetch_all("""
                 SELECT extra->>'kampanya' as kampanya, COUNT(*) as cnt
-                FROM error_logs
-                WHERE hesap_key = %s AND marketplace = %s AND agent = 'agent3'
-                  AND step = 'execution_plan'
+                FROM agent_logs
+                WHERE hesap_key = %s AND marketplace = %s AND agent_id = 'agent3'
+                  AND level = 'error'
+                  AND extra->>'step' = 'execution_plan'
                   AND extra->>'kampanya' IS NOT NULL
                 GROUP BY extra->>'kampanya'
                 HAVING COUNT(*) >= %s

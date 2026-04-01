@@ -32,8 +32,10 @@ class MaestroAnalyzer:
         # Pipeline gecmisi
         try:
             rows = sdb._fetch_all("""
-                SELECT session_id, status, agent1_status, agent2_status, agent3_status,
-                       started_at, completed_at, summary
+                SELECT session_id, status, current_step,
+                       started_at, completed_at, error_message,
+                       agent1_completed_at, agent2_completed_at,
+                       agent3_completed_at, agent4_completed_at
                 FROM pipeline_runs
                 WHERE hesap_key = %s AND marketplace = %s
                 ORDER BY started_at DESC
@@ -52,11 +54,14 @@ class MaestroAnalyzer:
         bekleyen   = sum(1 for r in rows if r[1] in ("RUNNING", "PARTIAL"))
 
         # Agent bazli basari oranlari
-        # rows columns: 0=session_id, 1=status, 2=agent1_status, 3=agent2_status, 4=agent3_status
+        # rows columns: 0=session_id, 1=status, 2=current_step,
+        #   3=started_at, 4=completed_at, 5=error_message,
+        #   6=agent1_completed_at, 7=agent2_completed_at,
+        #   8=agent3_completed_at, 9=agent4_completed_at
         agent_basari = {}
-        for agent_idx, agent_adi in [(2, "agent1"), (3, "agent2"), (4, "agent3")]:
-            tamamlanan_ag = sum(1 for r in rows if r[agent_idx] == "completed")
-            hatali_ag     = sum(1 for r in rows if r[agent_idx] == "failed")
+        for col_idx, agent_adi in [(6, "agent1"), (7, "agent2"), (8, "agent3")]:
+            tamamlanan_ag = sum(1 for r in rows if r[col_idx] is not None)
+            hatali_ag     = sum(1 for r in rows if r[col_idx] is None and r[1] == "FAILED")
             toplam_ag     = tamamlanan_ag + hatali_ag
             agent_basari[agent_adi] = {
                 "tamamlanan":  tamamlanan_ag,
