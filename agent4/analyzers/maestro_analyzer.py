@@ -1,7 +1,7 @@
 """
 Agent 4 — Maestro Analyzer (v3 — Supabase Only)
 ==================================================
-pipeline_runs ve maestro_errors tablolarindan okur.
+pipeline_runs ve agent_logs tablolarindan okur.
 Dosya bagimliligi (maestro/state/) kaldirildi.
 """
 
@@ -73,9 +73,10 @@ class MaestroAnalyzer:
         hata_sayac = Counter()
         try:
             hata_rows = sdb._fetch_all("""
-                SELECT agent, COUNT(*) as cnt FROM maestro_errors
+                SELECT agent_id as agent, COUNT(*) as cnt FROM agent_logs
                 WHERE hesap_key = %s AND marketplace = %s
-                GROUP BY agent
+                  AND level = 'error' AND agent_id = 'maestro'
+                GROUP BY agent_id
             """, (self.hesap_key, self.marketplace))
             for r in (hata_rows or []):
                 hata_sayac[r[0] or "bilinmiyor"] = r[1]
