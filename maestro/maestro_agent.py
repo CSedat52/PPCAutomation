@@ -74,8 +74,8 @@ def _extract_outer_json(text):
         elif c == '{':
             depth -= 1
             if depth == 0:
-                return i
-    return -1
+                return (i, end)
+    return (-1, -1)
 
 
 def _get_sdb():
@@ -461,9 +461,9 @@ def _run_agent2(state, session_id, hesap_key, marketplace):
         # stdout'tan JSON sonucu parse et
         output = result.stdout.strip()
         # Son satirdan itibaren JSON bul
-        json_start = _extract_outer_json(output)
+        json_start, json_end = _extract_outer_json(output)
         if json_start >= 0:
-            return json.loads(output[json_start:])
+            return json.loads(output[json_start:json_end+1])
         raise RuntimeError(f"Agent 2 JSON ciktisi alinamadi. Output: {output[:500]}")
 
     success, result, error_info = retry_handler.execute_with_retry(
@@ -547,9 +547,9 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
         if result.returncode != 0:
             raise RuntimeError(f"Agent 3 dry-run hatasi (code {result.returncode}): {result.stderr[:500]}")
         output = result.stdout.strip()
-        json_start = _extract_outer_json(output)
+        json_start, json_end = _extract_outer_json(output)
         if json_start >= 0:
-            return json.loads(output[json_start:])
+            return json.loads(output[json_start:json_end+1])
         raise RuntimeError(f"Agent 3 dry-run JSON ciktisi alinamadi. Output: {output[:500]}")
 
     success, dry_result, error_info = retry_handler.execute_with_retry(
@@ -610,9 +610,9 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
         if result.returncode != 0:
             raise RuntimeError(f"Agent 3 execution hatasi (code {result.returncode}): {result.stderr[:500]}")
         output = result.stdout.strip()
-        json_start = _extract_outer_json(output)
+        json_start, json_end = _extract_outer_json(output)
         if json_start >= 0:
-            return json.loads(output[json_start:])
+            return json.loads(output[json_start:json_end+1])
         raise RuntimeError(f"Agent 3 execution JSON ciktisi alinamadi.")
 
     success, exec_result, error_info = retry_handler.execute_with_retry(
@@ -663,9 +663,9 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
             cwd=config.BASE_DIR, env=env,
         )
         output = result.stdout.strip()
-        json_start = _extract_outer_json(output)
+        json_start, json_end = _extract_outer_json(output)
         if json_start >= 0:
-            return json.loads(output[json_start:])
+            return json.loads(output[json_start:json_end+1])
         return {"durum": "DOGRULAMA_BILGI_YOK"}
 
     _, verify_result, _ = retry_handler.execute_with_retry(
