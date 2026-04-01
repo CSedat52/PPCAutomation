@@ -69,7 +69,7 @@ class BidParamAnalyzer:
             from agent4.db_manager import DBManager
             db = DBManager(self.hesap_key, self.marketplace)
             db.load()
-            for k in db.get("karar_gecmisi", {}).get("kararlar", []):
+            for k in (db.get("karar_gecmisi") or {}).get("kararlar", []):
                 hid = k.get("hedefleme_id", "")
                 tarih = k.get("tarih", "")
                 if hid and tarih:

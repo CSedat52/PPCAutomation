@@ -80,7 +80,7 @@ class SegmentAnalyzer:
             }
             # kpi_after yok bid_recommendations'ta — in-memory DB'den eslestir
             a_met = {}
-            kararlar = self.db.get("karar_gecmisi", {}).get("kararlar", [])
+            kararlar = ( self.db.get("karar_gecmisi") or {} ).get("kararlar", [])
             hedefleme_id = ""  # eslestirme icin
             for k in kararlar:
                 if (k.get("segment") == segment and
