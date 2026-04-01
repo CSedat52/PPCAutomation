@@ -1,7 +1,7 @@
 """
 Agent 4 — Segment Analyzer (v3 — Supabase Only)
 ==================================================
-decision_history tablosundan direkt okur.
+bid_recommendations tablosundan direkt okur.
 Agent 2'nin 8 segmentinin gercekte ne kadar dogru calistigini olcer.
 
 Basari Kriteri:
@@ -43,29 +43,54 @@ class SegmentAnalyzer:
         return SupabaseClient()
 
     def analyze(self) -> dict:
-        """decision_history tablosundan APPLIED + kpi_after IS NOT NULL olanlari analiz et."""
+        """bid_recommendations tablosundan APPROVED/MODIFIED olanlari analiz et."""
         try:
             sdb = self._get_sdb()
             rows = sdb._fetch_all("""
-                SELECT segment, previous_bid, new_bid, metrics, kpi_after
-                FROM decision_history
+                SELECT segment, current_bid, recommended_bid, decision_bid,
+                       impressions, clicks, cost, sales, orders, acos, cvr, cpc,
+                       decision, decided_at
+                FROM bid_recommendations
                 WHERE hesap_key = %s AND marketplace = %s
-                  AND decision_status = 'APPLIED' AND kpi_after IS NOT NULL
+                  AND decision IN ('APPROVED', 'MODIFIED') AND decided_at IS NOT NULL
             """, (self.hesap_key, self.marketplace))
         except Exception as e:
-            logger.warning("decision_history okunamadi, fallback: %s", e)
+            logger.warning("bid_recommendations okunamadi, fallback: %s", e)
             return self._analyze_from_db()
 
         if not rows:
-            logger.info("Segment analizi: yeterli kpi_after verisi yok (Supabase).")
+            logger.info("Segment analizi: yeterli veri yok (Supabase).")
             return {"durum": "YETERSIZ_VERI", "olculebilir_karar": 0}
 
         seg_data = defaultdict(lambda: {"toplam": 0, "basarili": 0, "ornekler": []})
 
-        for segment, prev_bid, new_bid, metrics, kpi_after in rows:
+        for (segment, current_bid, recommended_bid, decision_bid,
+             impressions, clicks, cost, sales, orders, acos, cvr, cpc,
+             decision, decided_at) in rows:
             seg = segment or "BILINMIYOR"
-            b_met = metrics if isinstance(metrics, dict) else {}
-            a_met = kpi_after if isinstance(kpi_after, dict) else {}
+            b_met = {
+                "impressions": int(impressions or 0),
+                "clicks": int(clicks or 0),
+                "spend": float(cost or 0),
+                "sales": float(sales or 0),
+                "orders": int(orders or 0),
+                "acos": float(acos) if acos is not None else None,
+                "cvr": float(cvr) if cvr is not None else None,
+                "cpc": float(cpc) if cpc is not None else None,
+            }
+            # kpi_after yok bid_recommendations'ta — in-memory DB'den eslestir
+            a_met = {}
+            kararlar = self.db.get("karar_gecmisi", {}).get("kararlar", [])
+            hedefleme_id = ""  # eslestirme icin
+            for k in kararlar:
+                if (k.get("segment") == segment and
+                        k.get("onceki_bid") == float(current_bid or 0) and
+                        k.get("kpi_after")):
+                    a_met = k["kpi_after"]
+                    break
+
+            if not a_met:
+                continue  # kpi_after yoksa olculemez
 
             kriter = BASARI_KRITERLERI.get(seg)
             try:

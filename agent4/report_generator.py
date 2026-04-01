@@ -48,12 +48,13 @@ class ReportGenerator:
         rapor["analysis_dosyasi"] = str(analysis_path)
         logger.info("agent4_analysis.json kaydedildi: %s", analysis_path)
 
-        # Supabase status_reports
+        # Status raporu → agent_logs'a yaz (status_reports tablosu yok)
         try:
-            sdb = self._get_sdb()
-            sdb.insert_status_report(self.hesap_key, self.marketplace, rapor)
+            from log_utils import save_log
+            save_log("info", json.dumps(rapor, ensure_ascii=False, default=str),
+                     "agent4", self.hesap_key, self.marketplace)
         except Exception as e:
-            logger.warning("Status raporu Supabase'e yazilamadi: %s", e)
+            logger.warning("Status raporu yazilamadi: %s", e)
 
         # Konsol ozeti
         self._yazdir_ozet(rapor)
@@ -170,7 +171,7 @@ class ReportGenerator:
         try:
             sdb = self._get_sdb()
             row = sdb._fetch_one("""
-                SELECT COUNT(*) FROM proposals
+                SELECT COUNT(*) FROM proposals_system
                 WHERE hesap_key = %s AND marketplace = %s
                   AND status IN ('PENDING', 'BEKLIYOR')
             """, (self.hesap_key, self.marketplace))
@@ -247,15 +248,16 @@ class ReportGenerator:
 
 # ------------------------------------------------------------------ CLI
 def cmd_durum(hesap_key, marketplace):
-    """Son durum raporunu Supabase'den okuyarak konsola yazdirir."""
+    """Son durum raporunu agent_logs'tan okuyarak konsola yazdirir."""
     try:
         from supabase.db_client import SupabaseClient
         sdb = SupabaseClient()
         row = sdb._fetch_one("""
-            SELECT report_date, health_score, health_status, report_text
-            FROM status_reports
+            SELECT created_at, message
+            FROM agent_logs
             WHERE hesap_key = %s AND marketplace = %s
-            ORDER BY report_date DESC LIMIT 1
+              AND agent_id = 'agent4' AND level = 'info'
+            ORDER BY created_at DESC LIMIT 1
         """, (hesap_key, marketplace))
 
         if not row:
@@ -263,8 +265,13 @@ def cmd_durum(hesap_key, marketplace):
             return
 
         print(f"\nSon rapor: {row[0]}")
-        print(f"Saglik: {row[1]}/100 [{row[2]}]")
-        if row[3]:
-            print(row[3])
+        if row[1]:
+            try:
+                data = json.loads(row[1])
+                sg = data.get("sistem_sagligi", {})
+                print(f"Saglik: {sg.get('saglik_skoru', '?')}/100 [{sg.get('saglik_durumu', '?')}]")
+                print(f"Ozet: {data.get('ozet', '')}")
+            except (json.JSONDecodeError, TypeError):
+                print(row[1])
     except Exception as e:
         print(f"Supabase hatasi: {e}")

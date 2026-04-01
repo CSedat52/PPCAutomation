@@ -173,10 +173,8 @@ def _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor):
         return
 
     try:
-        # Karar gecmisi
+        # Karar gecmisi — kararlar zaten bid_recommendations'ta, ayri sync gerekmez
         kararlar = db._data.get("karar_gecmisi", {}).get("kararlar", [])
-        if kararlar:
-            sdb.upsert_decision_history(hesap_key, marketplace, kararlar)
 
         # ASIN profilleri
         profiller = db._data.get("asin_profilleri", {}).get("profiller", {})
@@ -196,9 +194,7 @@ def _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor):
         for kalip in db._data.get("kalip_kutuphanesi", {}).get("kaliplar", []):
             sdb.insert_pattern(hesap_key, marketplace, kalip)
 
-        # Durum raporu (zaten generate() icinde de yaziliyor, burada tekrar)
-        rapor_data = rapor.get("rapor_data", rapor)
-        sdb.insert_status_report(hesap_key, marketplace, rapor_data)
+        # Durum raporu — status_reports tablosu yok, generate() icinde agent_logs'a yaziliyor
 
         # Agent 4 status guncelle
         try:

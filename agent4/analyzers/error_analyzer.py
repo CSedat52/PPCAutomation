@@ -87,10 +87,10 @@ class ErrorAnalyzer:
             tip_dagilimi = {r[0]: r[1] for r in (tip_rows or [])}
 
             adim_rows = sdb._fetch_all("""
-                SELECT extra->>'step' as step, COUNT(*) as cnt FROM agent_logs
+                SELECT details->>'step' as step, COUNT(*) as cnt FROM agent_logs
                 WHERE hesap_key = %s AND marketplace = %s AND agent_id = %s
                   AND level = 'error'
-                GROUP BY extra->>'step' ORDER BY cnt DESC LIMIT 5
+                GROUP BY details->>'step' ORDER BY cnt DESC LIMIT 5
             """, (self.hesap_key, self.marketplace, agent))
             adim_dagilimi = {r[0]: r[1] for r in (adim_rows or [])}
 
@@ -103,7 +103,7 @@ class ErrorAnalyzer:
             son_30_tipler = {r[0]: r[1] for r in (son_30_tip_rows or [])}
 
             son_hata_row = sdb._fetch_one("""
-                SELECT created_at, error_type, message, extra->>'step' as step
+                SELECT created_at, error_type, message, details->>'step' as step
                 FROM agent_logs
                 WHERE hesap_key = %s AND marketplace = %s AND agent_id = %s
                   AND level = 'error'
@@ -162,13 +162,13 @@ class ErrorAnalyzer:
         # Kalip 3: Agent 3 kampanya kumesi
         try:
             kamp_rows = sdb._fetch_all("""
-                SELECT extra->>'kampanya' as kampanya, COUNT(*) as cnt
+                SELECT details->>'kampanya' as kampanya, COUNT(*) as cnt
                 FROM agent_logs
                 WHERE hesap_key = %s AND marketplace = %s AND agent_id = 'agent3'
                   AND level = 'error'
-                  AND extra->>'step' = 'execution_plan'
-                  AND extra->>'kampanya' IS NOT NULL
-                GROUP BY extra->>'kampanya'
+                  AND details->>'step' = 'execution_plan'
+                  AND details->>'kampanya' IS NOT NULL
+                GROUP BY details->>'kampanya'
                 HAVING COUNT(*) >= %s
             """, (self.hesap_key, self.marketplace, TEKRAR_ESIGI))
 

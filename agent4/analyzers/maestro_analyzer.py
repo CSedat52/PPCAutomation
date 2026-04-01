@@ -33,7 +33,7 @@ class MaestroAnalyzer:
         try:
             rows = sdb._fetch_all("""
                 SELECT session_id, status, current_step,
-                       started_at, completed_at, error_message,
+                       started_at, updated_at, error_message,
                        agent1_completed_at, agent2_completed_at,
                        agent3_completed_at, agent4_completed_at
                 FROM pipeline_runs

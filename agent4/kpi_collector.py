@@ -289,16 +289,6 @@ class KPICollector:
                 datetime.strptime(karar_tarihi, "%Y-%m-%d")
             ).days
 
-            # decision_history tablosunu da dogrudan guncelle
-            try:
-                sdb.update_decision_kpi(
-                    self.hesap_key, self.marketplace,
-                    hedefleme_id, karar_tarihi,
-                    k["kpi_after"]
-                )
-            except Exception as e:
-                logger.warning("Sessiz hata: %s", e)
-
             ozet["kpi_after_doldurulan"] += 1
 
         logger.info("%d karar icin kpi_after dolduruldu", ozet["kpi_after_doldurulan"])

@@ -43,39 +43,78 @@ class BidParamAnalyzer:
             logger.warning("Supabase baglantisi kurulamadi: %s", e)
             return []
 
-        # ASIN bazli karar verisi topla
+        # ASIN bazli karar verisi topla (bid_recommendations tablosundan)
         try:
             rows = sdb._fetch_all("""
-                SELECT asin, segment, previous_bid, new_bid, change_pct,
-                       metrics, kpi_after, decision_status, ad_type
-                FROM decision_history
+                SELECT keyword_id, target_id, segment, current_bid, recommended_bid,
+                       decision_bid, bid_change_pct,
+                       impressions, clicks, cost, sales, orders, acos,
+                       decision, analysis_date, ad_type
+                FROM bid_recommendations
                 WHERE hesap_key = %s AND marketplace = %s
-                  AND asin IS NOT NULL AND asin != ''
-                ORDER BY decision_date ASC
+                  AND decision IN ('APPROVED', 'MODIFIED')
+                ORDER BY analysis_date ASC
             """, (self.hesap_key, self.marketplace))
         except Exception as e:
-            logger.warning("decision_history okunamadi: %s", e)
+            logger.warning("bid_recommendations okunamadi: %s", e)
             return []
 
         if not rows:
             logger.info("ASIN bazli karar verisi yok.")
             return []
 
-        # ASIN bazli gruplama
+        # In-memory DB'den kpi_after eslestirmesi icin karar_gecmisi hazirla
+        inmemory_kararlar = {}
+        try:
+            from agent4.db_manager import DBManager
+            db = DBManager(self.hesap_key, self.marketplace)
+            db.load()
+            for k in db.get("karar_gecmisi", {}).get("kararlar", []):
+                hid = k.get("hedefleme_id", "")
+                tarih = k.get("tarih", "")
+                if hid and tarih:
+                    inmemory_kararlar[f"{hid}_{tarih}"] = k
+        except Exception:
+            pass  # in-memory DB yoksa kpi_after eslestirmesiz devam
+
+        # ASIN bazli gruplama — bid_recommendations'ta asin kolonu yok,
+        # in-memory DB'den eslestir veya "BILINMIYOR" kullan
         asin_data = defaultdict(lambda: {
             "kararlar": [],
             "segment_dagilimi": defaultdict(int),
         })
 
-        for asin, segment, prev_bid, new_bid, change_pct, metrics, kpi_after, status, ad_type in rows:
+        for (keyword_id, target_id, segment, current_bid, recommended_bid,
+             decision_bid, bid_change_pct,
+             impressions, clicks, cost, sales, orders, acos,
+             decision, analysis_date, ad_type) in rows:
+
+            hedefleme_id = str(keyword_id or target_id or "")
+            tarih = str(analysis_date)
+            inmemory_key = f"{hedefleme_id}_{tarih}"
+            inmemory_karar = inmemory_kararlar.get(inmemory_key, {})
+
+            asin = inmemory_karar.get("asin", "")
+            if not asin:
+                continue  # ASIN bilinmiyorsa atla
+
+            kpi_after = inmemory_karar.get("kpi_after")
+
             entry = {
                 "segment": segment,
-                "onceki_bid": float(prev_bid or 0),
-                "yeni_bid": float(new_bid or 0),
-                "degisim": float(change_pct or 0),
-                "metrikler": metrics if isinstance(metrics, dict) else {},
-                "kpi_after": kpi_after if isinstance(kpi_after, dict) else None,
-                "durum": status,
+                "onceki_bid": float(current_bid or 0),
+                "yeni_bid": float(decision_bid or recommended_bid or 0),
+                "degisim": float(bid_change_pct or 0),
+                "metrikler": {
+                    "impressions": int(impressions or 0),
+                    "clicks": int(clicks or 0),
+                    "spend": float(cost or 0),
+                    "sales": float(sales or 0),
+                    "orders": int(orders or 0),
+                    "acos": float(acos) if acos is not None else None,
+                },
+                "kpi_after": kpi_after,
+                "durum": decision,
                 "reklam_tipi": ad_type,
             }
             asin_data[asin]["kararlar"].append(entry)
@@ -100,7 +139,7 @@ class BidParamAnalyzer:
         """Tek ASIN icin performans analizi ve basit oneri."""
         kararlar = data["kararlar"]
         toplam = len(kararlar)
-        uygulanan = [k for k in kararlar if k["durum"] in ("APPLIED", "UYGULANDI")]
+        uygulanan = [k for k in kararlar if k["durum"] in ("APPROVED", "MODIFIED", "APPLIED", "UYGULANDI")]
         kpi_after_olan = [k for k in uygulanan if k["kpi_after"]]
 
         # Mevcut parametreler
