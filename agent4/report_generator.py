@@ -48,6 +48,10 @@ class ReportGenerator:
         rapor["analysis_dosyasi"] = str(analysis_path)
         logger.info("agent4_analysis.json kaydedildi: %s", analysis_path)
 
+        # agent4_error_data.json — Claude Code icin (sadece hata verileri)
+        error_data_path = self._write_claude_error_data(sonuclar, today)
+        rapor["error_data_dosyasi"] = error_data_path
+
         # Status raporu → agent_logs'a yaz (status_reports tablosu yok)
         try:
             from log_utils import save_log
@@ -93,6 +97,10 @@ class ReportGenerator:
         except Exception as e:
             logger.warning("Sessiz hata: %s", e)
 
+        # bid_param_analizi artik (ASIN x targeting_type) bazli
+        # Her ASIN icin 2 kayit olabilir (KEYWORD + PRODUCT_TARGET)
+        bid_param = sonuclar.get("bid_param", [])
+
         return {
             "tarih":              today,
             "hesap_key":          self.hesap_key,
@@ -101,10 +109,27 @@ class ReportGenerator:
             "segment_sonuclari":  sonuclar.get("segment", {}),
             "hata_analizi":       sonuclar.get("hata", {}),
             "maestro_analizi":    sonuclar.get("maestro", {}),
-            "bid_param_analizi":  sonuclar.get("bid_param", []),
+            "bid_param_analizi":  bid_param,
             "mevcut_bid_functions": mevcut_bf,
             "mevcut_settings":    mevcut_settings,
         }
+
+    # ------------------------------------------ Claude Code hata verisi (kucuk dosya)
+    def _write_claude_error_data(self, sonuclar: dict, today: str) -> str:
+        """Claude Code icin kucultulmus veri dosyasi — sadece hata verileri."""
+        error_data = {
+            "tarih": today,
+            "hesap_key": self.hesap_key,
+            "marketplace": self.marketplace,
+            "hata_analizi": sonuclar.get("hata", {}),
+            "maestro_analizi": sonuclar.get("maestro", {}),
+        }
+        error_data_path = self.data_dir / "agent4" / "agent4_error_data.json"
+        error_data_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(error_data_path, "w", encoding="utf-8") as f:
+            json.dump(error_data, f, indent=2, ensure_ascii=False)
+        logger.info("Claude Code hata verisi yazildi: %s", error_data_path)
+        return str(error_data_path)
 
     # ------------------------------------------ Sistem sagligi bolumu
     def _sistem_sagligi(self, sonuclar: dict) -> dict:

@@ -1,27 +1,43 @@
 """
-Agent 4 — Bid Parameter Analyzer (v3 — NEW)
-=============================================
-ASIN bazinda bid parametresi (hassasiyet + max_degisim) etki analizi.
-decision_history tablosundan ASIN bazli performans verisi toplar,
-basit Python onerisi uretir. Claude Code bu onerileri degerlendirip
-nihai karari verir.
+Agent 4 — Bid Parameter Analyzer (v4 — Tanh Regresyon)
+========================================================
+(ASIN x hedefleme tipi) bazinda tanh curve fitting.
+Optimal hassasiyet ve max_degisim parametrelerini veriden turetir.
+
+Hedefleme tipleri:
+  KEYWORD        — SP keyword + SB keyword
+  PRODUCT_TARGET — SP ASIN/category target + SD target
 
 Bid formulu hatirlatma:
   bid_degisim = -tanh(acos_fark_orani x hassasiyet) x max_degisim
 
-  hassasiyet UP   = kucuk ACoS sapmalarina agresif tepki
-  hassasiyet DOWN = ACoS sapmasina toleransli, yumusak tepki
-  max_degisim UP  = daha buyuk tek seferlik bid degisimi
-  max_degisim DOWN = daha kucuk, kademeli degisim
+Gereksinimler: scipy (pip install scipy)
 """
 
 import json
 import logging
+import warnings
 from collections import defaultdict
+from datetime import datetime
+
+import numpy as np
+from scipy.optimize import curve_fit, OptimizeWarning
 
 logger = logging.getLogger("agent4.bid_param")
 
-MIN_OLCULEBILIR_KARAR = 6   # Oneri uretmek icin minimum olculebilir karar
+# Sabitler
+MIN_OLCULEBILIR_KARAR = 20   # Her grup icin ayri ayri 20 veri noktasi
+MIN_R_SQUARED = 0.50          # Fit kalitesi esigi
+HASSASIYET_MIN = 0.1
+HASSASIYET_MAX = 2.0
+MAX_DEGISIM_MIN = 0.05
+MAX_DEGISIM_MAX = 0.40
+TARGETING_TYPES = ["KEYWORD", "PRODUCT_TARGET"]
+
+
+def tanh_model(bid_degisim, alpha, beta):
+    """Tanh regresyon modeli: acos_degisim = -tanh(bid_degisim * alpha) * beta"""
+    return -np.tanh(bid_degisim * alpha) * beta
 
 
 class BidParamAnalyzer:
@@ -36,262 +52,283 @@ class BidParamAnalyzer:
         return SupabaseClient()
 
     def analyze(self) -> list:
-        """Her ASIN icin bid param etki analizi ve basit oneri uretir."""
+        """Her (ASIN x targeting_type) icin tanh regresyon analizi."""
         try:
             sdb = self._get_sdb()
         except Exception as e:
             logger.warning("Supabase baglantisi kurulamadi: %s", e)
             return []
 
-        # ASIN bazli karar verisi topla (bid_recommendations tablosundan)
-        try:
-            rows = sdb._fetch_all("""
-                SELECT keyword_id, target_id, segment, current_bid, recommended_bid,
-                       decision_bid, bid_change_pct,
-                       impressions, clicks, cost, sales, orders, acos,
-                       decision, analysis_date, ad_type
-                FROM bid_recommendations
-                WHERE hesap_key = %s AND marketplace = %s
-                  AND decision IN ('APPROVED', 'MODIFIED')
-                ORDER BY analysis_date ASC
-            """, (self.hesap_key, self.marketplace))
-        except Exception as e:
-            logger.warning("bid_recommendations okunamadi: %s", e)
-            return []
-
+        # decision_history'den kpi_after dolu kararlari cek
+        rows = self._fetch_decisions(sdb)
         if not rows:
-            logger.info("ASIN bazli karar verisi yok.")
+            logger.info("Analiz icin karar verisi yok.")
             return []
 
-        # In-memory DB'den kpi_after eslestirmesi icin karar_gecmisi hazirla
-        inmemory_kararlar = {}
-        try:
-            from agent4.db_manager import DBManager
-            db = DBManager(self.hesap_key, self.marketplace)
-            db.load()
-            for k in (db.get("karar_gecmisi") or {}).get("kararlar", []):
-                hid = k.get("hedefleme_id", "")
-                tarih = k.get("tarih", "")
-                if hid and tarih:
-                    inmemory_kararlar[f"{hid}_{tarih}"] = k
-        except Exception:
-            pass  # in-memory DB yoksa kpi_after eslestirmesiz devam
-
-        # ASIN bazli gruplama — bid_recommendations'ta asin kolonu yok,
-        # in-memory DB'den eslestir veya "BILINMIYOR" kullan
-        asin_data = defaultdict(lambda: {
-            "kararlar": [],
-            "segment_dagilimi": defaultdict(int),
-        })
-
-        for (keyword_id, target_id, segment, current_bid, recommended_bid,
-             decision_bid, bid_change_pct,
-             impressions, clicks, cost, sales, orders, acos,
-             decision, analysis_date, ad_type) in rows:
-
-            hedefleme_id = str(keyword_id or target_id or "")
-            tarih = str(analysis_date)
-            inmemory_key = f"{hedefleme_id}_{tarih}"
-            inmemory_karar = inmemory_kararlar.get(inmemory_key, {})
-
-            asin = inmemory_karar.get("asin", "")
-            if not asin:
-                continue  # ASIN bilinmiyorsa atla
-
-            kpi_after = inmemory_karar.get("kpi_after")
-
-            entry = {
-                "segment": segment,
-                "onceki_bid": float(current_bid or 0),
-                "yeni_bid": float(decision_bid or recommended_bid or 0),
-                "degisim": float(bid_change_pct or 0),
-                "metrikler": {
-                    "impressions": int(impressions or 0),
-                    "clicks": int(clicks or 0),
-                    "spend": float(cost or 0),
-                    "sales": float(sales or 0),
-                    "orders": int(orders or 0),
-                    "acos": float(acos) if acos is not None else None,
-                },
-                "kpi_after": kpi_after,
-                "durum": decision,
-                "reklam_tipi": ad_type,
-            }
-            asin_data[asin]["kararlar"].append(entry)
-            asin_data[asin]["segment_dagilimi"][segment or "BILINMIYOR"] += 1
+        # (ASIN, targeting_type) bazinda grupla
+        gruplar = self._grupla(rows)
 
         # Mevcut bid parametrelerini al
         mevcut_params = self._get_mevcut_params(sdb)
 
-        # Her ASIN icin analiz
+        # ASIN hedeflerini al
+        asin_hedefleri = self._get_asin_hedefleri(sdb)
+
+        today = datetime.utcnow().strftime("%Y-%m-%d")
         sonuclar = []
-        for asin, data in asin_data.items():
-            analiz = self._analiz_asin(asin, data, mevcut_params)
+
+        for (asin, targeting_type), veri_noktalari in gruplar.items():
+            hedef_acos = asin_hedefleri.get(asin, {}).get("hedef_acos")
+            params = self._get_params_for_group(asin, targeting_type, mevcut_params)
+            analiz = self._analiz_grup(
+                asin, targeting_type, veri_noktalari,
+                params, hedef_acos, today
+            )
             if analiz:
+                # Supabase'e kaydet
+                self._kaydet_supabase(sdb, analiz, veri_noktalari, today)
                 sonuclar.append(analiz)
 
-        logger.info("Bid param analizi: %d ASIN analiz edildi, %d oneri uretildi",
-                    len(asin_data),
-                    sum(1 for s in sonuclar if s.get("python_onerisi")))
+        logger.info("Bid param analizi: %d grup analiz edildi, %d fit basarili",
+                    len(gruplar),
+                    sum(1 for s in sonuclar if s.get("fit_basarili")))
         return sonuclar
 
-    def _analiz_asin(self, asin: str, data: dict, mevcut_params: dict) -> dict:
-        """Tek ASIN icin performans analizi ve basit oneri."""
-        kararlar = data["kararlar"]
-        toplam = len(kararlar)
-        uygulanan = [k for k in kararlar if k["durum"] in ("APPROVED", "MODIFIED", "APPLIED", "UYGULANDI")]
-        kpi_after_olan = [k for k in uygulanan if k["kpi_after"]]
+    def _fetch_decisions(self, sdb) -> list:
+        """decision_history'den kpi_after dolu kararlari cek."""
+        try:
+            rows = sdb._fetch_all("""
+                SELECT asin, targeting_type, targeting_id, decision_date,
+                       change_pct, metrics, kpi_after, hedef_acos,
+                       previous_bid, new_bid, segment
+                FROM decision_history
+                WHERE hesap_key = %s AND marketplace = %s
+                  AND kpi_after IS NOT NULL
+                  AND asin IS NOT NULL AND asin != ''
+                  AND decision_status IN ('APPLIED', 'VERIFIED')
+                ORDER BY decision_date ASC
+            """, (self.hesap_key, self.marketplace))
+            return rows or []
+        except Exception as e:
+            logger.warning("decision_history okunamadi: %s", e)
+            return []
 
-        # Mevcut parametreler
-        asin_params = mevcut_params.get(asin, {})
-        hassasiyet = asin_params.get("hassasiyet", mevcut_params.get("_global", {}).get("hassasiyet", 0.5))
-        max_degisim = asin_params.get("max_degisim", mevcut_params.get("_global", {}).get("max_degisim", 0.20))
-        aktif = asin_params.get("aktif", False)
-        kaynak = "ASIN" if asin in mevcut_params else "GLOBAL"
+    def _grupla(self, rows: list) -> dict:
+        """Kararlari (ASIN, targeting_type) bazinda grupla."""
+        gruplar = defaultdict(list)
+        for row in rows:
+            (asin, targeting_type, targeting_id, decision_date,
+             change_pct, metrics, kpi_after, hedef_acos,
+             previous_bid, new_bid, segment) = row
 
-        # Segment bazli performans
-        segment_perf = defaultdict(lambda: {"toplam": 0, "basarili": 0, "degisimler": []})
+            if not asin or not targeting_type:
+                continue
 
-        for k in kpi_after_olan:
-            seg = k["segment"] or "BILINMIYOR"
-            b_met = k["metrikler"]
-            a_met = k["kpi_after"]
-            segment_perf[seg]["toplam"] += 1
+            # metrics ve kpi_after JSONB
+            if isinstance(metrics, str):
+                metrics = json.loads(metrics)
+            if isinstance(kpi_after, str):
+                kpi_after = json.loads(kpi_after)
 
-            acos_once = b_met.get("acos")
-            acos_sonra = a_met.get("acos")
+            acos_once = metrics.get("acos") if metrics else None
+            acos_sonra = kpi_after.get("acos") if kpi_after else None
 
-            # Basari kriteri: segment'e gore
-            basarili = False
-            if seg in ("KAZANAN", "OPTIMIZE_ET"):
-                basarili = (acos_sonra is not None and acos_once is not None
-                           and acos_sonra < acos_once)
-            elif seg in ("ZARAR", "KAN_KAYBEDEN"):
-                basarili = a_met.get("spend", 0) < b_met.get("spend", 0)
-            elif seg == "GORUNMEZ":
-                basarili = a_met.get("impressions", 0) > 0
-            elif seg == "SUPER_STAR":
-                basarili = (acos_sonra is not None and acos_once is not None
-                           and abs(acos_sonra - acos_once) <= 2.0)
-            else:
-                basarili = True  # YETERSIZ_VERI, TUZAK
+            if acos_once is None or acos_sonra is None:
+                continue
 
-            if basarili:
-                segment_perf[seg]["basarili"] += 1
+            bid_degisim = float(change_pct or 0) / 100.0  # yuzde → oran
 
-            if acos_once is not None and acos_sonra is not None:
-                segment_perf[seg]["degisimler"].append(acos_sonra - acos_once)
+            gruplar[(asin, targeting_type)].append({
+                "targeting_id": targeting_id,
+                "decision_date": str(decision_date),
+                "bid_degisim": bid_degisim,
+                "acos_once": float(acos_once),
+                "acos_sonra": float(acos_sonra),
+                "acos_degisim": float(acos_sonra) - float(acos_once),
+                "spend_before": float((metrics or {}).get("spend", 0)),
+                "spend_after": float((kpi_after or {}).get("spend", 0)),
+                "hedef_acos": float(hedef_acos) if hedef_acos else None,
+                "asin": asin,
+                "targeting_type": targeting_type,
+            })
 
-        # Genel performans metrikleri
-        acos_before_list = [k["metrikler"].get("acos") for k in kpi_after_olan
-                            if k["metrikler"].get("acos") is not None]
-        acos_after_list = [k["kpi_after"].get("acos") for k in kpi_after_olan
-                           if k["kpi_after"].get("acos") is not None]
+        return dict(gruplar)
 
-        ort_acos_once = sum(acos_before_list) / len(acos_before_list) if acos_before_list else None
-        ort_acos_sonra = sum(acos_after_list) / len(acos_after_list) if acos_after_list else None
+    def _analiz_grup(self, asin: str, targeting_type: str,
+                     veri_noktalari: list, mevcut: dict,
+                     hedef_acos: float, today: str) -> dict:
+        """Tek (ASIN x targeting_type) grubu icin tanh curve fitting."""
+        n = len(veri_noktalari)
+        hassasiyet_mevcut = mevcut.get("hassasiyet", 0.5)
+        max_degisim_mevcut = mevcut.get("max_degisim", 0.20)
+        parametre_kaynagi = mevcut.get("kaynak", "GLOBAL")
 
-        toplam_basarili = sum(sp["basarili"] for sp in segment_perf.values())
-        toplam_olculen = sum(sp["toplam"] for sp in segment_perf.values())
-        basari_orani = toplam_basarili / toplam_olculen if toplam_olculen > 0 else None
+        # Ortalama ACoS metrikleri
+        acos_once_list = [v["acos_once"] for v in veri_noktalari]
+        acos_sonra_list = [v["acos_sonra"] for v in veri_noktalari]
+        ort_acos_once = sum(acos_once_list) / len(acos_once_list) if acos_once_list else None
+        ort_acos_sonra = sum(acos_sonra_list) / len(acos_sonra_list) if acos_sonra_list else None
 
-        # Bid degisim ortalamalari (segment bazli)
-        bid_degisim_ortalamalari = {}
-        for seg, sp in segment_perf.items():
-            if sp["degisimler"]:
-                ort_deg = sum(sp["degisimler"]) / len(sp["degisimler"])
-                seg_basari = sp["basarili"] / sp["toplam"] if sp["toplam"] > 0 else 0
-                bid_degisim_ortalamalari[seg] = {
-                    "ort_degisim": round(ort_deg, 2),
-                    "basari": round(seg_basari, 2),
-                }
+        # Gap closure hesapla (bilgi amacli)
+        ort_gap_closure = self._hesapla_gap_closure(veri_noktalari, hedef_acos)
 
-        # Python onerisi uret
-        python_onerisi = None
-        if toplam_olculen >= MIN_OLCULEBILIR_KARAR:
-            python_onerisi = self._uret_oneri(
-                hassasiyet, max_degisim, basari_orani,
-                segment_perf, bid_degisim_ortalamalari,
-                ort_acos_once, ort_acos_sonra
-            )
-
-        acos_iyilesme = None
-        if ort_acos_once and ort_acos_sonra and ort_acos_once > 0:
-            acos_iyilesme = round((ort_acos_once - ort_acos_sonra) / ort_acos_once, 3)
-
-        return {
+        sonuc = {
             "asin": asin,
-            "mevcut_parametreler": {
-                "hassasiyet": hassasiyet,
-                "max_degisim": max_degisim,
-                "aktif": aktif,
-                "kaynak": kaynak,
-            },
-            "karar_istatistikleri": {
-                "toplam_karar": toplam,
-                "uygulanan": len(uygulanan),
-                "kpi_after_olan": len(kpi_after_olan),
-                "segment_dagilimi": dict(data["segment_dagilimi"]),
-            },
-            "performans_metrikleri": {
-                "ortalama_acos_once": round(ort_acos_once, 1) if ort_acos_once else None,
-                "ortalama_acos_sonra": round(ort_acos_sonra, 1) if ort_acos_sonra else None,
-                "acos_iyilesme_orani": acos_iyilesme,
-                "basari_orani": round(basari_orani, 2) if basari_orani is not None else None,
-                "bid_degisim_ortalamalari": bid_degisim_ortalamalari,
-            },
-            "python_onerisi": python_onerisi,
+            "targeting_type": targeting_type,
+            "hedef_acos": hedef_acos,
+            "veri_noktasi": n,
+            "hassasiyet_mevcut": hassasiyet_mevcut,
+            "max_degisim_mevcut": max_degisim_mevcut,
+            "parametre_kaynagi": parametre_kaynagi,
+            "ort_acos_once": round(ort_acos_once, 2) if ort_acos_once else None,
+            "ort_acos_sonra": round(ort_acos_sonra, 2) if ort_acos_sonra else None,
+            "ort_gap_closure": round(ort_gap_closure, 4) if ort_gap_closure is not None else None,
+            "analysis_date": today,
         }
 
-    def _uret_oneri(self, hassasiyet, max_degisim, basari_orani,
-                     segment_perf, bid_degisim_ort,
-                     ort_acos_once, ort_acos_sonra):
-        """Basit kural tabanli oneri uret."""
+        if n < MIN_OLCULEBILIR_KARAR:
+            sonuc["durum"] = "YETERSIZ_VERI"
+            sonuc["fit_basarili"] = False
+            sonuc["mesaj"] = f"{n} veri noktasi var, minimum {MIN_OLCULEBILIR_KARAR} gerekli"
+            logger.info("%s/%s: YETERSIZ_VERI (%d/%d)",
+                        asin, targeting_type, n, MIN_OLCULEBILIR_KARAR)
+            return sonuc
+
+        # Tanh curve fitting
+        x = np.array([v["bid_degisim"] for v in veri_noktalari])
+        y = np.array([v["acos_degisim"] for v in veri_noktalari])
+
+        fit_sonuc = self._fit_tanh(x, y)
+        if not fit_sonuc:
+            sonuc["durum"] = "FIT_BASARISIZ"
+            sonuc["fit_basarili"] = False
+            sonuc["mesaj"] = "Tanh curve fitting basarisiz"
+            return sonuc
+
+        alpha_fit, beta_fit_pp, r_squared, alpha_std, beta_std = fit_sonuc
+
+        sonuc.update({
+            "alpha_fit": round(alpha_fit, 4),
+            "beta_fit_pp": round(beta_fit_pp, 2),
+            "r_squared": round(r_squared, 4),
+            "alpha_std_err": round(alpha_std, 4),
+            "beta_std_err": round(beta_std, 2),
+            "fit_basarili": True,
+        })
+
+        if r_squared < MIN_R_SQUARED:
+            sonuc["durum"] = "DUSUK_R_SQUARED"
+            sonuc["mesaj"] = f"R²={r_squared:.4f} < {MIN_R_SQUARED} — fit guvenilir degil"
+            sonuc["python_onerisi"] = None
+            logger.info("%s/%s: DUSUK_R_SQUARED (%.4f)",
+                        asin, targeting_type, r_squared)
+            return sonuc
+
+        # Oneri uret
+        python_onerisi = self._uret_oneri(
+            alpha_fit, beta_fit_pp, alpha_std, beta_std,
+            hassasiyet_mevcut, max_degisim_mevcut
+        )
+
+        sonuc["durum"] = "BASARILI"
+        sonuc["python_onerisi"] = python_onerisi
+
+        logger.info("%s/%s: alpha_fit=%.4f, beta_fit_pp=%.2f, R²=%.4f, oneri=%s",
+                    asin, targeting_type, alpha_fit, beta_fit_pp, r_squared,
+                    "VAR" if python_onerisi else "YOK")
+        return sonuc
+
+    def _fit_tanh(self, x: np.ndarray, y: np.ndarray):
+        """scipy curve_fit ile tanh modeli fit et."""
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", OptimizeWarning)
+                # Baslangic tahmini: alpha=0.5, beta=5.0 (pp)
+                popt, pcov = curve_fit(
+                    tanh_model, x, y,
+                    p0=[0.5, 5.0],
+                    bounds=([HASSASIYET_MIN, 0.1], [HASSASIYET_MAX, 50.0]),
+                    maxfev=5000,
+                )
+
+            alpha_fit, beta_fit_pp = popt
+            # Standart hata
+            perr = np.sqrt(np.diag(pcov))
+            alpha_std = perr[0]
+            beta_std = perr[1]
+
+            # R² hesapla
+            y_pred = tanh_model(x, alpha_fit, beta_fit_pp)
+            ss_res = np.sum((y - y_pred) ** 2)
+            ss_tot = np.sum((y - np.mean(y)) ** 2)
+            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+            # Parametre sinirlari icerisinde tut
+            alpha_fit = max(HASSASIYET_MIN, min(HASSASIYET_MAX, alpha_fit))
+
+            return alpha_fit, beta_fit_pp, r_squared, alpha_std, beta_std
+
+        except (RuntimeError, ValueError, TypeError) as e:
+            logger.warning("Tanh fit basarisiz: %s", e)
+            return None
+
+    def _uret_oneri(self, alpha_fit, beta_fit_pp, alpha_std, beta_std,
+                     hassasiyet_mevcut, max_degisim_mevcut):
+        """Regresyondan parametre onerisi uret."""
         oneriler = {}
 
-        # Kural 1: Segment bazli basari orani < %50 → hassasiyeti dusur
-        kotu_segmentler = [
-            seg for seg, sp in segment_perf.items()
-            if sp["toplam"] >= 3 and (sp["basarili"] / sp["toplam"]) < 0.50
-            and seg in ("ZARAR", "KAN_KAYBEDEN", "OPTIMIZE_ET")
-        ]
-        if kotu_segmentler:
-            yeni_hass = round(hassasiyet * 0.80, 2)  # %20 dusur
-            oneriler["hassasiyet"] = {
-                "mevcut": hassasiyet,
-                "onerilen": yeni_hass,
-                "sebep": f"{', '.join(kotu_segmentler)} segmentlerinde basari orani <%50 — daha yumusak tepki gerekli",
-            }
+        # Hassasiyet onerisi: fark 2 sigma disindaysa
+        alpha_fark = abs(alpha_fit - hassasiyet_mevcut)
+        if alpha_std > 0 and alpha_fark > 2 * alpha_std:
+            yeni_hass = max(HASSASIYET_MIN, min(HASSASIYET_MAX, round(alpha_fit, 2)))
+            if yeni_hass != hassasiyet_mevcut:
+                yon = "artir" if alpha_fit > hassasiyet_mevcut else "dusur"
+                oneriler["hassasiyet"] = {
+                    "mevcut": hassasiyet_mevcut,
+                    "onerilen": yeni_hass,
+                    "alpha_fit": round(alpha_fit, 4),
+                    "alpha_std": round(alpha_std, 4),
+                    "sigma_uzakligi": round(alpha_fark / alpha_std, 2),
+                    "sebep": (
+                        f"Regresyon alpha={alpha_fit:.4f} vs mevcut={hassasiyet_mevcut:.2f} "
+                        f"({alpha_fark/alpha_std:.1f} sigma uzakta) — hassasiyeti {yon}"
+                    ),
+                }
 
-        # Kural 2: ACOS kotulesiyor → max_degisim dusur
-        if ort_acos_once and ort_acos_sonra and ort_acos_sonra > ort_acos_once:
-            yeni_max = round(max_degisim * 0.80, 2)  # %20 dusur
-            oneriler["max_degisim"] = {
-                "mevcut": max_degisim,
-                "onerilen": yeni_max,
-                "sebep": f"ACOS {ort_acos_once:.1f}% -> {ort_acos_sonra:.1f}% (kotulesme) — kademeli yaklasim daha iyi",
-            }
-
-        # Kural 3: ACOS iyilesiyor ama cok yavas → hassasiyeti artir
-        if (basari_orani and basari_orani > 0.60 and
-                ort_acos_once and ort_acos_sonra):
-            iyilesme = ort_acos_once - ort_acos_sonra
-            if 0 < iyilesme < 1.0:  # Pozitif ama cok kucuk
-                yeni_hass = round(hassasiyet * 1.15, 2)  # %15 artir
-                if "hassasiyet" not in oneriler:
-                    oneriler["hassasiyet"] = {
-                        "mevcut": hassasiyet,
-                        "onerilen": min(yeni_hass, 1.5),  # max 1.5
-                        "sebep": f"Basari orani iyi (%{basari_orani*100:.0f}) ama ACOS iyilesmesi yavas ({iyilesme:.1f}pp) — daha agresif tepki faydali olabilir",
-                    }
+        # Beta analizi: Claude Code max_degisim ile yorumlayacak
+        oneriler["beta_analiz"] = {
+            "beta_fit_pp": round(beta_fit_pp, 2),
+            "beta_std": round(beta_std, 2),
+            "max_degisim_mevcut": max_degisim_mevcut,
+            "aciklama": (
+                f"Gercek max ACoS etkisi: {beta_fit_pp:.2f}pp. "
+                f"Claude Code bu degeri max_degisim ({max_degisim_mevcut:.2f}) ile birlestirerek "
+                f"max_degisim onerisi uretecek."
+            ),
+        }
 
         return oneriler if oneriler else None
+
+    def _hesapla_gap_closure(self, veri_noktalari: list, hedef_acos: float):
+        """Gap closure hesapla — ACoS hedefe ne kadar yaklasti."""
+        if not hedef_acos:
+            return None
+
+        closures = []
+        for v in veri_noktalari:
+            gap_once = v["acos_once"] - hedef_acos
+            gap_sonra = v["acos_sonra"] - hedef_acos
+            if abs(gap_once) > 0.01:
+                closure = 1 - (gap_sonra / gap_once)
+                closures.append(closure)
+
+        return sum(closures) / len(closures) if closures else None
 
     def _get_mevcut_params(self, sdb) -> dict:
         """Mevcut ASIN ve global bid parametrelerini Supabase'den al."""
         params = {}
 
-        # ASIN bazli parametreler
+        # ASIN bazli parametreler (yeni format: ASIN x targeting_type destekli)
         try:
             rows = sdb._fetch_all("""
                 SELECT asin, aktif, hassasiyet, max_degisim
@@ -305,24 +342,121 @@ class BidParamAnalyzer:
                     "aktif": bool(aktif),
                 }
         except Exception as e:
-            logger.warning("Sessiz hata: %s", e)
+            logger.warning("asin_bid_params okunamadi: %s", e)
 
-        # Global tanh parametreleri
+        # bid_functions tablosundan ASIN x targeting_type parametreleri (yeni yapi)
         try:
             row = sdb._fetch_one("""
-                SELECT tanh_formulu FROM bid_functions
+                SELECT asin_parametreleri, tanh_formulu FROM bid_functions
                 WHERE hesap_key = %s AND marketplace = %s
             """, (self.hesap_key, self.marketplace))
-            if row and row[0]:
-                tf = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+            if row:
+                asin_params = row[0] if isinstance(row[0], dict) else {}
+                for asin, val in asin_params.items():
+                    if asin.startswith("_"):
+                        continue
+                    if isinstance(val, dict):
+                        # Yeni format: {"KEYWORD": {...}, "PRODUCT_TARGET": {...}}
+                        if "KEYWORD" in val or "PRODUCT_TARGET" in val:
+                            params[f"{asin}_KEYWORD"] = val.get("KEYWORD", {})
+                            params[f"{asin}_PRODUCT_TARGET"] = val.get("PRODUCT_TARGET", {})
+                        # Eski format: {"hassasiyet": ..., "max_degisim": ...}
+                        elif "hassasiyet" in val:
+                            if asin not in params:
+                                params[asin] = val
+
+                # Global tanh parametreleri
+                tf = row[1] if isinstance(row[1], dict) else {}
                 params["_global"] = {
                     "hassasiyet": tf.get("hassasiyet", 0.5),
                     "max_degisim": tf.get("max_degisim", 0.20),
                 }
         except Exception as e:
-            logger.warning("Sessiz hata: %s", e)
+            logger.warning("bid_functions okunamadi: %s", e)
 
         if "_global" not in params:
             params["_global"] = {"hassasiyet": 0.5, "max_degisim": 0.20}
 
         return params
+
+    def _get_params_for_group(self, asin: str, targeting_type: str,
+                               mevcut_params: dict) -> dict:
+        """Belirli bir (ASIN, targeting_type) icin mevcut parametreleri dondur."""
+        global_p = mevcut_params.get("_global", {"hassasiyet": 0.5, "max_degisim": 0.20})
+
+        # 1. ASIN x targeting_type ozel (yeni yapi)
+        key = f"{asin}_{targeting_type}"
+        if key in mevcut_params:
+            p = mevcut_params[key]
+            if p.get("aktif", False):
+                return {
+                    "hassasiyet": p.get("hassasiyet", global_p["hassasiyet"]),
+                    "max_degisim": p.get("max_degisim", global_p["max_degisim"]),
+                    "kaynak": f"ASIN_TIP ({targeting_type})",
+                }
+
+        # 2. ASIN genel (eski yapi)
+        if asin in mevcut_params:
+            p = mevcut_params[asin]
+            if p.get("aktif", False):
+                return {
+                    "hassasiyet": p.get("hassasiyet", global_p["hassasiyet"]),
+                    "max_degisim": p.get("max_degisim", global_p["max_degisim"]),
+                    "kaynak": "ASIN_OZEL",
+                }
+
+        # 3. Global
+        return {
+            "hassasiyet": global_p["hassasiyet"],
+            "max_degisim": global_p["max_degisim"],
+            "kaynak": "GLOBAL",
+        }
+
+    def _get_asin_hedefleri(self, sdb) -> dict:
+        """Settings tablosundan ASIN hedeflerini yukle."""
+        try:
+            row = sdb._fetch_one("""
+                SELECT asin_hedefleri FROM settings
+                WHERE hesap_key = %s AND marketplace = %s
+            """, (self.hesap_key, self.marketplace))
+            if row and row[0]:
+                return row[0] if isinstance(row[0], dict) else {}
+        except Exception as e:
+            logger.warning("asin_hedefleri yuklenemedi: %s", e)
+        return {}
+
+    def _kaydet_supabase(self, sdb, analiz: dict, veri_noktalari: list, today: str):
+        """Sonuclari Supabase'e yaz."""
+        try:
+            reg_data = {
+                "asin": analiz["asin"],
+                "targeting_type": analiz["targeting_type"],
+                "hedef_acos": analiz.get("hedef_acos"),
+                "alpha_fit": analiz.get("alpha_fit"),
+                "beta_fit_pp": analiz.get("beta_fit_pp"),
+                "r_squared": analiz.get("r_squared"),
+                "alpha_std_err": analiz.get("alpha_std_err"),
+                "beta_std_err": analiz.get("beta_std_err"),
+                "fit_basarili": analiz.get("fit_basarili", False),
+                "veri_noktasi": analiz.get("veri_noktasi", 0),
+                "hassasiyet_mevcut": analiz.get("hassasiyet_mevcut"),
+                "max_degisim_mevcut": analiz.get("max_degisim_mevcut"),
+                "parametre_kaynagi": analiz.get("parametre_kaynagi"),
+                "ort_gap_closure": analiz.get("ort_gap_closure"),
+                "ort_acos_once": analiz.get("ort_acos_once"),
+                "ort_acos_sonra": analiz.get("ort_acos_sonra"),
+                "analysis_date": today,
+            }
+            reg_id = sdb.upsert_bid_param_regression(
+                self.hesap_key, self.marketplace, reg_data
+            )
+
+            if reg_id and veri_noktalari:
+                sdb.insert_bid_param_regression_data(
+                    reg_id, self.hesap_key, self.marketplace, veri_noktalari
+                )
+
+            logger.info("Supabase: %s/%s regresyon kaydedildi (id=%s)",
+                        analiz["asin"], analiz["targeting_type"], reg_id)
+        except Exception as e:
+            logger.warning("Regresyon Supabase kaydi basarisiz: %s", e)

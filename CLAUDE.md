@@ -6,7 +6,7 @@ Sen Amazon PPC otomasyon sisteminin yardimci aracisin.
 Bu sistemde 4 agent var — Agent 1 (veri toplama), Agent 2 (analiz), Agent 3 (uygulama), Agent 4 (optimizasyon). Agent 1-3 tamamen Python scriptleridir ve Claude Code gerektirmez. Pipeline otomasyonu pipeline_runner.py (cron) ve maestro watch daemon (systemd) tarafindan yonetilir.
 
 Senin iki rolun var:
-1. **Agent 4 Asama 2 (otomatik):** Watch daemon seni cagirdiginda agent4_analysis.json dosyasini okuyup bid param optimizasyonu ve hata iyilestirme onerileri uretirsin.
+1. **Agent 4 Asama 2 (otomatik):** Watch daemon seni cagirdiginda `agent4_error_data.json` dosyasini okuyup hata analizi ve iyilestirme onerileri uretirsin. Bid param optimizasyonu Python tarafindan yapilir, senin gorevin DEGIL.
 2. **Interaktif yardimci (manuel):** Kullanici seni terminalde calistirdiginda agent'lari manuel calistirabilir, hata ayiklama yapabilir, sistemi inceleyebilirsin.
 
 ## CALISMA MODLARI
@@ -14,8 +14,9 @@ Senin iki rolun var:
 ### Otomatik Mod (Watch Daemon)
 Watch daemon seni Agent 4 Asama 2 icin cagirdiginda:
 - Kullaniciya HICBIR SEY SORMA
-- CLAUDE.md'deki "Agent 4 — Asama 2: Claude Code Dinamik Analiz" bolumunu takip et
-- agent4_analysis.json dosyasini oku, analiz yap, onerileri Supabase'e yaz
+- `agent4/AGENT4_CLAUDE_INSTRUCTIONS.md` dosyasini oku ve talimatlari takip et
+- `agent4_error_data.json` dosyasini oku, hata analizi yap, onerileri Supabase'e yaz
+- CLAUDE.md OKUMA, kaynak kod dosyalari OKUMA — sadece yukaridaki 2 dosya
 - Bitince CIK
 
 ### Interaktif Mod (Manuel Kullanim)
@@ -170,9 +171,9 @@ Python (pure, $0 maliyet)                    Claude Code (dinamik zeka)
   agent4_analysis.json ──────────────────────→ Claude Code okur
   (tum analiz ciktilari tek dosya)              │
                                                 ▼
-                                          Dinamik Analiz (2 gorev):
-                                              - Bid function parametre optimizasyonu
+                                          Dinamik Analiz (1 gorev):
                                               - Hata analizi ve iyilestirme onerileri
+                                          (Bid param optimizasyonu Python'da yapilir)
                                                 │
                                                 ▼
                                           proposals tablosuna yazar
@@ -191,65 +192,27 @@ python agent4/optimizer.py vigowood_na US durum
 
 KRITIK KURAL: Agent 4 hicbir dosyayi otomatik degistirmez. Tum oneriler onayini bekler.
 
-### Asama 2: Claude Code Dinamik Analiz
+### Asama 2: Claude Code — Hata Analizi
 
-Maestro watch daemon tarafindan otomatik cagirilir. Asama 1 tamamlandiktan sonra.
+Watch daemon tarafindan otomatik cagirilir. Asama 1 tamamlandiktan sonra.
 
-#### Girdi
-`data/{hesap}_{mp}/agent4/agent4_analysis.json` dosyasini oku. Icerigi:
-- `kpi_ozet` — KPI Collector ciktisi (yeni karar sayisi, kpi_after doldurulan)
-- `segment_sonuclari` — Segment bazli basari/basarisizlik oranlari
-- `hata_analizi` — Agent bazli hata dagilimi, tekrarlayan kaliplar
-- `maestro_analizi` — Pipeline session gecmisi, basari oranlari
-- `bid_param_analizi` — Her ASIN icin hassasiyet/max_degisim etki analizi ve Python'un basit onerileri
-- `mevcut_bid_functions` — Aktif tanh parametreleri ve segment parametreleri
-- `mevcut_settings` — Aktif settings (esik degerleri, ozel kurallar)
+**ONEMLI:** Claude Code artik bid param optimizasyonu YAPMAZ — bu gorev
+tamamen Python'a tasindi (tanh regresyon). Claude Code SADECE hata analizi yapar.
 
-#### Gorevler (2 gorev)
+**Talimat dosyasi:** Claude Code `CLAUDE.md` OKUMAZ.
+Bunun yerine `agent4/AGENT4_CLAUDE_INSTRUCTIONS.md` dosyasini okur (~50 satir).
 
-**1. Bid Function Parametre Optimizasyonu**
-- `bid_param_analizi` ve `segment_sonuclari` bolumlerini incele
-- `mevcut_bid_functions`'daki aktif parametreleri referans al
-- Python'un basit onerilerini (hassasiyet/max_degisim degisiklikleri) degerlendir
-- KPI before/after verilerine bakarak hangi parametrelerin iyilesme sagladigini, hangilerinin kotulestirdigini tespit et
-- Parametreleri guncelleyecek oneriler uret (ASIN bazli veya global)
+**Veri dosyasi:** Claude Code `agent4_analysis.json` OKUMAZ.
+Bunun yerine `agent4_error_data.json` dosyasini okur (sadece hata + maestro verileri).
 
-**2. Hata Analizi ve Iyilestirme Onerileri**
-- `hata_analizi` bolumundeki tekrarlayan hata kaliplarini incele
+**Gorev (tek gorev):**
+Hata Analizi ve Iyilestirme Onerileri:
+- hata_analizi bolumundeki tekrarlayan hata kaliplarini incele
 - Kok neden analizi yap
 - Cozum oner (config degisikligi, retry ayari, timeout ayari vb.)
+- Onerileri proposals tablosuna PENDING olarak yaz
 
-#### Cikti Formati
-Her oneri icin su 5 soruyu MUTLAKA yanitla:
-1. **NE** — Ne degistirilecek?
-2. **NEDEN** — Kanita dayali neden?
-3. **KANIT** — Hangi veri destekliyor?
-4. **RISK** — Olasi olumsuz etki?
-5. **KAZANIM** — Beklenen iyilesme?
-
-#### Onerileri Kaydetme
-`supabase/db_client.py`'daki `upsert_proposal()` fonksiyonunu kullan:
-```python
-from supabase.db_client import SupabaseClient
-sdb = SupabaseClient()
-sdb.upsert_proposal(hesap_key, marketplace, {
-    "kategori": "BID_PARAM" | "ERROR_PREVENTION",
-    "ne": "...",
-    "neden": "...",
-    "kanit": {...},
-    "risk": "...",
-    "kazanim": "...",
-    "degisecek_dosya": "config/... veya CLAUDE.md",
-    "degisecek_alan": {...},
-})
-```
-
-#### Kurallar
-- Hicbir dosyayi otomatik DEGISTIRME — sadece proposals_system tablosuna oneri yaz
-- Tum oneriler status='PENDING' olarak kaydedilir — kullanici onayi gerekir
-- Veri yetersizse (< 6 olculebilir karar) oneri uretme, "yetersiz veri" notu birak
-- Mevcut ayarlari oku ama DEGISTIRME
-- Sadece 2 gorev yap: bid function optimizasyonu + hata iyilestirme. Baska analiz yapma.
+**Maliyet:** ~$0.01-0.05 / pipeline calismasi (onceki: ~$0.10-0.30)
 
 ---
 
@@ -392,12 +355,10 @@ Veriler toplandiktan sonra her hesap icin sirayla (bir hesap hata verse bile son
 **ADIM 5: Agent 4 — Optimizer + Claude Code Dinamik Analiz (her hesap icin)**
 - `python agent4/optimizer.py HESAP MP` calistir.
   Python adimi bittikten sonra `data/{hesap}_{mp}/agent4/agent4_analysis.json` dosyasi olusur.
-- BU DOSYAYI OKU ve 2 gorev yap:
-  1. **Bid function parametre optimizasyonu**: KPI before/after verilerine bakarak hassasiyet ve
-     max_degisim parametrelerini degerlendir, guncelleme onerileri uret.
-  2. **Hata analizi ve iyilestirme onerileri**: Tekrarlayan hata kaliplarini incele, kok neden
-     analizi yap, cozum oner.
-- Baska analiz YAPMA (cross-ASIN pattern, sistem iyilestirme vb. ileride eklenecek).
+- `agent4_error_data.json` dosyasini oku ve hata analizi yap:
+  **Hata analizi ve iyilestirme onerileri**: Tekrarlayan hata kaliplarini incele, kok neden
+  analizi yap, cozum oner.
+- Bid param optimizasyonu Python tarafindan yapiliyor, sen YAPMA.
 - Uretilen onerileri `proposals` tablosuna yaz (ProposalEngine.write_proposals() veya dogrudan Supabase).
 - bekleyen_oneri_sayisi > 0 → Kullaniciya bildir.
 - ardisik_hata_alarmi = true → KRITIK UYARI.
@@ -550,11 +511,12 @@ kullanicinin henuz onay vermedigi anlamina gelir. Tekrar deneme YAPMA.
 Pipeline maliyeti:
 - Agent 1+2: $0 (saf Python, pipeline_runner.py via cron)
 - Agent 3: $0 (saf Python, watch daemon direkt calistirir)
-- Agent 4 Asama 1: $0 (saf Python, optimizer.py subprocess)
-- Agent 4 Asama 2: ~$0.10-0.30 (Claude Code, agent4_analysis.json analizi)
-- Toplam: ~$0.10-0.30 / pipeline calismasi
+- Agent 4 Asama 1: $0 (saf Python, optimizer.py subprocess — bid param regresyon dahil)
+- Agent 4 Asama 2: ~$0.01-0.05 (Claude Code, sadece hata analizi)
+- Toplam: ~$0.01-0.05 / pipeline calismasi
 
-Claude Code SADECE Agent 4 Asama 2 icin cagirilir.
+Claude Code SADECE Agent 4 Asama 2 icin cagirilir (hata analizi).
+Bid param optimizasyonu tamamen Python'da calisir ($0).
 Agent 4 Claude Code basarisiz olursa pipeline DURMAZ — Python sonuclari yeterli.
 
 ### pipeline_runner.py Akisi

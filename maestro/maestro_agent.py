@@ -1137,24 +1137,26 @@ def _run_agent3_from_queue(hesap_key, marketplace):
     except Exception as e:
         logger.error("Agent 4 Python calistirilamadi: %s — %s", account_label, e)
 
-    # ===== AGENT 4 ASAMA 2: Claude Code Dinamik Analiz =====
-    # Python asamasi basariliysa ve agent4_analysis.json varsa Claude Code'u cagir.
-    # Claude Code CLAUDE.md'deki "Agent 4 Asama 2" bolumunu okuyarak ne yapacagini bilir.
+    # ===== AGENT 4 ASAMA 2: Claude Code Hata Analizi =====
+    # Python asamasi basariliysa ve agent4_error_data.json varsa Claude Code'u cagir.
+    # Claude Code AGENT4_CLAUDE_INSTRUCTIONS.md okuyarak sadece hata analizi yapar.
     # Claude Code basarisiz olursa pipeline DURMAZ — Python asamasinin sonuclari yeterli.
     agent4_claude_ok = False
     if agent4_python_ok:
-        analysis_path = os.path.join(
+        instructions_path = os.path.join(config.BASE_DIR, "agent4", "AGENT4_CLAUDE_INSTRUCTIONS.md")
+        error_data_path = os.path.join(
             config.BASE_DIR, "data", f"{hesap_key}_{marketplace}",
-            "agent4", "agent4_analysis.json"
+            "agent4", "agent4_error_data.json"
         )
-        if os.path.exists(analysis_path):
+        if os.path.exists(error_data_path):
             logger.info("Agent 4 Asama 2 (Claude Code) baslatiliyor: %s", account_label)
             try:
                 claude_prompt = (
-                    f"CLAUDE.md oku. 'Agent 4 — Asama 2: Claude Code Dinamik Analiz' "
-                    f"bolumundeki talimatlari takip et.\n"
+                    f"Sadece su dosyayi oku ve icindeki talimatlari takip et: {instructions_path}\n"
                     f"Hesap: {hesap_key}/{marketplace}\n"
-                    f"Analiz dosyasi: {analysis_path}\n"
+                    f"Veri dosyasi: {error_data_path}\n"
+                    f"SADECE bu iki dosyayi oku, baska hicbir dosya OKUMA.\n"
+                    f"CLAUDE.md OKUMA. Kaynak kod dosyalari OKUMA.\n"
                     f"Kullaniciya soru sorma, otomatik calis, bitince cik."
                 )
                 result = subprocess.run(
@@ -1177,7 +1179,7 @@ def _run_agent3_from_queue(hesap_key, marketplace):
             except Exception as e:
                 logger.warning("Agent 4 Claude Code hatasi: %s — Python sonuclari yeterli", e)
         else:
-            logger.warning("agent4_analysis.json bulunamadi: %s — Asama 2 atlandi", analysis_path)
+            logger.warning("agent4_error_data.json bulunamadi: %s — Asama 2 atlandi", error_data_path)
 
     # Agent 4 status guncelle
     if sdb:

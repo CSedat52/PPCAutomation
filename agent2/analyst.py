@@ -673,17 +673,20 @@ def segmentize(target, settings, previous_decisions):
 # DINAMIK BID HESAPLAMA
 # ============================================================================
 
-def get_tanh_params_for_asin(asin, bid_funcs):
+def get_tanh_params_for_asin(asin, bid_funcs, targeting_type=None):
     """
     ASIN bazli tanh parametrelerini yukler.
 
     Oncelik sirasi:
-      1. Supabase asin_bid_params tablosunda aktif=True ise → ASIN parametreleri
-      2. bid_functions.asin_parametreleri'nde varsa (fallback) → ASIN parametreleri
-      3. Yoksa → tanh_formulu global degerleri
+      1. Yeni yapi: bid_functions.asin_parametreleri[ASIN][targeting_type] (aktif=True)
+      2. Supabase asin_bid_params tablosunda aktif=True ise → ASIN parametreleri
+      3. Eski yapi: bid_functions.asin_parametreleri[ASIN] (duz format, aktif=True)
+      4. Yoksa → tanh_formulu global degerleri
+
+    targeting_type: "KEYWORD" veya "PRODUCT_TARGET" (opsiyonel, geriye uyumlu)
 
     Donus: (hassasiyet, max_degisim, parametre_kaynagi)
-      parametre_kaynagi: "ASIN_OZEL" veya "GLOBAL" — log ve Excel raporuna yazilir.
+      parametre_kaynagi: "ASIN_TIP", "ASIN_OZEL" veya "GLOBAL" — log ve Excel raporuna yazilir.
     """
     global_params = bid_funcs.get("tanh_formulu", {})
     global_hass = global_params.get("hassasiyet", 0.8)
@@ -692,13 +695,27 @@ def get_tanh_params_for_asin(asin, bid_funcs):
     if not asin:
         return global_hass, global_max, "GLOBAL"
 
-    # Supabase asin_bid_params tablosundan oku (oncelikli)
+    # 1. Yeni yapi: ASIN x targeting_type (bid_functions.asin_parametreleri)
+    if targeting_type:
+        asin_params = bid_funcs.get("asin_parametreleri", {})
+        asin_val = asin_params.get(asin)
+        if isinstance(asin_val, dict) and targeting_type in asin_val:
+            tip_entry = asin_val[targeting_type]
+            if isinstance(tip_entry, dict) and tip_entry.get("aktif", False):
+                hass = tip_entry.get("hassasiyet", global_hass)
+                maxd = tip_entry.get("max_degisim", global_max)
+                return hass, maxd, f"ASIN_TIP ({targeting_type})"
+
+    # 2. Supabase asin_bid_params tablosundan oku
     asin_entry = _get_asin_bid_params_cache().get(asin)
 
-    # Fallback: bid_functions.asin_parametreleri (eski format)
+    # 3. Eski format fallback: bid_functions.asin_parametreleri (duz yapi)
     if not asin_entry:
         asin_params = bid_funcs.get("asin_parametreleri", {})
-        asin_entry = asin_params.get(asin)
+        entry = asin_params.get(asin)
+        # Eski format: dogrudan hassasiyet/max_degisim iceren dict
+        if isinstance(entry, dict) and "hassasiyet" in entry:
+            asin_entry = entry
 
     if not asin_entry or not isinstance(asin_entry, dict):
         return global_hass, global_max, "GLOBAL"
@@ -773,8 +790,16 @@ def calculate_new_bid(segment, target, hedef_acos, settings, bid_funcs, previous
     if mevcut_bid <= 0:
         return 0, 0, "Mevcut bid bilgisi bulunamadi"
 
+    # ── Hedefleme tipini belirle ──────────────────────────────────────────
+    hedefleme_str = target.get("hedefleme", "")
+    ad_type = target.get("reklam_tipi", "SP")
+    if ad_type == "SD" or "asin=" in hedefleme_str.lower() or "category" in hedefleme_str.lower():
+        targeting_type = "PRODUCT_TARGET"
+    else:
+        targeting_type = "KEYWORD"
+
     # ── Parametreleri yukle (ASIN ozel veya global) ──────────────────────
-    hassasiyet, max_degisim, param_kaynagi = get_tanh_params_for_asin(asin, bid_funcs)
+    hassasiyet, max_degisim, param_kaynagi = get_tanh_params_for_asin(asin, bid_funcs, targeting_type)
 
     seg_params     = bid_funcs.get("segment_parametreleri", {})
     genel_limit    = bid_funcs.get("genel_limitler", {})
@@ -1922,6 +1947,7 @@ def _sync_agent2_to_supabase(hesap_key, marketplace, today,
                 "portfolio": _get_portfolio(r),
                 "reason": r.get("sebep", ""),
                 "karar_durumu": "PENDING",
+                "asin": r.get("asin", ""),
             })
         if bid_data:
             db.insert_bid_recommendations(hesap_key, marketplace, today, bid_data)

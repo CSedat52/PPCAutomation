@@ -619,7 +619,7 @@ class SupabaseClient:
                 "impressions", "clicks", "cost", "sales", "orders",
                 "acos", "cvr", "cpc",
                 "portfolio", "reason",
-                "decision"]
+                "decision", "asin"]
         rows = []
         for d in data:
             rows.append((
@@ -648,7 +648,8 @@ class SupabaseClient:
                 self._safe_numeric(d.get("cpc")),
                 d.get("portfolio"),
                 d.get("reason") or d.get("sebep"),
-                d.get("karar_durumu", "PENDING")
+                d.get("karar_durumu", "PENDING"),
+                d.get("asin"),
             ))
         return self._insert_batch("bid_recommendations", cols, rows)
 
@@ -958,6 +959,105 @@ class SupabaseClient:
             report.get("onay_bekliyor", {}).get("bekleyen_oneri_sayisi", 0),
             report.get("ozet")
         ))
+
+    # ==========================================
+    # BID PARAM REGRESSION (v4)
+    # ==========================================
+
+    def upsert_bid_param_regression(self, hesap_key: str, mp: str, data: dict) -> str:
+        """Regresyon sonucunu kaydet/guncelle, ID dondur."""
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO bid_param_regression
+                    (hesap_key, marketplace, asin, targeting_type, hedef_acos,
+                     alpha_fit, beta_fit_pp, r_squared, alpha_std_err, beta_std_err,
+                     fit_basarili, veri_noktasi, hassasiyet_mevcut, max_degisim_mevcut,
+                     parametre_kaynagi, ort_gap_closure, ort_acos_once, ort_acos_sonra,
+                     analysis_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (hesap_key, marketplace, asin, targeting_type, analysis_date)
+                DO UPDATE SET
+                    hedef_acos = EXCLUDED.hedef_acos,
+                    alpha_fit = EXCLUDED.alpha_fit,
+                    beta_fit_pp = EXCLUDED.beta_fit_pp,
+                    r_squared = EXCLUDED.r_squared,
+                    alpha_std_err = EXCLUDED.alpha_std_err,
+                    beta_std_err = EXCLUDED.beta_std_err,
+                    fit_basarili = EXCLUDED.fit_basarili,
+                    veri_noktasi = EXCLUDED.veri_noktasi,
+                    hassasiyet_mevcut = EXCLUDED.hassasiyet_mevcut,
+                    max_degisim_mevcut = EXCLUDED.max_degisim_mevcut,
+                    parametre_kaynagi = EXCLUDED.parametre_kaynagi,
+                    ort_gap_closure = EXCLUDED.ort_gap_closure,
+                    ort_acos_once = EXCLUDED.ort_acos_once,
+                    ort_acos_sonra = EXCLUDED.ort_acos_sonra,
+                    created_at = NOW()
+                RETURNING id
+            """, (
+                hesap_key, mp,
+                data.get("asin"),
+                data.get("targeting_type"),
+                data.get("hedef_acos"),
+                data.get("alpha_fit"),
+                data.get("beta_fit_pp"),
+                data.get("r_squared"),
+                data.get("alpha_std_err"),
+                data.get("beta_std_err"),
+                data.get("fit_basarili", False),
+                data.get("veri_noktasi", 0),
+                data.get("hassasiyet_mevcut"),
+                data.get("max_degisim_mevcut"),
+                data.get("parametre_kaynagi"),
+                data.get("ort_gap_closure"),
+                data.get("ort_acos_once"),
+                data.get("ort_acos_sonra"),
+                data.get("analysis_date"),
+            ))
+            row = cur.fetchone()
+            cur.close()
+            return str(row[0]) if row else None
+        finally:
+            conn.close()
+
+    def insert_bid_param_regression_data(self, regression_id: str, hesap_key: str,
+                                          mp: str, data_points: list):
+        """Regresyon veri noktalarini kaydet. Once eski noktalari sil."""
+        if not data_points:
+            return
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            # Eski veri noktalarini sil
+            cur.execute("DELETE FROM bid_param_regression_data WHERE regression_id = %s",
+                        (regression_id,))
+            # Yeni noktalari ekle
+            cols = [
+                "regression_id", "hesap_key", "marketplace", "asin", "targeting_type",
+                "targeting_id", "decision_date", "bid_degisim",
+                "acos_once", "acos_sonra", "acos_degisim", "gap_closure",
+                "spend_before", "spend_after"
+            ]
+            values = []
+            for dp in data_points:
+                values.append((
+                    regression_id, hesap_key, mp,
+                    dp.get("asin"), dp.get("targeting_type"),
+                    dp.get("targeting_id"), dp.get("decision_date"),
+                    dp.get("bid_degisim"),
+                    dp.get("acos_once"), dp.get("acos_sonra"),
+                    dp.get("acos_degisim"), dp.get("gap_closure"),
+                    dp.get("spend_before"), dp.get("spend_after"),
+                ))
+            placeholders = ", ".join(["%s"] * len(cols))
+            template = f"({placeholders})"
+            sql = f"INSERT INTO bid_param_regression_data ({', '.join(cols)}) VALUES %s"
+            execute_values(cur, sql, values, template=template, page_size=500)
+            cur.close()
+        finally:
+            conn.close()
 
     # ==========================================
     # HATA LOGLARI

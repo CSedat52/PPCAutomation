@@ -64,7 +64,7 @@ class KPICollector:
                        match_type, segment, current_bid, recommended_bid,
                        decision_bid, bid_change_pct,
                        impressions, clicks, cost, sales, orders, acos, cvr, cpc,
-                       portfolio, decision
+                       portfolio, decision, asin
                 FROM bid_recommendations
                 WHERE hesap_key = %s AND marketplace = %s
                   AND analysis_date = %s
@@ -78,6 +78,9 @@ class KPICollector:
             logger.info("Bugun icin onaylanmis karar yok: %s", today)
             return
 
+        # ASIN hedeflerini yukle (hedef_acos icin)
+        asin_hedefleri = self._get_asin_hedefleri()
+
         mevcut_idler = {
             f"{k['tarih']}_{k['hedefleme_id']}"
             for k in self.db.get("karar_gecmisi")["kararlar"]
@@ -89,11 +92,27 @@ class KPICollector:
              match_type, segment, current_bid, recommended_bid,
              decision_bid, bid_change_pct,
              impressions, clicks, cost, sales, orders, acos, cvr, cpc,
-             portfolio, decision) = row
+             portfolio, decision, asin) = row
 
             hedefleme_id = str(keyword_id or target_id or "")
             tarih = str(analysis_date)
             yeni_bid = float(decision_bid or recommended_bid or 0)
+
+            # Targeting type belirleme
+            if keyword_id:
+                targeting_type = "KEYWORD"
+            elif target_id:
+                targeting_type = "PRODUCT_TARGET"
+            else:
+                targeting_str = (targeting or "").lower()
+                if "asin=" in targeting_str or "category" in targeting_str:
+                    targeting_type = "PRODUCT_TARGET"
+                else:
+                    targeting_type = "KEYWORD"
+
+            # Hedef ACoS
+            asin_str = asin or ""
+            hedef_acos = asin_hedefleri.get(asin_str, {}).get("hedef_acos") if asin_str else None
 
             uid = f"{tarih}_{hedefleme_id}"
 
@@ -104,12 +123,14 @@ class KPICollector:
                 "hedefleme":      keyword_text or targeting or "",
                 "kampanya":       campaign_name or "",
                 "portfolio_id":   portfolio or "",
-                "asin":           "",
+                "asin":           asin_str,
                 "segment":        segment or "",
                 "onceki_bid":     float(current_bid or 0),
                 "yeni_bid":       yeni_bid,
                 "degisim_yuzde":  float(bid_change_pct or 0),
                 "sebep":          "",
+                "targeting_type": targeting_type,
+                "hedef_acos":     hedef_acos,
                 "metrikler": {
                     "impressions": int(impressions or 0),
                     "clicks":      int(clicks or 0),
@@ -133,6 +154,20 @@ class KPICollector:
 
         logger.info("%d yeni karar, %d mevcut guncellendi",
                     ozet["yeni_karar"], ozet["guncellenen_karar"])
+
+    def _get_asin_hedefleri(self) -> dict:
+        """Settings tablosundan ASIN hedeflerini yukle."""
+        try:
+            sdb = self._get_sdb()
+            row = sdb._fetch_one("""
+                SELECT asin_hedefleri FROM settings
+                WHERE hesap_key = %s AND marketplace = %s
+            """, (self.hesap_key, self.marketplace))
+            if row and row[0]:
+                return row[0] if isinstance(row[0], dict) else {}
+        except Exception as e:
+            logger.warning("asin_hedefleri yuklenemedi: %s", e)
+        return {}
 
     # ----------------------------------------------- execution_items eslestirme
     def _isle_rollback(self, today: str, ozet: dict):
