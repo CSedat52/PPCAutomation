@@ -142,6 +142,8 @@ def load_settings():
                 for i, key in enumerate(keys):
                     if row[i]:
                         result[key] = row[i] if isinstance(row[i], dict) else json.loads(row[i])
+                    else:
+                        result[key] = {}
                 logger.info("Settings Supabase'den yuklendi (%s/%s)", hk, mp)
                 return result
         except Exception as e:
@@ -1888,7 +1890,7 @@ def verify_api_response(api_response, expected_action):
     # String response
     elif isinstance(api_response, str):
         try:
-            parsed = json.loads(api_response)
+            parsed = json.loads(api_response.strip())
             return verify_api_response(parsed, expected_action)
         except json.JSONDecodeError:
             if "error" in api_response.lower():

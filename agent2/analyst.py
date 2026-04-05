@@ -140,6 +140,8 @@ def load_settings():
                 for i, key in enumerate(keys):
                     if row[i]:
                         result[key] = row[i] if isinstance(row[i], dict) else json.loads(row[i])
+                    else:
+                        result[key] = {}
                 logger.info("Settings Supabase'den yuklendi (%s/%s)", hk, mp)
                 return result
         except Exception as e:
@@ -602,7 +604,7 @@ def segmentize(target, settings, previous_decisions):
       4. ACoS Optimizasyonu → SUPER_STAR / TUZAK / KAZANAN / OPTIMIZE_ET / ZARAR
     """
     esikler = settings["esik_degerleri"]
-    ozel = settings["ozel_kurallar"]
+    ozel = settings.get("ozel_kurallar", {})
     gosterim_esik = esikler["gosterim_esik"]
     tiklama_esik = esikler["tiklama_esik"]
 
@@ -620,7 +622,7 @@ def segmentize(target, settings, previous_decisions):
     if prev and ozel.get("impression_takibi", {}).get("aktif", True):
         prev_imp = prev.get("metrikler", {}).get("impressions", 0)
         prev_bid = prev.get("yeni_bid", prev.get("onceki_bid", 0))
-        imp_esik = ozel["impression_takibi"]["impression_dusus_esik_yuzde"] / 100
+        imp_esik = ozel.get("impression_takibi", {}).get("impression_dusus_esik_yuzde", 30) / 100
 
         if prev_bid != prev.get("onceki_bid", 0) and prev_imp > gosterim_esik:
             imp_degisim = (imp - prev_imp) / prev_imp if prev_imp > 0 else 0

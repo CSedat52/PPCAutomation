@@ -89,8 +89,8 @@ def get_data_dir(hesap_key, marketplace):
 RETRY_MAX = 3
 RETRY_RATE_LIMIT_WAIT = 60
 RETRY_TIMEOUT_WAIT = 15
-REPORT_MAX_WAIT = 1200
-REPORT_POLL_INTERVAL = 45     # v12: 90 → 45 sn (1200s'de 27 poll, 429 riski dusuk)
+REPORT_MAX_WAIT = 1800
+REPORT_POLL_INTERVAL = 60     # v13: 45 → 60 sn (1800s'de 30 poll)
 REPORTING_CONTENT_TYPE = "application/vnd.createasyncreportrequest.v3+json"
 
 
@@ -184,6 +184,15 @@ class AmazonAdsClient:
                 resp.raise_for_status()
                 return resp.json()
 
+            except (httpx.RemoteProtocolError, httpx.ConnectError) as e:
+                last_error = e
+                if attempt < RETRY_MAX:
+                    wait = 30 * (2 ** attempt)
+                    logger.warning("Baglanti hatasi (%s), %ds sonra tekrar denenecek (deneme %d/%d): %s",
+                                   type(e).__name__, wait, attempt + 1, RETRY_MAX, str(e)[:200])
+                    await asyncio.sleep(wait)
+                    continue
+                raise
             except httpx.TimeoutException:
                 if attempt < RETRY_MAX:
                     wait = RETRY_TIMEOUT_WAIT * (attempt + 1)
@@ -229,6 +238,20 @@ class AmazonAdsClient:
                     return {"reportId": match.group(1)}
                 else:
                     return {"error": f"HTTP 425", "details": error_body}
+            elif e.response and e.response.status_code == 429:
+                logger.warning("Report create 429 rate limit, 60s bekleniyor...")
+                await asyncio.sleep(60)
+                try:
+                    data = await self.post("/reporting/reports", payload,
+                                            content_type=REPORTING_CONTENT_TYPE,
+                                            include_account_id=True)
+                except httpx.HTTPStatusError as e2:
+                    error_body2 = e2.response.text[:500] if e2.response else ""
+                    return {"error": f"HTTP {e2.response.status_code} (retry)", "details": error_body2}
+                report_id = data.get("reportId")
+                if not report_id:
+                    return {"error": "Report ID yok (retry)"}
+                return {"reportId": report_id}
             else:
                 return {"error": f"HTTP {e.response.status_code}", "details": error_body}
 

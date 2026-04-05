@@ -549,7 +549,19 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
         output = result.stdout.strip()
         json_start, json_end = _extract_outer_json(output)
         if json_start >= 0:
-            return json.loads(output[json_start:json_end+1])
+            json_str = output[json_start:json_end+1]
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError as e:
+                try:
+                    decoder = json.JSONDecoder()
+                    result, _ = decoder.raw_decode(json_str.strip())
+                    logger.warning("Agent 3 dry-run: Extra data atildi, ilk JSON nesnesi kullanildi")
+                    return result
+                except json.JSONDecodeError:
+                    logger.error("Agent 3 dry-run JSON parse basarisiz. Raw output (ilk 500 char): %s",
+                                 json_str[:500])
+                    raise RuntimeError(f"Agent 3 dry-run JSON parse hatasi: {e}")
         raise RuntimeError(f"Agent 3 dry-run JSON ciktisi alinamadi. Output: {output[:500]}")
 
     success, dry_result, error_info = retry_handler.execute_with_retry(

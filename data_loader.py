@@ -349,17 +349,19 @@ def load_pipeline_sessions(hesap_key, marketplace, limit=50):
     try:
         sdb = _get_sdb()
         rows = sdb._fetch_all("""
-            SELECT session_id, status, agent1_status, agent2_status,
-                   agent3_status, agent4_status, started_at, completed_at,
-                   summary, current_step, error_message
+            SELECT session_id, status, current_step, error_message,
+                   started_at, updated_at, completed_at,
+                   agent1_completed_at, agent2_completed_at,
+                   agent3_completed_at, agent4_completed_at
             FROM pipeline_runs
             WHERE hesap_key = %s AND marketplace = %s
             ORDER BY started_at DESC LIMIT %s
         """, (hesap_key, marketplace, limit))
         if rows:
-            cols = ["session_id", "status", "agent1_status", "agent2_status",
-                    "agent3_status", "agent4_status", "started_at", "completed_at",
-                    "summary", "current_step", "error_message"]
+            cols = ["session_id", "status", "current_step", "error_message",
+                    "started_at", "updated_at", "completed_at",
+                    "agent1_completed_at", "agent2_completed_at",
+                    "agent3_completed_at", "agent4_completed_at"]
             return [dict(zip(cols, r)) for r in rows]
     except Exception as e:
         logger.debug("Pipeline sessions Supabase'den okunamadi: %s", e)
