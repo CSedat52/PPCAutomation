@@ -1,554 +1,150 @@
-# Amazon PPC Otomasyon Sistemi — Master Agent (Multi-Account v2)
+# Amazon PPC Otomasyon Sistemi
 
-## Sen Kimsin
-Sen Amazon PPC otomasyon sisteminin yardimci aracisin.
+3 hesap, 12 marketplace icin Amazon PPC kampanyalarini yoneten otomasyon sistemi.
+Agent 1-3 saf Python ($0), Agent 4 Asama 2 Claude Code (~$0.01-0.02/calisma).
 
-Bu sistemde 4 agent var — Agent 1 (veri toplama), Agent 2 (analiz), Agent 3 (uygulama), Agent 4 (optimizasyon). Agent 1-3 tamamen Python scriptleridir ve Claude Code gerektirmez. Pipeline otomasyonu pipeline_runner.py (cron) ve maestro watch daemon (systemd) tarafindan yonetilir.
+## Hesaplar
 
-Senin iki rolun var:
-1. **Agent 4 Asama 2 (otomatik):** Watch daemon seni cagirdiginda `agent4_error_data.json` dosyasini okuyup hata analizi ve iyilestirme onerileri uretirsin. Bid param optimizasyonu Python tarafindan yapilir, senin gorevin DEGIL.
-2. **Interaktif yardimci (manuel):** Kullanici seni terminalde calistirdiginda agent'lari manuel calistirabilir, hata ayiklama yapabilir, sistemi inceleyebilirsin.
+| Hesap Key | Marketplace'ler |
+|-----------|-----------------|
+| vigowood_na | US, CA |
+| vigowood_eu | UK, DE, FR, ES, IT, SE, PL, NL |
+| qmmp_na | US, CA |
 
-## CALISMA MODLARI
+Veri izolasyonu: `data/{hesap_key}_{marketplace}/`, `config/{hesap_key}_{marketplace}/`
+Hesaplar arasi veri ASLA karistirilmaz.
 
-### Otomatik Mod (Watch Daemon)
-Watch daemon seni Agent 4 Asama 2 icin cagirdiginda:
-- Kullaniciya HICBIR SEY SORMA
-- `agent4/AGENT4_CLAUDE_INSTRUCTIONS.md` dosyasini oku ve talimatlari takip et
-- `agent4_error_data.json` dosyasini oku, hata analizi yap, onerileri Supabase'e yaz
-- CLAUDE.md OKUMA, kaynak kod dosyalari OKUMA — sadece yukaridaki 2 dosya
-- Bitince CIK
-
-### Interaktif Mod (Manuel Kullanim)
-Kullanici seni terminalde calistirdiginda:
-- Komutlara gore agent'lari calistirabilirsin
-- Hata ayiklama yapabilirsin
-- Sistem durumunu sorgulayabilirsin
-- Her adimda kullanicidan onay al (Agent 3 haric — Agent 3 icin MUTLAKA onay gerekli)
-
----
-
-## Multi-Account Mimari
-
-Sistem 3 hesap ve 12 marketplace'i yonetir. Her islem hesap+marketplace bazlidir.
-
-### Hesaplar
-| Hesap Key | Hesap Adi | Marketplace'ler |
-|-----------|-----------|-----------------|
-| vigowood_na | Vigowood NA (HassWoodtech) | US, CA |
-| vigowood_eu | Vigowood EU | UK, DE, FR, ES, IT, SE, PL, NL |
-| qmmp_na | qmmp NA | US, CA |
-
-### Veri Izolasyonu
-Her hesap+marketplace kombinasyonu kendi izole klasorune sahiptir:
-- Veriler: `data/{hesap_key}_{marketplace}/` (ornek: `data/vigowood_na_US/`)
-- Config: `config/{hesap_key}_{marketplace}/` (ornek: `config/vigowood_na_US/`)
-- Hesaplar arasi veri ASLA karistirilmaz.
-
-### Kimlik Bilgileri
-- `config/accounts.json` — Tum hesaplarin credential'lari, profile_id'leri, API endpoint'leri
-- `.env` — Sadece Maestro e-posta ayarlari
-
----
-
-## Proje Dosya Yapisi
+## Dosya Yapisi
 
 ```
 amazon-ppc-automation/
-+-- .env                                 # Maestro e-posta ayarlari
-+-- CLAUDE.md                            # Bu dosya
-+-- pipeline_runner.py                   # Saf Python pipeline ($0 maliyet — cron bunu cagirmali)
-+-- data_loader.py                       # Supabase-first, JSON-fallback veri yukleme modulu
-+-- log_utils.py                         # Ortak hata taksonomisi ve log yardimci fonksiyonlari
-+-- parallel_collector.py                # Paralel veri toplayici (Agent 1 paralel)
-+-- parallel_analyzer.py                 # Paralel analizci (Agent 2 paralel)
++-- pipeline_runner.py              # Cron giris noktasi (Agent 1+2 orkestrasyonu, $0)
++-- parallel_collector.py           # Agent 1 — Amazon API veri toplama (tum MP'ler paralel)
++-- parallel_analyzer.py            # Agent 2 — paralel analiz orkestrator
++-- data_loader.py                  # Supabase-first, JSON-fallback veri yukleme
++-- log_utils.py                    # Ortak hata taksonomisi + log fonksiyonlari
 +-- config/
-|   +-- accounts.json                    # TUM hesap credential'lari ve profile_id'ler
-|   +-- vigowood_na_US/
-|   |   +-- settings.json                # ASIN hedefleri, esik degerleri, agent3 ayarlari
-|   |   +-- bid_functions.json           # Bid formul parametreleri (tanh)
-|   +-- vigowood_na_CA/
-|   |   +-- settings.json
-|   |   +-- bid_functions.json
-|   +-- vigowood_eu_UK/
-|   |   +-- ...
-|   +-- (her marketplace icin ayri config klasoru)
-+-- agent2/
-|   +-- __init__.py
-|   +-- analyst.py                       # Agent 2 v5 — Analiz scripti (multi-account)
-+-- agent3/
-|   +-- __init__.py
-|   +-- executor.py                      # Agent 3 v3 — Executor scripti (multi-account)
+|   +-- accounts.json               # Amazon API credential'lari (git'e COMMITLENMEZ)
++-- agent2/analyst.py               # Agent 2 — segmentasyon, tanh bid hesaplama, Excel rapor
++-- agent3/executor.py              # Agent 3 — Amazon API execution + decision_history yazma
 +-- agent4/
-|   +-- __init__.py
-|   +-- optimizer.py                     # Agent 4 v3 — Optimizer (multi-account, Supabase only)
-|   +-- db_manager.py                    # v3 — Supabase only, JSON kaldirildi
-|   +-- kpi_collector.py                 # v3 — Supabase only (bid_recommendations, targeting_reports)
-|   +-- bid_param_analyzer.py            # v3 — ASIN bazli bid param etki analizi
-|   +-- proposal_engine.py               # v3 — Sadece writer, statik kurallar kaldirildi
-|   +-- report_generator.py              # v3 — agent4_analysis.json ciktisi
+|   +-- optimizer.py                # Agent 4 orkestrator (4 adim)
+|   +-- kpi_collector.py            # decision_history kpi_after doldurma (targeting_reports'tan)
+|   +-- bid_param_analyzer.py       # Gap closure regresyon (scipy curve_fit)
+|   +-- proposal_engine.py          # proposals_system tablosuna yazar + CLI
+|   +-- report_generator.py         # agent4_analysis.json + error_data.json + konsol ozeti
 |   +-- analyzers/
-|       +-- __init__.py
-|       +-- segment_analyzer.py          # v3 — decision_history tablosundan okur
-|       +-- error_analyzer.py            # v3 — agent_logs tablosundan okur
-|       +-- maestro_analyzer.py          # v3 — pipeline_runs tablosundan okur
+|       +-- error_analyzer.py       # agent_logs'dan hata kalip tespiti
+|       +-- maestro_analyzer.py     # pipeline_runs'dan pipeline saglik analizi
 +-- maestro/
-|   +-- __init__.py
-|   +-- config.py                        # v2 — init_account(), get_active_pipelines()
-|   +-- state_manager.py
-|   +-- email_handler.py
-|   +-- retry_handler.py                 # log_utils.classify_error_type kullanir
-|   +-- maestro_agent.py                 # v2 — run_all_pipelines(), start_pipeline(hesap,mp)
-|   +-- logs/
-|       +-- maestro_log_{tarih}.log      # Session text loglari (30 gun rotasyon)
+|   +-- maestro_agent.py            # Watch daemon + Agent 3/4 orkestrator
+|   +-- config.py                   # init_account(), get_active_pipelines()
+|   +-- state_manager.py, email_handler.py, retry_handler.py
 +-- supabase/
-|   +-- __init__.py
-|   +-- db_client.py                     # Supabase client (psycopg2)
-|   +-- migrations/
-|       +-- 001_initial_schema.sql
-|       +-- 002_campaign_reports_daily.sql
-|       +-- 003_kpi_optimizer_v4.sql
-|       +-- 004_kpi_daily.sql
-+-- data/
-    +-- vigowood_na_US/
-    |   +-- *.json                       # Agent 1 ciktilari
-    |   +-- analysis/                    # Agent 2 Excel raporlari
-    |   +-- agent4/
-    |       +-- raporlar/                # Durum raporlari
-    |       +-- agent4_analysis.json     # Claude Code girdi dosyasi
-    +-- vigowood_na_CA/
-    |   +-- (ayni yapi)
-    +-- (her marketplace icin ayri data klasoru)
+|   +-- db_client.py                # PostgreSQL client (psycopg2)
+|   +-- migrations/                 # Schema migration dosyalari (001-005)
++-- data/{hesap}_{mp}/
+    +-- *.json                      # Agent 1 ciktilari
+    +-- analysis/                   # Agent 2 Excel raporlari
+    +-- agent4/
+        +-- agent4_analysis.json    # Agent 4 analiz ciktisi
+        +-- agent4_error_data.json  # Claude Code Phase 2 girdi dosyasi
 ```
 
----
+## Konfigurasyon
 
-## Agent Listesi
+Tum ayarlar Supabase'den okunur (JSON fallback yok):
+- `settings` tablosu: ASIN hedefleri, esik degerleri, segmentasyon kurallari
+- `bid_functions` tablosu: tanh formul parametreleri, segment parametreleri
+- `accounts.json`: Amazon API credential'lari (lokal dosya, Supabase'e tasinmaz)
+- `.env`: Maestro e-posta ayarlari (GMAIL_ADDRESS, APP_PASSWORD, NOTIFY_EMAIL)
 
-### Agent 1: Data Collector (parallel_collector.py)
-Script: `parallel_collector.py`
-Cagiris: `python parallel_collector.py <hesap_key>:<marketplace> [...]`
-Ornek: `python parallel_collector.py vigowood_na:US vigowood_eu:DE`
-Gorevi: Amazon API'den SP + SB + SD verilerini ceker.
+## Pipeline Akisi
 
-Teknik: accounts.json'dan credential okur. Tum hesaplar ve marketplace'ler TAMAMEN PARALEL calisir.
-
-### Agent 2: Analyst v5 (Multi-Account)
-Script: `agent2/analyst.py`
-Cagiris: `python agent2/analyst.py <hesap_key> <marketplace>`
-Ornek: `python agent2/analyst.py vigowood_na US`
-Gorevi: Verileri 8 segmente ayirir, tanh formuluyle bid tavsiyeleri uretir. 3 Excel raporu olusturur.
-Ciktilar: `data/{hesap}_{mp}/analysis/{tarih}_bid_recommendations.xlsx`, `_negative_candidates.xlsx`, `_harvesting_candidates.xlsx`
-
-### Agent 3: Executor v3 (Multi-Account)
-Script: `agent3/executor.py`
-Cagiris: `python agent3/executor.py <hesap_key> <marketplace> [--execute] [--verify] [--collect-verify]`
-Ornek: `python agent3/executor.py vigowood_na US`                   (dry-run)
-Ornek: `python agent3/executor.py vigowood_na US --execute`          (plan + dogrudan API'ye gonder)
-Ornek: `python agent3/executor.py vigowood_na US --collect-verify`   (verify verileri cek)
-Ornek: `python agent3/executor.py vigowood_na US --verify`           (dogrulama yap)
-Gorevi: Onaylanmis kararlari Amazon API uzerinden uygular.
-
-### Agent 4: Optimizer & Learning Agent v3 (Multi-Account, Supabase Only)
-Script: `agent4/optimizer.py`
-Cagiris: `python agent4/optimizer.py <hesap_key> <marketplace>`
-Ornek: `python agent4/optimizer.py vigowood_na US`
-Gorevi: 3 ana gorev — bid param optimizasyonu, hata tespiti & cozum, sistem iyilestirme.
-Calisma zamani: Agent 3 verify tamamlandiktan HEMEN SONRA.
-
-**Yeni v3 Akisi:**
 ```
-Python (pure, $0 maliyet)                    Claude Code (dinamik zeka)
-═══════════════════════════                   ═══════════════════════════
-[1] DBManager (Supabase only)
-[2] KPICollector (Supabase only)
-[3] SegmentAnalyzer (Supabase only)
-[4] ErrorAnalyzer (Supabase only)
-[5] MaestroAnalyzer (Supabase only)
-[6] BidParamAnalyzer (Supabase only)
-        │
-        ▼
-  agent4_analysis.json ──────────────────────→ Claude Code okur
-  (tum analiz ciktilari tek dosya)              │
-                                                ▼
-                                          Dinamik Analiz (1 gorev):
-                                              - Hata analizi ve iyilestirme onerileri
-                                          (Bid param optimizasyonu Python'da yapilir)
-                                                │
-                                                ▼
-                                          proposals tablosuna yazar
-                                          (onay bekler, auto-apply YOK)
+Cron (02:00 UTC, 3 gunde bir)
+  |
+  +-> pipeline_runner.py
+        |-> parallel_collector.py (Agent 1) — Amazon API'den veri ceker
+        |-> parallel_analyzer.py (Agent 2) — Analiz + Excel rapor uretir
+        |-> Eksik rapor varsa retry
+        +-> CIK — watch daemon devralir
+
+Watch Daemon (systemd: ppc-watcher.service, 7/24 calisiyor)
+  |
+  +-> execution_queue tablosunu dinler (5 dk aralik)
+        |-> Dashboard'dan onay gelince:
+              |-> Agent 3 — Amazon API'ye uygular + decision_history'ye yazar ($0)
+              |-> Agent 4 Asama 1 — Python analiz ($0)
+              |     [1/4] KPICollector: decision_history kpi_after doldurur
+              |     [2/4] ErrorAnalyzer: agent_logs hata kalip tespiti
+              |     [3/4] MaestroAnalyzer: pipeline saglik analizi
+              |     [4/4] BidParamAnalyzer: gap closure regresyon
+              +-> Agent 4 Asama 2 — Claude Code hata analizi (~$0.01-0.02)
 ```
 
-Tum veri Supabase'den okunur, JSON dosya fallback kaldirildi.
+maestro_agent.py CLI: `watch [dakika]`, `status [hesap mp]`, `accounts`
 
-Oneri yonetimi:
-```bash
-python agent4/optimizer.py vigowood_na US oneri listele
-python agent4/optimizer.py vigowood_na US oneri onayla ONR-XXXXXXXX
-python agent4/optimizer.py vigowood_na US oneri reddet ONR-XXXXXXXX [sebep]
-python agent4/optimizer.py vigowood_na US durum
+## Bid Param Optimizasyon Dongusu
+
+Bid formulu (Agent 2):
+```
+bid_degisim = -tanh(acos_fark_orani × hassasiyet) × max_degisim
+acos_fark_orani = (mevcut_acos - hedef_acos) / hedef_acos
 ```
 
-KRITIK KURAL: Agent 4 hicbir dosyayi otomatik degistirmez. Tum oneriler onayini bekler.
-
-### Asama 2: Claude Code — Hata Analizi
-
-Watch daemon tarafindan otomatik cagirilir. Asama 1 tamamlandiktan sonra.
-
-**ONEMLI:** Claude Code artik bid param optimizasyonu YAPMAZ — bu gorev
-tamamen Python'a tasindi (tanh regresyon). Claude Code SADECE hata analizi yapar.
-
-**Talimat dosyasi:** Claude Code `CLAUDE.md` OKUMAZ.
-Bunun yerine `agent4/AGENT4_CLAUDE_INSTRUCTIONS.md` dosyasini okur (~50 satir).
-
-**Veri dosyasi:** Claude Code `agent4_analysis.json` OKUMAZ.
-Bunun yerine `agent4_error_data.json` dosyasini okur (sadece hata + maestro verileri).
-
-**Gorev (tek gorev):**
-Hata Analizi ve Iyilestirme Onerileri:
-- hata_analizi bolumundeki tekrarlayan hata kaliplarini incele
-- Kok neden analizi yap
-- Cozum oner (config degisikligi, retry ayari, timeout ayari vb.)
-- Onerileri proposals tablosuna PENDING olarak yaz
-
-**Maliyet:** ~$0.01-0.05 / pipeline calismasi (onceki: ~$0.10-0.30)
-
----
-
-## Hata Loglama Mekanizmasi
-
-### Ortak Hata Taksonomisi
-Tum agentlar ayni hata tiplerini kullanir. Agent 4 ErrorAnalyzer bu tipleri normalize ederek analiz eder.
-
-| Hata Tipi | Aciklama |
-|-----------|----------|
-| RateLimit | HTTP 429, API throttling |
-| AuthError | HTTP 401/403, token suresi dolmus |
-| ApiError | HTTP 400, format/validation hatasi |
-| ServerError | HTTP 500+, Amazon sunucu hatasi |
-| NetworkError | Timeout, connection, DNS hatasi |
-| FileNotFound | Dosya veya rapor bulunamadi |
-| DataError | JSON parse, format uyumsuzlugu, eksik alan |
-| Preflight | On kontrol basarisiz |
-| ExecutionError | API islemi basarisiz (bid, negatif, harvesting) |
-| VerificationError | Dogrulama uyusmazligi |
-| AgentFailure | Alt agent calistirma hatasi (Maestro icin) |
-| ReportFailed | Rapor indirme/olusturma basarisiz |
-| InternalError | Beklenmeyen Python exception |
-
-### Log Dosyalari
-Tum agentlar `save_error_log()` ile Supabase'e structured log yazar.
-JSON dosya yazimi v3'te kaldirildi — tek kaynak Supabase.
-
-| Kaynak | Supabase Tablosu | Icerik |
-|--------|-----------------|--------|
-| Agent 1 | `agent_logs` (agent_id='agent1') | API hatalari, entity/rapor toplama |
-| Agent 2 | `agent_logs` (agent_id='agent2') | Analiz hatalari, preflight |
-| Agent 3 | `agent_logs` (agent_id='agent3') | Execution + verification hatalari |
-| Agent 4 | `agent_logs` (agent_id='agent4') | Optimizer hatalari |
-| Maestro | `maestro_errors` | Pipeline-seviye hatalar, agent failure, email |
-
-Kayit formati (tum agentlarda ayni):
-```json
-{
-  "timestamp": "2026-03-15T09:00:00",
-  "hata_tipi": "RateLimit",
-  "hata_mesaji": "HTTP 429 — Too many requests",
-  "adim": "collect_report",
-  "session_id": "20260315_120000",
-  "extra": {"rapor": "sp_targeting_14d", "hesap": "vigowood_na/US"},
-  "traceback": "..."
-}
+Veri akisi:
+```
+Agent 3 bid uygular → decision_history (status=APPLIED, before metrikleri)
+    ↓ (3 gun sonra)
+Agent 1 yeni targeting_reports toplar
+    ↓
+Agent 4 KPICollector → kpi_after doldurur, gap_closure hesaplar (status=VERIFIED)
+    ↓ (20+ veri noktasi biriktikten sonra)
+Agent 4 BidParamAnalyzer → (ASIN × targeting_type) bazinda regresyon
+    ↓
+scipy curve_fit: ideal_bid_degisim = -tanh(x × h_optimal) × m_optimal
+    ↓
+bid_param_regressions + regression_data_points tablolarina yazar
+    ↓
+Dashboard: regresyon grafigi (noktalar + mevcut egri + optimal egri)
 ```
 
-### session_id Korelasyonu
-Pipeline calistiginda Maestro her agent'a session_id iletir:
-- Maestro: Kendi hatalarinda dogrudan `session_id` yazar
-- Agent 1/2/3: `MAESTRO_SESSION_ID` env var ile alir (subprocess cagrisinda iletilir)
-- Manuel calistirmada: session_id `None` olur — sorun yaratmaz
+Targeting tipleri: KEYWORD (SP/SB keyword) ve PRODUCT_TARGET (SP/SB/SD target)
+Her ASIN icin iki ayri regresyon yapilir.
 
-### Log Rotasyonu
-- Supabase agent_logs: Her agent icin son 2000 kayit tutulur. Watch daemon periyodik olarak eski kayitlari siler.
-- `maestro_log_*.log`: Pipeline basinda 30 gunden eski dosyalar otomatik silinir
+## Agent 4 Asama 2 — Claude Code Gorevi
 
-### Agent 4 Log Tuketimi
-Agent 4 ErrorAnalyzer ve MaestroAnalyzer Supabase'den okur:
-- ErrorAnalyzer: agent_logs tablosu (level='error') → hata tipi normalizasyonu, tekrarlayan kalip tespiti
-- MaestroAnalyzer: pipeline_runs tablosu → pipeline saglik analizi, agent basari oranlari
+Watch daemon tarafindan otomatik cagirilir. Tek gorev:
+1. `agent4_error_data.json` dosyasini oku
+2. Tekrarlayan hata kaliplarini analiz et, kok neden tespiti yap
+3. Cozum onerileri uret (config degisikligi, retry ayari, timeout vb.)
+4. Onerileri `proposals_system` tablosuna PENDING olarak yaz
+5. Bid param optimizasyonu YAPMA — Python tarafindan yapiliyor
+6. Bitince CIK
 
----
+## Kritik Kurallar
 
-## INTERAKTIF HATA AYIKLAMA (Manuel Mod)
+1. **Agent 3 guvenlik**: Agent 3 SADECE watch daemon uzerinden tetiklenir. ASLA dogrudan calistirma.
+2. **Veri izolasyonu**: Her agent cagirisinda hesap_key + marketplace ZORUNLU.
+3. **Maliyet**: Agent 1-3 saf Python ($0). Claude Code SADECE Agent 4 Asama 2.
+4. **Hata yonetimi**: Agent 4 Claude Code basarisiz olursa pipeline DURMAZ.
+5. **Onay**: Agent 3 "BOS" donerse hata DEGIL — kullanici henuz onay vermemis.
+6. **Log**: Tum hatalar Supabase `agent_logs` tablosuna yazilir (JSON log yok).
 
-NOT: Bu bolum sadece Claude Code'u interaktif olarak (terminalde) calistirdiginda gecerlidir.
-Otomatik pipeline'da (cron + watch daemon) bu bolum KULLANILMAZ — Agent 1-3 saf Python'dur
-ve kendi retry/error handling mekanizmalari vardir.
+## Hata Taksonomisi
 
-### Temel Felsefe
+Tum agentlar ayni tipleri kullanir: RateLimit, AuthError, ApiError, ServerError,
+NetworkError, FileNotFound, DataError, Preflight, ExecutionError, VerificationError,
+AgentFailure, ReportFailed, InternalError.
 
-Interaktif modda Claude Code'un 3 gucu:
-1. **Kodu okuyabilir** — Agent dosyalarini acip okuyabilir
-2. **Kodu duzeltebilir** — Sorunu tespit ettiginde ilgili dosyayi duzenleyebilir
-3. **Tekrar calistirabilir** — Duzeltmeden sonra agent'i yeniden calistirabilir
+## VPS Bilgileri
 
-### "maestro start" dediginde (TUM HESAPLAR):
-
-**ONCE: Kullaniciya hangi hesaplar icin calistirilacagini sor.**
-Kullanici cevabina gore hedef listesi olustur.
-Ornekler:
-  - "tum hesaplar" → hepsini calistir
-  - "vigowood NA ve EU" → vigowood_na + vigowood_eu
-  - "sadece qmmp amerika" → qmmp_na:US
-  - "vigowood eu almanya ve ingiltere" → vigowood_eu:UK vigowood_eu:DE
-
-**KRITIK: PIPELINE_DATE — Gece Yarisi Korumasi**
-Pipeline basladiginda tarihi kaydet ve TUM adimlarda bu tarihi kullan:
-```
-PIPELINE_DATE = bugunun tarihi (YYYY-MM-DD formatinda, pipeline baslangicinda bir kez belirlenir)
-```
-Bu tarih Agent 2 raporlari, Agent 3 execution plan, verify ve Agent 4'te kullanilir.
-Gece yarisi gecilse bile tarih DEGISMEZ — pipeline bastan sona ayni tarihle calisir.
-
-**ADIM 1: Agent 1 — Paralel Veri Toplama**
-```
-python parallel_collector.py vigowood_na:US vigowood_na:CA vigowood_eu:UK vigowood_eu:DE ...
-```
-
-parallel_collector tum hesaplari ve marketplace'leri TAMAMEN PARALEL calistirir (batch mimarisi kaldirildi).
-Script bitince tum verileri data/{hesap}_{mp}/ altina kaydeder.
-
-**ADIM 2-6: Her hesap+marketplace icin SIRAYLA devam et**
-Veriler toplandiktan sonra her hesap icin sirayla (bir hesap hata verse bile sonrakine gecer):
-
-**ADIM 2: Agent 2 — Paralel Analiz (tum marketplace'ler)**
-- `python parallel_analyzer.py HESAP1:MP1 HESAP2:MP2 ...` calistir (Agent 1 ile ayni target listesi).
-- Tek komut tum marketplace'leri paralel analiz eder ve kompakt ozet basar.
-- Alternatif (tek marketplace): `python agent2/analyst.py HESAP MP`
-- Sonucu degerlendir:
-  - Tum marketplace'ler TAMAMLANDI → devam et.
-  - Hata varsa → PROBLEM COZME MODUNA GIR.
-
-**ADIM 3: Dashboard Onay Bekleme (ayri daemon)**
-- Watch modu artik Maestro pipeline icinde DEGIL, ayri bir daemon olarak calisir
-  (`python -m maestro.maestro_agent watch`).
-- Daemon her 5 dakikada bir Supabase `execution_queue` tablosunu kontrol eder.
-- Dashboard'dan kullanici "Agent3'u Calistir" butonuna bastiginda `execution_queue`'ya
-  `status='pending', command='agent3_execute'` kaydi eklenir.
-- Daemon bu kaydi aldiginda _run_agent3_from_queue() fonksiyonunu cagirir.
-- Bu fonksiyon Agent 3'u direkt Python ile calistirir (Claude Code KULLANMAZ, $0).
-- Agent 3 basarili olursa Agent 4'e gecilir (Asama 1: Python, Asama 2: Claude Code).
-- Gecmis gunlerden kalan pending kayitlar otomatik failed yapilir.
-
-**ADIM 4: Agent 3 — Execution (manuel mod veya watch icinde otomatik)**
-- `python agent3/executor.py HESAP MP --execute --date PIPELINE_DATE` calistir.
-  (Bu komut plan olusturur VE dogrudan Amazon API'ye gonderir.)
-- 5 dakika bekle.
-- Verify verileri cek: `python agent3/executor.py HESAP MP --collect-verify`
-- `python agent3/executor.py HESAP MP --verify --date PIPELINE_DATE` calistir.
-
-**ADIM 5: Agent 4 — Optimizer + Claude Code Dinamik Analiz (her hesap icin)**
-- `python agent4/optimizer.py HESAP MP` calistir.
-  Python adimi bittikten sonra `data/{hesap}_{mp}/agent4/agent4_analysis.json` dosyasi olusur.
-- `agent4_error_data.json` dosyasini oku ve hata analizi yap:
-  **Hata analizi ve iyilestirme onerileri**: Tekrarlayan hata kaliplarini incele, kok neden
-  analizi yap, cozum oner.
-- Bid param optimizasyonu Python tarafindan yapiliyor, sen YAPMA.
-- Uretilen onerileri `proposals` tablosuna yaz (ProposalEngine.write_proposals() veya dogrudan Supabase).
-- bekleyen_oneri_sayisi > 0 → Kullaniciya bildir.
-- ardisik_hata_alarmi = true → KRITIK UYARI.
-- Hata varsa → Problem Cozme Moduna gir.
-- NOT: Agent 4 kendi tarihini kullanir, PIPELINE_DATE gerektirmez.
-
-**ADIM 6: Pipeline Ozet**
-- Agent 2 zaten tum marketplace'leri paralel analiz ettigi icin hesap bazli dongu YOKTUR.
-- Adim 3-5 her marketplace icin sirayla (veya watch modu ile otomatik) calisir.
-- Tum marketplace'ler bittiyse ozet raporla, tamamlandi e-postasi gonder.
-
----
-
-### PROBLEM COZME MODU (Sadece Interaktif Kullanim)
-
-Kullanici bir agent'i manuel calistirdiginda hata alinirsa bu adimlari izle.
-Otomatik pipeline'da bu mod KULLANILMAZ.
-
-Herhangi bir agent hata verdiginde su adimlari izle:
-
-**1. TESHIS — Hatanin ne oldugunu anla**
-   - Hata mesajini oku. HTTP status kodunu, hata tipini, endpoint'i belirle.
-   - Gecici mi (429, 500, timeout) yoksa kalici mi (400, format hatasi, kod hatasi)?
-
-**2. GECICI HATA ise → RETRY**
-   - 429 Rate Limit: 30s bekle, tekrar dene (max 5 kez, artan bekleme)
-   - 500+ Server: 120s bekle, tekrar dene (max 3 kez)
-   - Timeout/Network: 60s bekle, tekrar dene (max 3 kez)
-   - Auth 401/403: Token yenileme gerekebilir, 1 kez tekrar dene.
-
-**3. KALICI HATA ise → KOD ANALIZI VE DUZELTME**
-   a. Hatanin kaynagini bul (endpoint, parametre, alan adi).
-   b. Ilgili kaynak kodu oku (parallel_collector.py, agent2/, agent3/ dosyalarini).
-   c. Sorunu teshis et.
-   d. Duzeltmeyi uygula (SADECE hataya neden olan kismi degistir).
-   e. Agent'i tekrar calistir.
-   f. Basarisiz olursa: Max 3 deneme. Cozemezse kullaniciya raporla.
-
-**4. ONEMLI KURALLAR**
-   - Tahmini duzeltme yapma — once kesin teshis, sonra duzeltme.
-   - Her duzeltmeyi logla — ne, nerede, neden.
-   - Tum agentlar normal Python scriptleri — restart gerekmez.
-   - Agent 3 "BOS" donerse bu hata DEGILDIR — Problem Cozme Moduna girme.
-     Kullanici dashboard'dan onay verene kadar Agent 3 calistirilmaz.
-
----
-
-## MANUEL MOD TALIMATLARI (Interaktif Kullanim)
-
-Kullanici Claude Code'u terminalde calistirdiginda asagidaki komutlara cevap ver.
-Otomatik pipeline'da bu komutlar KULLANILMAZ.
-
-### "verileri topla" veya "agent 1'i calistir" dediginde:
-1. Hangi hesap+marketplace icin oldugunu sor
-2. `python parallel_collector.py HESAP1:MP1 [HESAP2:MP2 ...]` calistir
-3. Sonucu raporla
-
-### "analiz et" veya "agent 2'yi calistir" dediginde:
-1. Hangi hesap+marketplace icin oldugunu sor
-2. `config/{hesap}_{mp}/settings.json` oku ve goster
-3. Kullanicidan onay al
-4. Birden fazla marketplace icin: `python parallel_analyzer.py HESAP1:MP1 HESAP2:MP2 ...` calistir
-   Tek marketplace icin: `python agent2/analyst.py HESAP MP` calistir
-5. Sonuclari raporla
-
-### "agent 3'u calistir" veya "uygula" dediginde:
-1. Hangi hesap+marketplace icin oldugunu sor
-2. `python agent3/executor.py HESAP MP` (dry-run) calistir
-3. "Bu islemler uygulansin mi?" sor
-4. Onaylarsa: `python agent3/executor.py HESAP MP --execute` (plan olusturur + API'ye gonderir)
-5. 5 dk bekle → verify
-
-### "hesaplari goster" dediginde:
-`python -m maestro.maestro_agent accounts` calistir.
-
-### "profilleri goster" dediginde:
-`config/accounts.json` dosyasindan profile bilgilerini oku ve goster.
-
----
-
-## Maestro Komutlari
-
-| Komut | Islem |
-|-------|-------|
-| maestro start | Hesap secimi sor, paralel veri topla, sirayla pipeline |
-| maestro start vigowood_na US | Tek hesap pipeline |
-| maestro resume vigowood_na US | Kaldigi yerden devam |
-| maestro force-start | Duplikasyon kilidini gec (tum hesaplar) |
-| maestro status | Tum hesaplarin durumu |
-| maestro status vigowood_na US | Tek hesap durumu |
-| maestro accounts | Aktif hesap listesi |
-| maestro log | Son log dosyasi |
-| maestro history | Gecmis session ozeti |
-| python parallel_collector.py | Tum hesaplar paralel veri toplama |
-| python parallel_collector.py vigowood_eu | Tek hesap paralel |
-| python parallel_collector.py vigowood_na:US vigowood_eu:DE | Belirli marketplace'ler |
-| python parallel_analyzer.py | Tum hesaplar paralel analiz |
-| python parallel_analyzer.py vigowood_na:US vigowood_eu:DE | Belirli marketplace'ler analiz |
-
----
-
-## Config Dosyalari
-
-### accounts.json (config/ altinda)
-Tum hesaplarin credential'lari, profile_id'leri, marketplace ayarlari.
-**Bu dosya git'e ASLA commitlenmemeli.**
-
-### settings.json (config/{hesap}_{mp}/ altinda)
-Her marketplace icin ASIN hedefleri, esik degerleri, segmentasyon kurallari, agent3 ayarlari.
-
-### bid_functions.json (config/{hesap}_{mp}/ altinda)
-Her marketplace icin bid formul parametreleri (tanh hassasiyet, max degisim, segment parametreleri, ASIN bazli parametreler).
-
-### .env (proje koku)
-Sadece Maestro e-posta ayarlari:
-```
-MAESTRO_GMAIL_ADDRESS=your@gmail.com
-MAESTRO_GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx
-MAESTRO_NOTIFY_EMAIL=your@gmail.com
-```
-
----
-
-## VPS Otonom Mod
-
-Pipeline headless modda (-p flag ile) calistiginda su kurallar gecerlidir:
-
-**!!! KRITIK GUVENLIK KURALI — AGENT 3 KORUMASI !!!**
-Agent 3'u (executor.py --execute) ASLA dogrudan calistirma.
-Agent 3 SADECE watch daemon uzerinden tetiklenir:
-  watch daemon → execution_queue'da pending bulur → _run_agent3_from_queue() cagirir
-Bu kural hicbir kosulda ihlal edilemez. "BOS" sonucu hata DEGILDIR —
-kullanicinin henuz onay vermedigi anlamina gelir. Tekrar deneme YAPMA.
-
-1. Kullaniciya HICBIR SORU SORMA. Tum hesaplar icin otomatik calis.
-2. Agent 1 icin parallel_collector.py'yi subprocess olarak calistir.
-3. Agent 2 bittikten sonra watch moduna GECME — ayri bir Python daemon
-   (maestro watch) zaten execution_queue'yu dinliyor.
-4. Agent 2 tamamlandiginda ozet raporla ve CIK.
-5. Dashboard'dan onay geldiginde watch daemon _run_agent3_from_queue() cagirir.
-   Agent 3 direkt Python ile calisir ($0). Agent 4 Asama 1 Python ($0), Asama 2 Claude Code.
-6. Agent 3+4 bittikten sonra execution_queue kaydini "completed" yapar.
-   Watch daemon sonraki pending kaydi bekler.
-
----
-
-## Maliyet Optimizasyonu
-
-Pipeline maliyeti:
-- Agent 1+2: $0 (saf Python, pipeline_runner.py via cron)
-- Agent 3: $0 (saf Python, watch daemon direkt calistirir)
-- Agent 4 Asama 1: $0 (saf Python, optimizer.py subprocess — bid param regresyon dahil)
-- Agent 4 Asama 2: ~$0.01-0.02 (Dogrudan Anthropic API, tek call)
-- Toplam: ~$0.01-0.02 / pipeline calismasi
-
-Claude Code SADECE Agent 4 Asama 2 icin cagirilir (hata analizi).
-Bid param optimizasyonu tamamen Python'da calisir ($0).
-Agent 4 Claude Code basarisiz olursa pipeline DURMAZ — Python sonuclari yeterli.
-
-### pipeline_runner.py Akisi
-1. `parallel_collector.py` (Agent 1) → subprocess ($0)
-2. `parallel_analyzer.py` (Agent 2) → subprocess ($0)
-3. Supabase'den eksik rapor kontrolu
-4. Eksik varsa → `parallel_collector.py`'yi sadece eksik marketplace'ler icin tekrar cagir
-5. Durum raporu + e-posta
-6. CIK — Agent 3+4 icin watch daemon bekler
-
-### VPS Cron
-```
-0 2 */3 * * cd /home/ppc/amazon-ppc-automation && /usr/bin/python3 pipeline_runner.py >> /home/ppc/amazon-ppc-automation/maestro/logs/pipeline_runner.log 2>&1
-```
-
-ANTHROPIC_API_KEY cron'da GEREKMIYOR — pipeline_runner.py Claude Code cagirmaz.
-API key sadece watch daemon (systemd service) icin gerekli.
-
----
-
-## Temel Kurallar
-1. Kullanicinin parasini yoneten bir sistem — her hata ciddi, gormezden gelme
-2. Hesaplar arasi veri izolasyonu — yanlis klasorden okuma/yazma yapma
-3. Her agent cagirisinda hesap_key + marketplace ZORUNLU parametre
-4. Agent 1 ve Agent 2 sadece veri OKUR, degisiklik YAPMAZ
-5. Agent 3 varsayilan DRY-RUN — Manuel modda kullanici onayi olmadan uygulamaz
-6. Agent 4 sadece ANALIZ + ONERI uretir — hicbir dosyayi otomatik degistirmez
-7. Maestro modunda dry-run → otomatik execute → verify → Agent 4 (soru SORMA)
-8. Hata olursa once KENDIN COZ — kodu oku, teshis et, duzelt, tekrar dene
-9. Max 3 duzeltme denemesi. Cozemezsen kullaniciya detayli rapor ver
-10. Pipeline bir hesapta hata verse bile sonraki hesaba gecmeli
-11. Uzun suren islemleri (parallel_collector, agent3 execute vb.) takip ederken EN AZ 10 DAKIKA arayla kontrol et. Her kontrol token harcar. Collector ortalama 90-120 dakika surer.
-12. Uzun suren background komutlarini takip ederken ASLA TaskOutput kullanma. TaskOutput her seferinde TUM ciktiyi bastan dondurur ve context'i gereksiz sisirir. Bunun yerine `tail -20` veya `tail -30` kullan.
-13. ASLA `python -c "..."` ile cok satirli veya karmasik kod calistirma. Bunun yerine gecici bir .py dosyasi olustur, calistir, sonra sil.
-14. Birden fazla marketplace icin Agent 2 calistirirken `python parallel_analyzer.py` kullan. Tek komut, tek kompakt ozet.
-15. Analiz periyodu 3 gundur
-16. Rakamlari okunakli formatta goster ($1,234.56)
-17. Agent 3 "BOS" veya "0 onaylanmis islem" donerse bu HATA DEGILDIR. Kullanici henuz
-    onay vermemis demektir. Problem Cozme Moduna GIRME, tekrar deneme YAPMA. Pipeline'i
-    "ONAY_BEKLIYOR" statusuyle sonlandir.
-
+- Sunucu: Hetzner CPX22, Ubuntu 24.04, IP 116.203.46.163
+- Kullanici: `ppc` (sudo yok), `root` (systemd islemleri)
+- Cron: `0 2 */3 * * cd /home/ppc/amazon-ppc-automation && /usr/bin/python3 pipeline_runner.py`
+- Service: `ppc-watcher.service` (auto-restart, boot persistence)
+- Firewall: UFW — inbound 22/tcp, outbound 443, 80, 53, 5432
+- DB: Supabase PostgreSQL (free tier)
+- Dashboard: lynor-dashboard.vercel.app (Next.js/TypeScript)
+- GitHub: CSedat52/PPCAutomation, CSedat52/lynor-dashboard
