@@ -123,37 +123,33 @@ def init_paths(hesap_key, marketplace):
 
 
 def load_settings():
-    """Settings'i Supabase'den yukler. Basarisizsa JSON dosyasina fallback."""
+    """Settings'i Supabase'den yukler. Tek kaynak Supabase, fallback yok."""
     hk = os.environ.get("HESAP_KEY", "")
     mp = os.environ.get("MARKETPLACE", "")
-    if hk and mp:
-        try:
-            from supabase.db_client import SupabaseClient
-            db = SupabaseClient()
-            conn = db._conn()
-            cur = conn.cursor()
-            cur.execute("SELECT genel_ayarlar, esik_degerleri, asin_hedefleri, segmentasyon_kurallari, agent3_ayarlari, ozel_kurallar, negatif_keyword_kurali, yeni_keyword_kurali, harvesting_ayarlari FROM settings WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
-            row = cur.fetchone()
-            cur.close()
-            conn.close()
-            if row:
-                result = {}
-                keys = ["genel_ayarlar", "esik_degerleri", "asin_hedefleri", "segmentasyon_kurallari", "agent3_ayarlari", "ozel_kurallar", "negatif_keyword_kurali", "yeni_keyword_kurali", "harvesting_ayarlari"]
-                for i, key in enumerate(keys):
-                    if row[i]:
-                        result[key] = row[i] if isinstance(row[i], dict) else json.loads(row[i])
-                    else:
-                        result[key] = {}
-                logger.info("Settings Supabase'den yuklendi (%s/%s)", hk, mp)
-                return result
-        except Exception as e:
-            logger.warning("Settings Supabase'den okunamadi, dosyaya fallback: %s", e)
-
-    settings_path = CONFIG_DIR / "settings.json"
-    if settings_path.exists():
-        with open(settings_path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    raise FileNotFoundError(f"Settings bulunamadi: Supabase ve {settings_path}")
+    if not (hk and mp):
+        raise RuntimeError("Settings yuklenemedi: HESAP_KEY/MARKETPLACE env var eksik.")
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        conn = db._conn()
+        cur = conn.cursor()
+        cur.execute("SELECT genel_ayarlar, esik_degerleri, asin_hedefleri, segmentasyon_kurallari, agent3_ayarlari, ozel_kurallar, negatif_keyword_kurali, yeni_keyword_kurali, harvesting_ayarlari FROM settings WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        raise RuntimeError(f"Settings Supabase'den okunamadi ({hk}/{mp}). Supabase baglantisini kontrol edin: {e}")
+    if not row:
+        raise RuntimeError(f"Settings Supabase'den okunamadi ({hk}/{mp}). Supabase baglantisini kontrol edin.")
+    result = {}
+    keys = ["genel_ayarlar", "esik_degerleri", "asin_hedefleri", "segmentasyon_kurallari", "agent3_ayarlari", "ozel_kurallar", "negatif_keyword_kurali", "yeni_keyword_kurali", "harvesting_ayarlari"]
+    for i, key in enumerate(keys):
+        if row[i]:
+            result[key] = row[i] if isinstance(row[i], dict) else json.loads(row[i])
+        else:
+            result[key] = {}
+    logger.info("Settings Supabase'den yuklendi (%s/%s)", hk, mp)
+    return result
 
 
 def get_agent3_config(settings):

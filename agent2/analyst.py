@@ -86,8 +86,6 @@ CONFIG_DIR = None
 DATA_DIR = None
 ANALYSIS_DIR = None
 DECISIONS_DIR = None
-SETTINGS_FILE = None
-BID_FUNCTIONS_FILE = None
 
 # Maestro pipeline session ID'si (env var ile iletilir, korelasyon icin)
 MAESTRO_SESSION_ID = os.environ.get("MAESTRO_SESSION_ID")
@@ -96,15 +94,12 @@ MAESTRO_SESSION_ID = os.environ.get("MAESTRO_SESSION_ID")
 def init_paths(hesap_key, marketplace):
     """Hesap+marketplace icin tum path'leri set eder."""
     global CONFIG_DIR, DATA_DIR, ANALYSIS_DIR, DECISIONS_DIR
-    global SETTINGS_FILE, BID_FUNCTIONS_FILE
 
     dir_name = f"{hesap_key}_{marketplace}"
     CONFIG_DIR = BASE_DIR / "config" / dir_name
     DATA_DIR = BASE_DIR / "data" / dir_name
     ANALYSIS_DIR = DATA_DIR / "analysis"
     DECISIONS_DIR = DATA_DIR / "decisions"
-    SETTINGS_FILE = CONFIG_DIR / "settings.json"
-    BID_FUNCTIONS_FILE = CONFIG_DIR / "bid_functions.json"
 
     logger.info("Paths: data=%s, config=%s", DATA_DIR, CONFIG_DIR)
 
@@ -121,67 +116,61 @@ CURRENCY_MAP = {
 # ============================================================================
 
 def load_settings():
-    """Settings'i Supabase'den yukler. Basarisizsa JSON dosyasina fallback."""
+    """Settings'i Supabase'den yukler. Tek kaynak Supabase, fallback yok."""
     hk = os.environ.get("HESAP_KEY", "")
     mp = os.environ.get("MARKETPLACE", "")
-    if hk and mp:
-        try:
-            from supabase.db_client import SupabaseClient
-            db = SupabaseClient()
-            conn = db._conn()
-            cur = conn.cursor()
-            cur.execute("SELECT genel_ayarlar, esik_degerleri, asin_hedefleri, segmentasyon_kurallari, agent3_ayarlari, ozel_kurallar, negatif_keyword_kurali, yeni_keyword_kurali, harvesting_ayarlari FROM settings WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
-            row = cur.fetchone()
-            cur.close()
-            conn.close()
-            if row:
-                result = {}
-                keys = ["genel_ayarlar", "esik_degerleri", "asin_hedefleri", "segmentasyon_kurallari", "agent3_ayarlari", "ozel_kurallar", "negatif_keyword_kurali", "yeni_keyword_kurali", "harvesting_ayarlari"]
-                for i, key in enumerate(keys):
-                    if row[i]:
-                        result[key] = row[i] if isinstance(row[i], dict) else json.loads(row[i])
-                    else:
-                        result[key] = {}
-                logger.info("Settings Supabase'den yuklendi (%s/%s)", hk, mp)
-                return result
-        except Exception as e:
-            logger.warning("Settings Supabase'den okunamadi, dosyaya fallback: %s", e)
-
-    if SETTINGS_FILE and SETTINGS_FILE.exists():
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    raise FileNotFoundError(f"Settings bulunamadi: Supabase ve {SETTINGS_FILE}")
+    if not (hk and mp):
+        raise RuntimeError("Settings yuklenemedi: HESAP_KEY/MARKETPLACE env var eksik.")
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        conn = db._conn()
+        cur = conn.cursor()
+        cur.execute("SELECT genel_ayarlar, esik_degerleri, asin_hedefleri, segmentasyon_kurallari, agent3_ayarlari, ozel_kurallar, negatif_keyword_kurali, yeni_keyword_kurali, harvesting_ayarlari FROM settings WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        raise RuntimeError(f"Settings Supabase'den okunamadi ({hk}/{mp}). Supabase baglantisini kontrol edin: {e}")
+    if not row:
+        raise RuntimeError(f"Settings Supabase'den okunamadi ({hk}/{mp}). Supabase baglantisini kontrol edin.")
+    result = {}
+    keys = ["genel_ayarlar", "esik_degerleri", "asin_hedefleri", "segmentasyon_kurallari", "agent3_ayarlari", "ozel_kurallar", "negatif_keyword_kurali", "yeni_keyword_kurali", "harvesting_ayarlari"]
+    for i, key in enumerate(keys):
+        if row[i]:
+            result[key] = row[i] if isinstance(row[i], dict) else json.loads(row[i])
+        else:
+            result[key] = {}
+    logger.info("Settings Supabase'den yuklendi (%s/%s)", hk, mp)
+    return result
 
 
 def load_bid_functions():
-    """Bid functions'i Supabase'den yukler. Basarisizsa JSON dosyasina fallback."""
+    """Bid functions'i Supabase'den yukler. Tek kaynak Supabase, fallback yok."""
     hk = os.environ.get("HESAP_KEY", "")
     mp = os.environ.get("MARKETPLACE", "")
-    if hk and mp:
-        try:
-            from supabase.db_client import SupabaseClient
-            db = SupabaseClient()
-            conn = db._conn()
-            cur = conn.cursor()
-            cur.execute("SELECT tanh_formulu, segment_parametreleri, genel_limitler, asin_parametreleri FROM bid_functions WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
-            row = cur.fetchone()
-            cur.close()
-            conn.close()
-            if row:
-                result = {}
-                if row[0]: result["tanh_formulu"] = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-                if row[1]: result["segment_parametreleri"] = row[1] if isinstance(row[1], dict) else json.loads(row[1])
-                if row[2]: result["genel_limitler"] = row[2] if isinstance(row[2], dict) else json.loads(row[2])
-                if row[3]: result["asin_parametreleri"] = row[3] if isinstance(row[3], dict) else json.loads(row[3])
-                logger.info("Bid functions Supabase'den yuklendi (%s/%s)", hk, mp)
-                return result
-        except Exception as e:
-            logger.warning("Bid functions Supabase'den okunamadi, dosyaya fallback: %s", e)
-
-    if BID_FUNCTIONS_FILE and BID_FUNCTIONS_FILE.exists():
-        with open(BID_FUNCTIONS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    raise FileNotFoundError(f"Bid functions bulunamadi: Supabase ve {BID_FUNCTIONS_FILE}")
+    if not (hk and mp):
+        raise RuntimeError("Bid functions yuklenemedi: HESAP_KEY/MARKETPLACE env var eksik.")
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        conn = db._conn()
+        cur = conn.cursor()
+        cur.execute("SELECT tanh_formulu, segment_parametreleri, genel_limitler, asin_parametreleri FROM bid_functions WHERE hesap_key = %s AND marketplace = %s", (hk, mp))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        raise RuntimeError(f"Bid functions Supabase'den okunamadi ({hk}/{mp}). Supabase baglantisini kontrol edin: {e}")
+    if not row:
+        raise RuntimeError(f"Bid functions Supabase'den okunamadi ({hk}/{mp}). Supabase baglantisini kontrol edin.")
+    result = {}
+    if row[0]: result["tanh_formulu"] = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+    if row[1]: result["segment_parametreleri"] = row[1] if isinstance(row[1], dict) else json.loads(row[1])
+    if row[2]: result["genel_limitler"] = row[2] if isinstance(row[2], dict) else json.loads(row[2])
+    if row[3]: result["asin_parametreleri"] = row[3] if isinstance(row[3], dict) else json.loads(row[3])
+    logger.info("Bid functions Supabase'den yuklendi (%s/%s)", hk, mp)
+    return result
 
 
 def get_hedef_acos(settings, asin):
