@@ -1,16 +1,14 @@
 """
-Agent 4 — Optimizer & Learning Agent (v3 Multi-Account)
+Agent 4 — Optimizer & Learning Agent (v4 Multi-Account)
 =========================================================
 Yeni akis:
-  [1] DBManager (Supabase only)
-  [2] KPICollector (Supabase only)
-  [3] SegmentAnalyzer (Supabase only)
-  [4] ErrorAnalyzer (Supabase only)
-  [5] MaestroAnalyzer (Supabase only)
-  [6] BidParamAnalyzer (Supabase only)
+  [1/4] KPICollector (Supabase only)
+  [2/4] ErrorAnalyzer (Supabase only)
+  [3/4] MaestroAnalyzer (Supabase only)
+  [4/4] BidParamAnalyzer (Supabase only)
   → agent4_analysis.json ciktisi (Claude Code icin)
 
-PatternDetector ve AnomalyDetector kaldirildi — Claude Code devralir.
+DBManager + SegmentAnalyzer kaldirildi — decision_history dogrudan kullaniliyor.
 
 Kullanim:
   python agent4/optimizer.py <hesap_key> <marketplace>
@@ -34,9 +32,7 @@ BASE_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
 # Agent 4 modullerini import et
-from agent4.db_manager      import DBManager
 from agent4.kpi_collector   import KPICollector
-from agent4.analyzers.segment_analyzer  import SegmentAnalyzer
 from agent4.analyzers.error_analyzer    import ErrorAnalyzer
 from agent4.analyzers.maestro_analyzer  import MaestroAnalyzer
 from agent4.bid_param_analyzer import BidParamAnalyzer
@@ -104,54 +100,37 @@ def run_optimizer(hesap_key, marketplace):
 def _run_optimizer_impl(today, data_dir, config_dir, hesap_key, marketplace):
     account_label = f"{hesap_key}/{marketplace}"
 
-    # ---- 1. VERITABANI ----
-    logger.info("--- [1/6] Veritabani yukleniyor ---")
-    db = DBManager(hesap_key, marketplace)
-    db.load()
-
-    # ---- 2. KPI GUNCELLEME ----
-    logger.info("--- [2/6] KPI guncelleniyor ---")
+    # ---- 1. KPI GUNCELLEME ----
+    logger.info("--- [1/4] KPI guncelleniyor ---")
     kpi = KPICollector(hesap_key, marketplace)
     kpi_ozet = kpi.run(today)
-    logger.info("KPI: %d yeni karar islendi, %d kpi_after dolduruldu",
-                kpi_ozet.get("yeni_karar", 0), kpi_ozet.get("kpi_after_doldurulan", 0))
+    logger.info("KPI: %d kpi_after dolduruldu",
+                kpi_ozet.get("kpi_after_doldurulan", 0))
 
-    # ---- 3. SEGMENT ANALIZI ----
-    logger.info("--- [3/6] Segment analizi ---")
-    seg_analyzer = SegmentAnalyzer(hesap_key, marketplace, db)
-    seg_sonuc = seg_analyzer.analyze()
-
-    # ---- 4. HATA ANALIZI ----
-    logger.info("--- [4/6] Hata analizi ---")
-    err_analyzer = ErrorAnalyzer(hesap_key, marketplace, db)
+    # ---- 2. HATA ANALIZI ----
+    logger.info("--- [2/4] Hata analizi ---")
+    err_analyzer = ErrorAnalyzer(hesap_key, marketplace)
     err_sonuc = err_analyzer.analyze()
 
-    # ---- 5. MAESTRO ANALIZI ----
-    logger.info("--- [5/6] Maestro mudahale analizi ---")
-    maestro_analyzer = MaestroAnalyzer(hesap_key, marketplace, db)
+    # ---- 3. MAESTRO ANALIZI ----
+    logger.info("--- [3/4] Maestro mudahale analizi ---")
+    maestro_analyzer = MaestroAnalyzer(hesap_key, marketplace)
     maestro_sonuc = maestro_analyzer.analyze()
 
-    # ---- 6. BID PARAMETRE ANALIZI ----
-    logger.info("--- [6/6] Bid parametre analizi ---")
-    bid_param_analyzer = BidParamAnalyzer(hesap_key, marketplace, config_dir)
+    # ---- 4. BID PARAMETRE ANALIZI ----
+    logger.info("--- [4/4] Bid parametre analizi ---")
+    bid_param_analyzer = BidParamAnalyzer(hesap_key, marketplace)
     bid_param_sonuc = bid_param_analyzer.analyze()
 
     # ---- RAPOR ----
-    generator = ReportGenerator(hesap_key, marketplace, data_dir, db)
+    generator = ReportGenerator(hesap_key, marketplace, data_dir)
     rapor = generator.generate(today, {
         "kpi":       kpi_ozet,
-        "segment":   seg_sonuc,
         "hata":      err_sonuc,
         "maestro":   maestro_sonuc,
         "bid_param": bid_param_sonuc,
         "oneriler":  [],   # Artik Claude Code uretecek
     })
-
-    # ---- VERITABANI KAYDET ----
-    db.save()
-
-    # ---- SUPABASE SYNC ----
-    _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor)
 
     logger.info("=" * 60)
     logger.info("AGENT 4 TAMAMLANDI — %s", account_label)
@@ -160,56 +139,6 @@ def _run_optimizer_impl(today, data_dir, config_dir, hesap_key, marketplace):
     logger.info("=" * 60)
 
     return rapor
-
-
-def _sync_agent4_to_supabase(hesap_key, marketplace, today, db, rapor):
-    """Agent 4 verilerini Supabase'e senkronize et."""
-    try:
-        sys.path.insert(0, str(BASE_DIR))
-        from supabase.db_client import SupabaseClient
-        sdb = SupabaseClient()
-    except Exception as e:
-        logger.warning("Supabase sync atlandi: %s", e)
-        return
-
-    try:
-        # Karar gecmisi — kararlar zaten bid_recommendations'ta, ayri sync gerekmez
-        kararlar = db._data.get("karar_gecmisi", {}).get("kararlar", [])
-
-        # ASIN profilleri
-        profiller = db._data.get("asin_profilleri", {}).get("profiller", {})
-        if profiller:
-            sdb.upsert_asin_profiles(hesap_key, marketplace, profiller)
-
-        # Segment istatistikleri
-        segmentler = db._data.get("segment_istatistikleri", {}).get("segmentler", {})
-        if segmentler:
-            sdb.upsert_segment_stats(hesap_key, marketplace, segmentler)
-
-        # Anomaliler
-        for anomali in db._data.get("anomali_gecmisi", {}).get("anomaliler", []):
-            sdb.insert_anomaly(hesap_key, marketplace, anomali)
-
-        # Kaliplar
-        for kalip in db._data.get("kalip_kutuphanesi", {}).get("kaliplar", []):
-            sdb.insert_pattern(hesap_key, marketplace, kalip)
-
-        # Durum raporu — status_reports tablosu yok, generate() icinde agent_logs'a yaziliyor
-
-        # Agent 4 status guncelle
-        try:
-            sdb.update_agent_status_detail("agent4", "completed", {
-                "tasks": len(kararlar),
-                "duration": "?",
-                "errors_7d": 0,
-            })
-        except Exception as e:
-            logger.warning("Sessiz hata: %s", e)
-
-        logger.info("Supabase: Agent 4 verileri yazildi (%d karar)", len(kararlar))
-
-    except Exception as e:
-        logger.error("Supabase sync hatasi (optimizer devam eder): %s", e)
 
 
 # ============================================================================

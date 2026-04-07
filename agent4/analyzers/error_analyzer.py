@@ -15,10 +15,9 @@ TEKRAR_ESIGI = 3
 
 class ErrorAnalyzer:
 
-    def __init__(self, hesap_key: str, marketplace: str, db):
+    def __init__(self, hesap_key: str, marketplace: str):
         self.hesap_key = hesap_key
         self.marketplace = marketplace
-        self.db = db
 
     def _get_sdb(self):
         from supabase.db_client import SupabaseClient
@@ -39,15 +38,6 @@ class ErrorAnalyzer:
         }
 
         sonuc["tekrar_eden_kaliplar"] = self._kalip_tespiti(sdb, sonuc)
-
-        for kalip in sonuc["tekrar_eden_kaliplar"]:
-            if kalip["tekrar"] >= TEKRAR_ESIGI:
-                self.db.add_kalip({
-                    "tip":     "HATA_DONGUSU",
-                    "tanim":   kalip["tanim"],
-                    "bilesen": kalip["bilesen"],
-                    "oneri":   kalip.get("oneri", ""),
-                })
 
         logger.info("Hata analizi: agent1=%d, agent2=%d, agent3=%d, kalip=%d",
                     sonuc["agent1"].get("toplam", 0),

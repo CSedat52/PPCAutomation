@@ -13,10 +13,9 @@ logger = logging.getLogger("agent4.maestro")
 
 class MaestroAnalyzer:
 
-    def __init__(self, hesap_key: str, marketplace: str, db):
+    def __init__(self, hesap_key: str, marketplace: str):
         self.hesap_key = hesap_key
         self.marketplace = marketplace
-        self.db = db
 
     def _get_sdb(self):
         from supabase.db_client import SupabaseClient
@@ -105,13 +104,6 @@ class MaestroAnalyzer:
 
         if ardisik_hata:
             logger.warning("SON 3 SESSION ARDISIK HATA — kritik uyari!")
-            self.db.add_anomali({
-                "tip":    "MAESTRO_ARDISIK_HATA",
-                "tanim":  "Son 3 session ardisik olarak hata ile sonuclandi",
-                "siddet": "KRITIK",
-                "durum":  "AKTIF",
-                "oneri":  "CLAUDE.md yeni senaryo veya retry_handler.py guncellenmesi gerekebilir",
-            })
 
         logger.info("Maestro analizi: toplam=%d tamamlanan=%d hatali=%d",
                     toplam, tamamlanan, hatali)

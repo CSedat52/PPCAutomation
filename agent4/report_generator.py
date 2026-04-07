@@ -17,13 +17,12 @@ logger = logging.getLogger("agent4.report")
 
 class ReportGenerator:
 
-    def __init__(self, hesap_key: str, marketplace: str, data_dir, db):
+    def __init__(self, hesap_key: str, marketplace: str, data_dir):
         self.hesap_key   = hesap_key
         self.marketplace = marketplace
         self.data_dir    = Path(data_dir)
         self.rapor_dir   = self.data_dir / "agent4" / "raporlar"
         self.rapor_dir.mkdir(parents=True, exist_ok=True)
-        self.db          = db
 
     def _get_sdb(self):
         from supabase.db_client import SupabaseClient
@@ -106,7 +105,6 @@ class ReportGenerator:
             "hesap_key":          self.hesap_key,
             "marketplace":        self.marketplace,
             "kpi_ozet":           sonuclar.get("kpi", {}),
-            "segment_sonuclari":  sonuclar.get("segment", {}),
             "hata_analizi":       sonuclar.get("hata", {}),
             "maestro_analizi":    sonuclar.get("maestro", {}),
             "bid_param_analizi":  bid_param,
@@ -136,7 +134,6 @@ class ReportGenerator:
         maestro = sonuclar.get("maestro", {})
         hata    = sonuclar.get("hata", {})
         kpi     = sonuclar.get("kpi", {})
-        segment = sonuclar.get("segment", {})
 
         skor = 100
 
@@ -150,14 +147,6 @@ class ReportGenerator:
 
         if maestro.get("ardisik_hata_alarmi"):
             skor -= 25
-
-        # Aktif anomaliler (in-memory DB'den)
-        aktif_anomali = len(self.db.get_aktif_anomaliler())
-        skor -= min(aktif_anomali * 5, 20)
-
-        # Segment dusuk performans
-        dusuk_performans = segment.get("dusuk_performans", [])
-        skor -= min(len(dusuk_performans) * 5, 15)
 
         skor = max(0, skor)
 
@@ -179,13 +168,6 @@ class ReportGenerator:
             "kpi_ozeti": {
                 "islenen_karar":       kpi.get("yeni_karar", 0),
                 "kpi_after_doldurulan": kpi.get("kpi_after_doldurulan", 0),
-            },
-            "anomaliler": {
-                "aktif": aktif_anomali,
-            },
-            "segment_sagligi": {
-                "olculebilir_karar":  segment.get("olculebilir_karar", 0),
-                "dusuk_performans":   dusuk_performans,
             },
         }
 
@@ -219,7 +201,6 @@ class ReportGenerator:
         parcalar = []
         parcalar.append(f"Pipeline: {maestro.get('tamamlanan', 0)}/{maestro.get('toplam_session', 0)} session basarili")
         parcalar.append(f"KPI: {kpi.get('kpi_after_doldurulan', 0)} karar guncellendi")
-        parcalar.append(f"Anomali: {len(self.db.get_aktif_anomaliler())} aktif")
         parcalar.append(f"Oneri: {len(oneriler)} yeni")
 
         if maestro.get("ardisik_hata_alarmi"):
@@ -243,15 +224,9 @@ class ReportGenerator:
               f"Agent2={sg['hata_ozeti']['agent2_toplam']} "
               f"Agent3={sg['hata_ozeti']['agent3_toplam']} "
               f"Kalip={sg['hata_ozeti']['tekrar_eden_kalip']}")
-        print(f"  Anomali        : {sg['anomaliler']['aktif']} aktif")
 
         if sg["pipeline"]["ardisik_hata"]:
             print("  [!] KRITIK: Son 3 session ardisik hata!")
-
-        if sg["segment_sagligi"]["dusuk_performans"]:
-            print("  [!] Dusuk performans:")
-            for dp in sg["segment_sagligi"]["dusuk_performans"]:
-                print(f"     {dp['segment']}: %{dp['basari_orani']*100:.0f} basari ({dp['toplam']} karar)")
 
         print("-"*60)
         print(f"  Bekleyen Oneri : {ob['bekleyen_oneri_sayisi']} adet")
