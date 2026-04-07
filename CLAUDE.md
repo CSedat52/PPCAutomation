@@ -73,34 +73,42 @@ amazon-ppc-automation/
 |   +-- vigowood_eu_UK/
 |   |   +-- ...
 |   +-- (her marketplace icin ayri config klasoru)
-+-- agent1/                              # (bos — veri toplama parallel_collector.py'ye tasindi)
 +-- agent2/
+|   +-- __init__.py
 |   +-- analyst.py                       # Agent 2 v5 — Analiz scripti (multi-account)
 +-- agent3/
+|   +-- __init__.py
 |   +-- executor.py                      # Agent 3 v3 — Executor scripti (multi-account)
 +-- agent4/
+|   +-- __init__.py
 |   +-- optimizer.py                     # Agent 4 v3 — Optimizer (multi-account, Supabase only)
 |   +-- db_manager.py                    # v3 — Supabase only, JSON kaldirildi
 |   +-- kpi_collector.py                 # v3 — Supabase only (bid_recommendations, targeting_reports)
-|   +-- bid_param_analyzer.py            # v3 — ASIN bazli bid param etki analizi (NEW)
-|   +-- proposal_engine.py              # v3 — Sadece writer, statik kurallar kaldirildi
-|   +-- report_generator.py             # v3 — agent4_analysis.json ciktisi ekle
+|   +-- bid_param_analyzer.py            # v3 — ASIN bazli bid param etki analizi
+|   +-- proposal_engine.py               # v3 — Sadece writer, statik kurallar kaldirildi
+|   +-- report_generator.py              # v3 — agent4_analysis.json ciktisi
 |   +-- analyzers/
 |       +-- __init__.py
 |       +-- segment_analyzer.py          # v3 — decision_history tablosundan okur
-|       +-- error_analyzer.py            # v3 — error_logs tablosundan okur
+|       +-- error_analyzer.py            # v3 — agent_logs tablosundan okur
 |       +-- maestro_analyzer.py          # v3 — pipeline_runs tablosundan okur
 +-- maestro/
 |   +-- __init__.py
 |   +-- config.py                        # v2 — init_account(), get_active_pipelines()
 |   +-- state_manager.py
 |   +-- email_handler.py
-|   +-- retry_handler.py
-|   +-- excel_checker.py
+|   +-- retry_handler.py                 # log_utils.classify_error_type kullanir
 |   +-- maestro_agent.py                 # v2 — run_all_pipelines(), start_pipeline(hesap,mp)
 |   +-- logs/
 |       +-- maestro_log_{tarih}.log      # Session text loglari (30 gun rotasyon)
-|       +-- {hesap}_{mp}_maestro_errors.json  # Maestro structured hata loglari
++-- supabase/
+|   +-- __init__.py
+|   +-- db_client.py                     # Supabase client (psycopg2)
+|   +-- migrations/
+|       +-- 001_initial_schema.sql
+|       +-- 002_campaign_reports_daily.sql
+|       +-- 003_kpi_optimizer_v4.sql
+|       +-- 004_kpi_daily.sql
 +-- data/
     +-- vigowood_na_US/
     |   +-- *.json                       # Agent 1 ciktilari
