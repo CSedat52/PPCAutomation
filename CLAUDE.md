@@ -113,14 +113,9 @@ amazon-ppc-automation/
     +-- vigowood_na_US/
     |   +-- *.json                       # Agent 1 ciktilari
     |   +-- analysis/                    # Agent 2 Excel raporlari
-    |   +-- decisions/                   # Karar gecmisi
-    |   +-- logs/                        # agent1/2/3/4 hata loglari
     |   +-- agent4/
-    |       +-- db/                      # Kumulatif veritabani
     |       +-- raporlar/                # Durum raporlari
-    |       +-- proposals/
-    |           +-- bekleyen/            # Onay bekleyen oneriler
-    |           +-- arsiv/               # Onaylanan/reddedilen
+    |       +-- agent4_analysis.json     # Claude Code girdi dosyasi
     +-- vigowood_na_CA/
     |   +-- (ayni yapi)
     +-- (her marketplace icin ayri data klasoru)
@@ -135,16 +130,14 @@ Script: `parallel_collector.py`
 Cagiris: `python parallel_collector.py <hesap_key>:<marketplace> [...]`
 Ornek: `python parallel_collector.py vigowood_na:US vigowood_eu:DE`
 Gorevi: Amazon API'den SP + SB + SD verilerini ceker.
-Hata logu: `data/{hesap}_{mp}/logs/agent1_errors.json`
 
-Teknik: accounts.json'dan credential okur. Farkli hesaplari PARALEL, ayni hesaptaki marketplace'leri 2'li BATCH calistirir.
+Teknik: accounts.json'dan credential okur. Tum hesaplar ve marketplace'ler TAMAMEN PARALEL calisir.
 
 ### Agent 2: Analyst v5 (Multi-Account)
 Script: `agent2/analyst.py`
 Cagiris: `python agent2/analyst.py <hesap_key> <marketplace>`
 Ornek: `python agent2/analyst.py vigowood_na US`
 Gorevi: Verileri 8 segmente ayirir, tanh formuluyle bid tavsiyeleri uretir. 3 Excel raporu olusturur.
-Hata logu: `data/{hesap}_{mp}/logs/agent2_errors.json`
 Ciktilar: `data/{hesap}_{mp}/analysis/{tarih}_bid_recommendations.xlsx`, `_negative_candidates.xlsx`, `_harvesting_candidates.xlsx`
 
 ### Agent 3: Executor v3 (Multi-Account)
@@ -155,7 +148,6 @@ Ornek: `python agent3/executor.py vigowood_na US --execute`          (plan + dog
 Ornek: `python agent3/executor.py vigowood_na US --collect-verify`   (verify verileri cek)
 Ornek: `python agent3/executor.py vigowood_na US --verify`           (dogrulama yap)
 Gorevi: Onaylanmis kararlari Amazon API uzerinden uygular.
-Hata logu: `data/{hesap}_{mp}/logs/agent3_errors.json`
 
 ### Agent 4: Optimizer & Learning Agent v3 (Multi-Account, Supabase Only)
 Script: `agent4/optimizer.py`
@@ -323,8 +315,7 @@ Gece yarisi gecilse bile tarih DEGISMEZ — pipeline bastan sona ayni tarihle ca
 python parallel_collector.py vigowood_na:US vigowood_na:CA vigowood_eu:UK vigowood_eu:DE ...
 ```
 
-parallel_collector farkli hesaplari PARALEL, ayni hesaptaki marketplace'leri 2'li BATCH calistirir.
-EU batch eslestirmesi: UK+SE, DE+PL, FR+NL, ES+IT (yogun+hafif dengesi).
+parallel_collector tum hesaplari ve marketplace'leri TAMAMEN PARALEL calistirir (batch mimarisi kaldirildi).
 Script bitince tum verileri data/{hesap}_{mp}/ altina kaydeder.
 
 **ADIM 2-6: Her hesap+marketplace icin SIRAYLA devam et**
@@ -348,10 +339,6 @@ Veriler toplandiktan sonra her hesap icin sirayla (bir hesap hata verse bile son
 - Bu fonksiyon Agent 3'u direkt Python ile calistirir (Claude Code KULLANMAZ, $0).
 - Agent 3 basarili olursa Agent 4'e gecilir (Asama 1: Python, Asama 2: Claude Code).
 - Gecmis gunlerden kalan pending kayitlar otomatik failed yapilir.
-
-**ALTERNATIF: Manuel Onay (Maestro watch modu disinda)**
-- Kullaniciya Excel'leri doldurmasi gerektigini soyle.
-- Kullanici "onay" yazinca asagidaki adimlari sirayla calistir:
 
 **ADIM 4: Agent 3 — Execution (manuel mod veya watch icinde otomatik)**
 - `python agent3/executor.py HESAP MP --execute --date PIPELINE_DATE` calistir.
@@ -399,7 +386,7 @@ Herhangi bir agent hata verdiginde su adimlari izle:
 
 **3. KALICI HATA ise → KOD ANALIZI VE DUZELTME**
    a. Hatanin kaynagini bul (endpoint, parametre, alan adi).
-   b. Ilgili kaynak kodu oku (agent1/ agent2/ agent3/ dosyalarini).
+   b. Ilgili kaynak kodu oku (parallel_collector.py, agent2/, agent3/ dosyalarini).
    c. Sorunu teshis et.
    d. Duzeltmeyi uygula (SADECE hataya neden olan kismi degistir).
    e. Agent'i tekrar calistir.
@@ -457,7 +444,6 @@ Otomatik pipeline'da bu komutlar KULLANILMAZ.
 | maestro force-start | Duplikasyon kilidini gec (tum hesaplar) |
 | maestro status | Tum hesaplarin durumu |
 | maestro status vigowood_na US | Tek hesap durumu |
-| maestro check vigowood_na US | Excel onay kontrolu |
 | maestro accounts | Aktif hesap listesi |
 | maestro log | Son log dosyasi |
 | maestro history | Gecmis session ozeti |
