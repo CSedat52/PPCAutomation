@@ -813,6 +813,138 @@ class SupabaseClient:
         ))
 
     # ==========================================
+    # AGENT 3 — VERIFY SNAPSHOTS
+    # ==========================================
+
+    def upsert_verify_snapshot(self, hesap_key: str, mp: str,
+                               verify_date: str, entity_type: str,
+                               data: list, session_id: str = None) -> int:
+        """
+        Agent 3 --collect-verify tarafindan cekilen verify verisini
+        verify_snapshots tablosuna yazar. Ayni (hesap,mp,tarih,entity)
+        icin upsert yapar.
+        """
+        sql = """
+            INSERT INTO verify_snapshots
+                (hesap_key, marketplace, verify_date, session_id, entity_type, entity_count, snapshot_data)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (hesap_key, marketplace, verify_date, entity_type)
+            DO UPDATE SET snapshot_data = EXCLUDED.snapshot_data,
+                          entity_count = EXCLUDED.entity_count,
+                          session_id = EXCLUDED.session_id,
+                          created_at = NOW()
+        """
+        try:
+            return self._execute(sql, (
+                hesap_key, mp, verify_date, session_id, entity_type,
+                len(data or []), Json(data or [])
+            ))
+        except Exception as e:
+            logger.warning("upsert_verify_snapshot basarisiz (%s/%s %s): %s",
+                           hesap_key, mp, entity_type, e)
+            return 0
+
+    def get_verify_snapshots(self, hesap_key: str, mp: str,
+                              verify_date: str) -> dict:
+        """
+        verify_snapshots tablosundan ilgili tarih icin tum entity'leri
+        oku. Donus: {entity_type: [raw_data...], ...}
+        Supabase basarisiz/bos ise bos dict doner.
+        """
+        try:
+            rows = self._fetch_all(
+                "SELECT entity_type, snapshot_data FROM verify_snapshots "
+                "WHERE hesap_key = %s AND marketplace = %s AND verify_date = %s",
+                (hesap_key, mp, verify_date)
+            )
+            result = {}
+            if not rows:
+                return result
+            for entity_type, raw in rows:
+                if raw is None:
+                    result[entity_type] = []
+                elif isinstance(raw, list):
+                    result[entity_type] = raw
+                elif isinstance(raw, str):
+                    try:
+                        result[entity_type] = json.loads(raw)
+                    except Exception:
+                        result[entity_type] = []
+                elif isinstance(raw, dict):
+                    result[entity_type] = [raw]
+                else:
+                    result[entity_type] = []
+            return result
+        except Exception as e:
+            logger.debug("get_verify_snapshots basarisiz: %s", e)
+            return {}
+
+    def cleanup_old_verify_snapshots(self, days: int = 7) -> int:
+        """7 gunden eski verify snapshot'lari siler."""
+        try:
+            return self._execute(
+                "DELETE FROM verify_snapshots "
+                "WHERE verify_date < CURRENT_DATE - INTERVAL '%s days'" % int(days)
+            )
+        except Exception as e:
+            logger.debug("cleanup_old_verify_snapshots basarisiz: %s", e)
+            return 0
+
+    def get_execution_items_for_verify(self, hesap_key: str, mp: str,
+                                        plan_date: str) -> list:
+        """
+        Agent 3 verify icin: verilen tarihte olusturulmus execution_plans'e
+        ait execution_items kayitlarini doner. Her kayit rollback_log
+        'islem' formatina uygun dict olarak gelir.
+        """
+        try:
+            rows = self._fetch_all(
+                """
+                SELECT ei.item_type, ei.campaign_id, ei.campaign_name,
+                       ei.ad_group_id, ei.keyword_id, ei.target_id,
+                       ei.targeting, ei.old_bid, ei.new_bid,
+                       ei.negative_type, ei.match_type,
+                       ei.harvest_type, ei.source_campaign,
+                       ei.api_endpoint, ei.api_payload, ei.status
+                FROM execution_items ei
+                JOIN execution_plans ep ON ei.plan_id = ep.id
+                WHERE ei.hesap_key = %s AND ei.marketplace = %s
+                  AND ep.plan_date = %s
+                """,
+                (hesap_key, mp, plan_date)
+            )
+            if not rows:
+                return []
+            items = []
+            for r in rows:
+                (item_type, campaign_id, campaign_name, ad_group_id,
+                 keyword_id, target_id, targeting, old_bid, new_bid,
+                 negative_type, match_type, harvest_type, source_campaign,
+                 api_endpoint, api_payload, status) = r
+                items.append({
+                    "item_type": item_type,
+                    "campaign_id": campaign_id,
+                    "kampanya": campaign_name,
+                    "ad_group_id": ad_group_id,
+                    "keyword_id": keyword_id,
+                    "target_id": target_id,
+                    "hedefleme": targeting,
+                    "eski_bid": float(old_bid) if old_bid is not None else None,
+                    "yeni_bid": float(new_bid) if new_bid is not None else None,
+                    "negative_type": negative_type,
+                    "match_type": match_type,
+                    "harvest_type": harvest_type,
+                    "kaynak_kampanya": source_campaign,
+                    "api_endpoint": api_endpoint,
+                    "api_payload": api_payload,
+                    "status": status,
+                })
+            return items
+        except Exception as e:
+            logger.debug("get_execution_items_for_verify basarisiz: %s", e)
+            return []
+
+    # ==========================================
     # AGENT 4 — OPTIMIZER
     # ==========================================
 

@@ -369,9 +369,21 @@ def load_pipeline_sessions(hesap_key, marketplace, limit=50):
 
 
 # ============================================================================
-# VERIFY DOSYALARI (ephemeral — sadece JSON, Supabase'e gitmez)
+# VERIFY DOSYALARI (Supabase-first, JSON fallback)
 # ============================================================================
 
-def load_verify_file(data_dir, date, entity_prefix):
-    """Verify dosyası oku. Bu dosyalar ephemeral — sadece JSON."""
+def load_verify_file(data_dir, date, entity_prefix, hesap_key=None, marketplace=None):
+    """
+    Verify dosyası oku. Önce Supabase verify_snapshots'tan dener,
+    başarısız olursa JSON dosyasına düşer.
+    """
+    if hesap_key and marketplace:
+        try:
+            sdb = _get_sdb()
+            snaps = sdb.get_verify_snapshots(hesap_key, marketplace, date)
+            if snaps and entity_prefix in snaps:
+                return snaps.get(entity_prefix) or []
+        except Exception as e:
+            logger.debug("Verify snapshot Supabase'den okunamadi (%s): %s",
+                         entity_prefix, e)
     return _json_load(data_dir, f"{date}_verify_{entity_prefix}.json") or []

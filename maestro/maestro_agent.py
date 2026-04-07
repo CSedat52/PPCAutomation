@@ -1009,6 +1009,11 @@ def poll_execution_queue(filter_hesap=None, filter_marketplace=None):
             "WHERE status IN ('completed','failed','expired') "
             "AND completed_at < NOW() - INTERVAL '7 days'")
 
+        # Kural: 7 gunden eski verify snapshot'lari sil:
+        sdb._execute(
+            "DELETE FROM verify_snapshots "
+            "WHERE verify_date < CURRENT_DATE - INTERVAL '7 days'")
+
         # Kural: Agent log kayitlarini son 2000 ile sinirla (her agent icin):
         for agent_id in ['agent1', 'agent2', 'agent3', 'agent4', 'maestro', 'pipeline_runner']:
             sdb._execute(

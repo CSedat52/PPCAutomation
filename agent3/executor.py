@@ -1957,6 +1957,54 @@ def verify_batch_results(operations, api_responses):
 VERIFICATION_DELAY_SECONDS = 300  # 5 dakika
 
 
+def _map_item_type(item):
+    """
+    Supabase execution_items kaydini rollback_log 'islem' formatina donustur.
+    item_type (BID_CHANGE / NEG_KEYWORD / NEG_TARGET / HARVEST / CAMPAIGN_CREATE)
+    -> rollback 'tip' (BID_DEGISIKLIGI / NEGATIF_KEYWORD / NEGATIF_ASIN /
+    HARVEST_KEYWORD / HARVEST_ASIN / KAMPANYA_OLUSTURMA).
+    """
+    it = dict(item)
+    item_type = (it.get("item_type") or "").upper()
+    ad_type = ""
+    ep = (it.get("api_endpoint") or "").lower()
+    if ep.startswith("sp_"):
+        ad_type = "SP"
+    elif ep.startswith("sb_"):
+        ad_type = "SB"
+    elif ep.startswith("sd_"):
+        ad_type = "SD"
+
+    if item_type in ("BID_CHANGE", "BID_DEGISIKLIGI"):
+        entity_type = ""
+        if it.get("keyword_id"):
+            entity_type = "KEYWORD"
+        elif it.get("target_id"):
+            entity_type = "TARGET"
+        it["tip"] = "BID_DEGISIKLIGI"
+        it["entity_type"] = entity_type
+        it["entity_id"] = it.get("keyword_id") or it.get("target_id") or ""
+        it["ad_type"] = ad_type
+    elif item_type in ("NEG_KEYWORD", "NEGATIVE_KEYWORD", "NEGATIF_KEYWORD"):
+        it["tip"] = "NEGATIF_KEYWORD"
+    elif item_type in ("NEG_TARGET", "NEGATIVE_TARGET", "NEGATIF_ASIN"):
+        it["tip"] = "NEGATIF_ASIN"
+    elif item_type == "HARVEST":
+        htype = (it.get("harvest_type") or "").upper()
+        if htype == "ASIN":
+            it["tip"] = "HARVEST_ASIN"
+            it["source_campaign_id"] = it.get("campaign_id")
+        else:
+            it["tip"] = "HARVEST_KEYWORD"
+            it["yeni_kampanya_adi"] = it.get("kampanya")
+    elif item_type in ("CAMPAIGN_CREATE", "KAMPANYA_OLUSTURMA"):
+        it["tip"] = "KAMPANYA_OLUSTURMA"
+        it["kampanya_adi"] = it.get("kampanya")
+    else:
+        it["tip"] = item_type
+    return it
+
+
 def run_delayed_verification(rollback_log_path, today=None):
     """
     Agent 3 islemlerinden 5 dk sonra calistirilir.
@@ -1979,11 +2027,26 @@ def run_delayed_verification(rollback_log_path, today=None):
 
     logger.info("=== GECIKMELI DOGRULAMA BASLADI ===")
 
-    # Rollback log'u oku
-    with open(rollback_log_path, "r", encoding="utf-8") as f:
-        rollback_log = json.load(f)
+    # Onceligimiz: Supabase execution_items. Basarisiz olursa rollback JSON'a dus.
+    islemler = []
+    try:
+        from supabase.db_client import SupabaseClient
+        hk = HESAP_KEY or os.environ.get("HESAP_KEY", "")
+        mp = MARKETPLACE or os.environ.get("MARKETPLACE", "")
+        if hk and mp:
+            sdb = SupabaseClient()
+            raw_items = sdb.get_execution_items_for_verify(hk, mp, today)
+            if raw_items:
+                islemler = [_map_item_type(it) for it in raw_items]
+                logger.info("Execution items Supabase'den yuklendi: %d kayit", len(islemler))
+    except Exception as e:
+        logger.debug("Execution items Supabase'den okunamadi: %s", e)
 
-    islemler = rollback_log.get("islemler", [])
+    if not islemler:
+        # JSON fallback
+        with open(rollback_log_path, "r", encoding="utf-8") as f:
+            rollback_log = json.load(f)
+        islemler = rollback_log.get("islemler", [])
     if not islemler:
         logger.info("Dogrulanacak islem yok.")
         return {"durum": "BOS", "mesaj": "Dogrulanacak islem yok."}
@@ -2235,6 +2298,92 @@ def process_verification_results(verification_report, actual_data):
 
 
 def load_verify_actual_data(data_date):
+    """
+    Supabase-first wrapper: verify snapshot'lari once Supabase'den okumaya
+    calisir, basarisiz olursa JSON dosya fallback'ine duser.
+    """
+    # 1) Supabase dene
+    try:
+        from supabase.db_client import SupabaseClient
+        hk = HESAP_KEY or os.environ.get("HESAP_KEY", "")
+        mp = MARKETPLACE or os.environ.get("MARKETPLACE", "")
+        if hk and mp:
+            sdb = SupabaseClient()
+            snaps = sdb.get_verify_snapshots(hk, mp, data_date)
+            if snaps:
+                actual = _build_actual_from_snapshots(snaps)
+                logger.info("Verify verileri Supabase'den yuklendi: %d keyword, "
+                            "%d target, %d neg.kw campaign, %d neg.target campaign, "
+                            "%d kampanya",
+                            len(actual["keywords"]), len(actual["targets"]),
+                            len(actual["negative_keywords"]),
+                            len(actual["negative_targets"]),
+                            len(actual["campaigns"]))
+                return actual
+    except Exception as e:
+        logger.debug("Verify snapshot Supabase'den okunamadi: %s", e)
+
+    # 2) JSON fallback
+    return _load_verify_actual_data_from_json(data_date)
+
+
+def _build_actual_from_snapshots(snaps):
+    """verify_snapshots dict'inden actual_data yapisini olustur."""
+    actual = {
+        "keywords": {},
+        "targets": {},
+        "themes": {},
+        "negative_keywords": {},
+        "negative_targets": {},
+        "campaigns": {},
+    }
+    for kw in snaps.get("sp_keywords", []) or []:
+        kid = str(kw.get("keywordId", ""))
+        if kid:
+            actual["keywords"][kid] = {"bid": kw.get("bid", 0)}
+    for kw in snaps.get("sb_keywords", []) or []:
+        kid = str(kw.get("keywordId", ""))
+        if kid:
+            actual["keywords"][kid] = {"bid": kw.get("bid", 0)}
+    for t in snaps.get("sp_targets", []) or []:
+        tid = str(t.get("targetId", ""))
+        if tid:
+            actual["targets"][tid] = {"bid": t.get("bid", 0)}
+    for t in snaps.get("sd_targets", []) or []:
+        tid = str(t.get("targetId", ""))
+        if tid:
+            actual["targets"][tid] = {"bid": t.get("bid", 0)}
+    for t in snaps.get("sb_targets", []) or []:
+        tid = str(t.get("targetId", ""))
+        if tid:
+            actual["targets"][tid] = {"bid": t.get("bid", 0)}
+    for t in snaps.get("sb_themes", []) or []:
+        tid = str(t.get("themeId", ""))
+        if tid:
+            actual["themes"][tid] = {"bid": t.get("bid", 0)}
+    for nk in snaps.get("sp_negative_keywords", []) or []:
+        cid = str(nk.get("campaignId", ""))
+        text = nk.get("keywordText", "")
+        if cid and text:
+            actual["negative_keywords"].setdefault(cid, []).append(text)
+    for nt in snaps.get("sp_negative_targets", []) or []:
+        cid = str(nt.get("campaignId", ""))
+        expr = nt.get("expression", [])
+        for e in (expr if isinstance(expr, list) else []):
+            val = e.get("value", "")
+            if cid and val:
+                actual["negative_targets"].setdefault(cid, []).append(val)
+    for c in snaps.get("sp_campaigns", []) or []:
+        name = c.get("name", "")
+        if name:
+            actual["campaigns"][name] = {
+                "state": c.get("state", ""),
+                "campaignId": c.get("campaignId", ""),
+            }
+    return actual
+
+
+def _load_verify_actual_data_from_json(data_date):
     """
     _verify_ dosyalarindan actual_data sozlugunu olusturur.
     process_verification_results'a gecilecek formatta doner.
@@ -2501,7 +2650,7 @@ def prepare_retry_operations(retry_list, config, campaign_lookup, targeting_look
 
 
 def save_verification_report(report, today=None):
-    """Dogrulama raporunu dosyaya kaydeder."""
+    """Dogrulama raporunu dosyaya kaydeder ve Supabase'e yazar."""
     if today is None:
         today = datetime.utcnow().strftime("%Y-%m-%d")
 
@@ -2509,6 +2658,30 @@ def save_verification_report(report, today=None):
     report_path = LOG_DIR / f"{today}_verification_report.json"
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
+
+    # Supabase'e de yaz (best-effort)
+    try:
+        from supabase.db_client import SupabaseClient
+        hk = HESAP_KEY or os.environ.get("HESAP_KEY", "")
+        mp = MARKETPLACE or os.environ.get("MARKETPLACE", "")
+        if hk and mp:
+            ozet = report.get("ozet", {})
+            sonuclar = report.get("sonuclar", {})
+            detaylar = []
+            for key in ("bid_kontrolleri", "negatif_kontrolleri", "kampanya_kontrolleri"):
+                detaylar.extend(sonuclar.get(key, []) or [])
+            result_row = {
+                "toplam": ozet.get("toplam_kontrol", 0),
+                "eslesme": ozet.get("dogrulanan", 0),
+                "uyumsuz": ozet.get("uyusmayan", 0),
+                "bulunamadi": ozet.get("kontrol_edilemeyen", 0),
+                "detaylar": detaylar,
+            }
+            SupabaseClient().insert_verification_result(
+                None, hk, mp, today, result_row
+            )
+    except Exception as e:
+        logger.debug("Verification result Supabase yazimi basarisiz: %s", e)
 
     logger.info("Dogrulama raporu kaydedildi: %s", report_path)
     logger.info("Ozet: %d dogrulandi, %d uyusmadi, %d kontrol edilemedi, %d retry",
@@ -2835,6 +3008,14 @@ async def _collect_verify_data(hesap_key, marketplace):
                     page_data = resp2.get(_wrapper, []) if isinstance(resp2, dict) else resp2 if isinstance(resp2, list) else []
                     data.extend(page_data)
                     next_token = resp2.get("nextToken") if isinstance(resp2, dict) else None
+
+            # Supabase'e yaz (birincil) — JSON fallback her durumda yazilir
+            try:
+                from supabase.db_client import SupabaseClient
+                sdb = SupabaseClient()
+                sdb.upsert_verify_snapshot(hesap_key, marketplace, today, name, data, session_id=os.environ.get("MAESTRO_SESSION_ID"))
+            except Exception as e:
+                logger.debug("Verify snapshot Supabase yazimi basarisiz [%s]: %s", name, e)
 
             filepath = DATA_DIR / f"{today}_verify_{name}.json"
             with open(filepath, "w", encoding="utf-8") as f:
