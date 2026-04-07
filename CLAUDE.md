@@ -512,8 +512,8 @@ Pipeline maliyeti:
 - Agent 1+2: $0 (saf Python, pipeline_runner.py via cron)
 - Agent 3: $0 (saf Python, watch daemon direkt calistirir)
 - Agent 4 Asama 1: $0 (saf Python, optimizer.py subprocess — bid param regresyon dahil)
-- Agent 4 Asama 2: ~$0.01-0.05 (Claude Code, sadece hata analizi)
-- Toplam: ~$0.01-0.05 / pipeline calismasi
+- Agent 4 Asama 2: ~$0.01-0.02 (Dogrudan Anthropic API, tek call)
+- Toplam: ~$0.01-0.02 / pipeline calismasi
 
 Claude Code SADECE Agent 4 Asama 2 icin cagirilir (hata analizi).
 Bid param optimizasyonu tamamen Python'da calisir ($0).

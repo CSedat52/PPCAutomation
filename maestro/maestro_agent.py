@@ -1080,7 +1080,7 @@ def _run_agent3_from_queue(hesap_key, marketplace):
     Dashboard onaylarindan Agent 3 + Agent 4'u calistirir.
     Agent 3: direkt Python (_run_agent3 fonksiyonu).
     Agent 4 Asama 1: Python (optimizer.py subprocess).
-    Agent 4 Asama 2: Claude Code (CLAUDE.md'deki talimatlari okur).
+    Agent 4 Asama 2: Dogrudan Anthropic API (Claude Code kaldirildi).
     """
     config.init_account(hesap_key, marketplace)
     account_label = f"{hesap_key}/{marketplace}"
@@ -1154,49 +1154,21 @@ def _run_agent3_from_queue(hesap_key, marketplace):
     except Exception as e:
         logger.error("Agent 4 Python calistirilamadi: %s — %s", account_label, e)
 
-    # ===== AGENT 4 ASAMA 2: Claude Code Hata Analizi =====
-    # Python asamasi basariliysa ve agent4_error_data.json varsa Claude Code'u cagir.
-    # Claude Code AGENT4_CLAUDE_INSTRUCTIONS.md okuyarak sadece hata analizi yapar.
-    # Claude Code basarisiz olursa pipeline DURMAZ — Python asamasinin sonuclari yeterli.
+    # ===== AGENT 4 ASAMA 2: Dogrudan Anthropic API ile Hata Analizi =====
+    # Claude Code KALDIRILDI — dogrudan API cagrisi ile %99 token tasarrufu.
+    # Basarisiz olursa pipeline DURMAZ — Python sonuclari yeterli.
     agent4_claude_ok = False
     if agent4_python_ok:
-        instructions_path = os.path.join(config.BASE_DIR, "agent4", "AGENT4_CLAUDE_INSTRUCTIONS.md")
-        error_data_path = os.path.join(
-            config.BASE_DIR, "data", f"{hesap_key}_{marketplace}",
-            "agent4", "agent4_error_data.json"
-        )
-        if os.path.exists(error_data_path):
-            logger.info("Agent 4 Asama 2 (Claude Code) baslatiliyor: %s", account_label)
-            try:
-                claude_prompt = (
-                    f"Sadece su dosyayi oku ve icindeki talimatlari takip et: {instructions_path}\n"
-                    f"Hesap: {hesap_key}/{marketplace}\n"
-                    f"Veri dosyasi: {error_data_path}\n"
-                    f"SADECE bu iki dosyayi oku, baska hicbir dosya OKUMA.\n"
-                    f"CLAUDE.md OKUMA. Kaynak kod dosyalari OKUMA.\n"
-                    f"Kullaniciya soru sorma, otomatik calis, bitince cik."
-                )
-                result = subprocess.run(
-                    ["claude", "-p", claude_prompt, "--dangerously-skip-permissions"],
-                    capture_output=True, text=True, timeout=300,
-                    cwd=config.BASE_DIR,
-                    env={**os.environ, "MAESTRO_SESSION_ID": session_id,
-                         "HESAP_KEY": hesap_key, "MARKETPLACE": marketplace},
-                )
-                if result.returncode == 0:
-                    agent4_claude_ok = True
-                    logger.info("Agent 4 Asama 2 (Claude Code) basarili: %s", account_label)
-                else:
-                    logger.warning("Agent 4 Claude Code hata (exit %d) — Python sonuclari yeterli",
-                                    result.returncode)
-            except FileNotFoundError:
-                logger.warning("claude komutu bulunamadi — Asama 2 atlandi, Python sonuclari yeterli")
-            except subprocess.TimeoutExpired:
-                logger.warning("Agent 4 Claude Code timeout (5 dk) — Python sonuclari yeterli")
-            except Exception as e:
-                logger.warning("Agent 4 Claude Code hatasi: %s — Python sonuclari yeterli", e)
-        else:
-            logger.warning("agent4_error_data.json bulunamadi: %s — Asama 2 atlandi", error_data_path)
+        logger.info("Agent 4 Asama 2 (API) baslatiliyor: %s", account_label)
+        try:
+            from maestro.agent4_api_caller import run_agent4_phase2
+            agent4_claude_ok = run_agent4_phase2(hesap_key, marketplace, config.BASE_DIR)
+            if agent4_claude_ok:
+                logger.info("Agent 4 Asama 2 (API) basarili: %s", account_label)
+            else:
+                logger.warning("Agent 4 API sonuc yok — Python sonuclari yeterli")
+        except Exception as e:
+            logger.warning("Agent 4 API hatasi: %s — Python sonuclari yeterli", e)
 
     # Agent 4 status guncelle
     if sdb:
