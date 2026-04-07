@@ -1724,6 +1724,144 @@ def generate_dry_run_report(bid_ops, neg_ops, harvest_ops):
 # ROLLBACK LOG
 # ============================================================================
 
+def _sync_to_decision_history(rollback_entries, today=None):
+    """
+    Başarılı bid değişikliklerini decision_history tablosuna yazar.
+    bid_recommendations tablosundan ASIN, segment, before metrikleri alır.
+    Agent 4 BidParamAnalyzer bu tablodan regresyon yapacak.
+    """
+    if not today:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+
+    hk = HESAP_KEY or os.environ.get("HESAP_KEY", "")
+    mp = MARKETPLACE or os.environ.get("MARKETPLACE", "")
+    if not hk or not mp:
+        logger.warning("decision_history sync: HESAP_KEY/MARKETPLACE eksik")
+        return 0
+
+    bid_entries = [e for e in rollback_entries if e.get("tip") == "BID_DEGISIKLIGI"]
+    if not bid_entries:
+        return 0
+
+    try:
+        from supabase.db_client import SupabaseClient
+        sdb = SupabaseClient()
+    except Exception as e:
+        logger.warning("decision_history sync: Supabase bağlantısı başarısız: %s", e)
+        return 0
+
+    entity_ids = []
+    for entry in bid_entries:
+        eid = entry.get("entity_id", "")
+        if eid:
+            entity_ids.append(eid)
+
+    if not entity_ids:
+        return 0
+
+    placeholders = ",".join(["%s"] * len(entity_ids))
+    try:
+        rec_rows = sdb._fetch_all(f"""
+            SELECT keyword_id, target_id, ad_type, campaign_id, campaign_name,
+                   keyword_text, targeting, match_type, segment, asin,
+                   current_bid, recommended_bid, decision_bid, bid_change_pct,
+                   impressions, clicks, cost, sales, orders, acos, cvr, cpc,
+                   portfolio
+            FROM bid_recommendations
+            WHERE hesap_key = %s AND marketplace = %s AND analysis_date = %s
+              AND decision IN ('APPROVED', 'MODIFIED')
+              AND (keyword_id IN ({placeholders}) OR target_id IN ({placeholders}))
+        """, (hk, mp, today, *entity_ids, *entity_ids))
+    except Exception as e:
+        logger.warning("decision_history sync: bid_recommendations sorgu hatası: %s", e)
+        return 0
+
+    if not rec_rows:
+        logger.info("decision_history sync: eşleşen bid_recommendations bulunamadı")
+        return 0
+
+    rec_map = {}
+    for row in rec_rows:
+        kw_id, tgt_id = str(row[0] or ""), str(row[1] or "")
+        if kw_id:
+            rec_map[kw_id] = row
+        if tgt_id:
+            rec_map[tgt_id] = row
+
+    hedef_acos_default = 25.0
+    try:
+        settings_row = sdb._fetch_one(
+            "SELECT asin_hedefleri FROM settings WHERE hesap_key=%s AND marketplace=%s",
+            (hk, mp))
+        asin_hedefleri = settings_row[0] if settings_row and settings_row[0] else {}
+    except Exception:
+        asin_hedefleri = {}
+
+    inserted = 0
+    for entry in bid_entries:
+        eid = entry.get("entity_id", "")
+        rec = rec_map.get(eid)
+        if not rec:
+            continue
+
+        (kw_id, tgt_id, ad_type, campaign_id, campaign_name,
+         keyword_text, targeting_text, match_type, segment, asin,
+         current_bid, recommended_bid, decision_bid, bid_change_pct,
+         impressions, clicks, cost, sales, orders, acos, cvr, cpc,
+         portfolio) = rec
+
+        if kw_id and str(kw_id).strip():
+            targeting_type = "KEYWORD"
+            targeting_id = str(kw_id)
+        else:
+            targeting_type = "PRODUCT_TARGET"
+            targeting_id = str(tgt_id)
+
+        hedef = hedef_acos_default
+        if asin and isinstance(asin_hedefleri, dict):
+            asin_conf = asin_hedefleri.get(asin)
+            if isinstance(asin_conf, dict):
+                hedef = asin_conf.get("hedef_acos", hedef_acos_default)
+            elif isinstance(asin_conf, (int, float)):
+                hedef = float(asin_conf)
+
+        metrics = {
+            "impressions": int(impressions or 0),
+            "clicks": int(clicks or 0),
+            "spend": float(cost or 0),
+            "sales": float(sales or 0),
+            "orders": int(orders or 0),
+            "acos": float(acos) if acos is not None else None,
+            "cvr": float(cvr) if cvr is not None else None,
+            "cpc": float(cpc) if cpc is not None else None,
+        }
+
+        acos_before = float(acos) if acos is not None else None
+
+        try:
+            from psycopg2.extras import Json
+            sdb._execute("""
+                INSERT INTO decision_history
+                    (hesap_key, marketplace, decision_date, targeting_id,
+                     ad_type, targeting, campaign_name, portfolio_id, asin,
+                     segment, previous_bid, new_bid, change_pct, metrics,
+                     decision_status, targeting_type, hedef_acos, acos_before)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT DO NOTHING
+            """, (hk, mp, today, targeting_id,
+                  ad_type, keyword_text or targeting_text, campaign_name, portfolio,
+                  asin or "", segment, float(current_bid or 0),
+                  float(entry.get("yeni_bid", 0)), float(bid_change_pct or 0),
+                  Json(metrics), "APPLIED", targeting_type,
+                  hedef, acos_before))
+            inserted += 1
+        except Exception as e:
+            logger.warning("decision_history insert hatası (%s): %s", targeting_id, e)
+
+    logger.info("decision_history: %d/%d kayıt yazıldı", inserted, len(bid_entries))
+    return inserted
+
+
 def save_rollback_log(bid_ops, neg_ops, harvest_ops, today=None):
     """Her islem icin rollback bilgisini kaydeder."""
     if today is None:
@@ -3362,6 +3500,12 @@ async def apply_execution_plan(hesap_key, marketplace, plan_path):
     ozet = results["ozet"]
     logger.info("=== EXECUTION TAMAMLANDI: %d basarili, %d basarisiz, %d atlanan ===",
                 ozet["basarili"], ozet["basarisiz"], ozet["atlanan"])
+
+    # Decision history sync (Agent 4 regresyon için)
+    try:
+        _sync_to_decision_history(results.get("rollback_log", []), today)
+    except Exception as e:
+        logger.warning("decision_history sync hatası (execution devam eder): %s", e)
 
     await client.close()
     return results
