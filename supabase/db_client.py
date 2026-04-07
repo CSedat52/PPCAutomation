@@ -1024,7 +1024,7 @@ class SupabaseClient:
         beklenen = proposal.get("beklenen_sonuc") or proposal.get("risk", "")
         gerceklesen = proposal.get("gerceklesen_sonuc") or proposal.get("kazanim", "")
         self._execute("""
-            INSERT INTO proposals (hesap_key, marketplace, proposal_id, proposal_type,
+            INSERT INTO proposals_system (hesap_key, marketplace, proposal_id, proposal_type,
                                    title, description, current_value, proposed_value,
                                    rationale, impact_estimate,
                                    beklenen_sonuc, gerceklesen_sonuc,

@@ -201,12 +201,12 @@ def _parse_proposals(text: str) -> dict:
 
 def _write_proposals_to_supabase(hesap_key: str, marketplace: str,
                                   oneriler: list) -> int:
-    """Onerileri Supabase proposals tablosuna yaz."""
+    """Onerileri Supabase proposals_system tablosuna yaz."""
     try:
-        import sys
+        import sys as _sys
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if base not in sys.path:
-            sys.path.insert(0, base)
+        if base not in _sys.path:
+            _sys.path.insert(0, base)
         from supabase.db_client import SupabaseClient
         sdb = SupabaseClient()
     except Exception as e:
@@ -214,29 +214,28 @@ def _write_proposals_to_supabase(hesap_key: str, marketplace: str,
         return 0
 
     yazilan = 0
-    today = datetime.utcnow().strftime("%Y-%m-%d")
 
     for oneri in oneriler:
         try:
-            # Proposal ID olustur
-            icerik = f"{oneri.get('kategori', '')}|{oneri.get('ne', '')}|{today}"
-            proposal_id = "ONR-" + hashlib.md5(icerik.encode()).hexdigest()[:8].upper()
+            kanit = oneri.get("kanit", {})
+            if isinstance(kanit, dict):
+                kanit = json.dumps(kanit, ensure_ascii=False)
 
-            sdb.upsert_proposal(hesap_key, marketplace, {
-                "id":               proposal_id,
-                "tarih":            today,
-                "kategori":         oneri.get("kategori", "ERROR_PREVENTION"),
-                "durum":            "PENDING",
-                "ne":               oneri.get("ne", ""),
-                "neden":            oneri.get("neden", ""),
-                "kanit":            oneri.get("kanit", {}),
-                "risk":             oneri.get("risk", ""),
-                "kazanim":          oneri.get("kazanim", ""),
-                "beklenen_sonuc":   oneri.get("risk", ""),
-                "gerceklesen_sonuc": oneri.get("kazanim", ""),
-                "degisecek_dosya":  oneri.get("degisecek_dosya", ""),
-                "degisecek_alan":   oneri.get("degisecek_alan", {}),
-            })
+            sdb._execute("""
+                INSERT INTO proposals_system
+                    (hesap_key, marketplace, title, reason, evidence,
+                     beklenen_sonuc, gerceklesen_sonuc, category, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                hesap_key, marketplace,
+                oneri.get("ne", ""),
+                oneri.get("neden", ""),
+                kanit,
+                oneri.get("risk", ""),
+                oneri.get("kazanim", ""),
+                oneri.get("kategori", "ERROR_PREVENTION"),
+                "PENDING",
+            ))
             yazilan += 1
         except Exception as e:
             logger.warning("Oneri yazilamadi: %s — %s", oneri.get("ne", "?"), e)
