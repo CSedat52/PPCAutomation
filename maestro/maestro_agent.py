@@ -9,7 +9,6 @@ Calisma Modlari:
   - resume <hesap_key> <marketplace> : Hata sonrasi devam
   - status    : Tum hesaplarin durumunu gosterir
   - status <hesap_key> <marketplace> : Tek hesap durumu
-  - check <hesap_key> <marketplace>  : Excel onay kontrolu
   - log       : Son log dosyasini gosterir
   - history   : Gecmis session'larin ozetini gosterir
   - accounts  : Aktif hesap listesini gosterir
@@ -37,7 +36,6 @@ from . import config
 from . import state_manager
 from . import email_handler
 from . import retry_handler
-from . import excel_checker
 
 logger = logging.getLogger("maestro.agent")
 
@@ -309,16 +307,8 @@ def resume_pipeline(hesap_key, marketplace, allow_agent3=False):
                 "session_id": session_id,
                 "mesaj": f"Agent 1+2 tamamlandi. Dashboard'dan onay bekleniyor ({account_label}).",
             }
-        current_status = session.get("status", "")
-        if current_status == "waiting_approval":
-            approval_result = _wait_for_approval(state, session_id)
-            if not approval_result:
-                return _build_waiting_result(state, session_id, account_label)
-        elif session["agent3"]["status"] != "completed":
-            state_manager.update_session_status(state, "waiting_approval")
-            approval_result = _wait_for_approval(state, session_id)
-            if not approval_result:
-                return _build_waiting_result(state, session_id, account_label)
+        logger.info("Agent 2 tamamlandi. Onay icin dashboard execution_queue bekleniyor.")
+        return True
 
     if session["agent3"]["status"] != "completed":
         if not allow_agent3:
@@ -716,86 +706,6 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
 
 
 # ============================================================================
-# ONAY BEKLEME DONGUSU
-# ============================================================================
-
-def _wait_for_approval(state, session_id):
-    """
-    E-posta gonderir ve onay bekler.
-    Her APPROVAL_CHECK_INTERVAL_MINUTES dakikada bir kontrol eder.
-    
-    Returns:
-        True: Onay alindi
-        False: Hala bekleniyor (pipeline duraklatildi)
-    """
-    session = state.get("current_session", {})
-
-    # E-posta gonder (henuz gonderilmediyse)
-    if not session["approval"].get("email_sent_at"):
-        agent2_summary = session.get("_agent2_full_summary", {})
-        success, _ = email_handler.send_excel_ready(session_id, agent2_summary)
-        if success:
-            state_manager.update_approval_status(state, "email_sent_at")
-        else:
-            logger.warning("Excel hazir e-postasi gonderilemedi. Yine de beklemeye devam.")
-            save_error_log("NetworkError", "Excel hazir e-postasi gonderilemedi",
-                           session_id=session_id, adim="send_excel_ready",
-                           extra={"email_type": "excel_ready"})
-
-    interval_seconds = config.APPROVAL_CHECK_INTERVAL_MINUTES * 60
-    reminder_seconds = config.APPROVAL_REMINDER_AFTER_HOURS * 3600
-    wait_start = time.time()
-    check_count = 0
-
-    while True:
-        check_count += 1
-        elapsed = time.time() - wait_start
-        logger.info("Onay kontrolu #%d (%d dk beklendi)...", check_count, int(elapsed // 60))
-
-        # 1. IMAP kontrol (reply var mi?)
-        reply_found, imap_error = email_handler.check_for_approval_reply(session_id)
-
-        if reply_found:
-            logger.info("E-posta reply alindi! Excel kontrol ediliyor...")
-
-            # 2. Excel'leri kontrol et
-            excel_status = excel_checker.check_approval_status()
-
-            if excel_status["has_any_approval"]:
-                logger.info("Onay kutulari dolu (%d/%d). Agent 3'e geciliyor.",
-                            excel_status["approved_rows"], excel_status["total_rows"])
-                state_manager.update_approval_status(state, "approved_at")
-                state_manager.update_approval_status(state, "approval_method", "email_reply+excel")
-                return True
-            else:
-                logger.warning("Reply alindi ama Excel onay kutulari bos! Kullaniciya bildirim...")
-                email_handler.send_email(
-                    f"[Maestro] Excel Onay Kutulari Bos - Session {session_id}",
-                    "Reply'iniz alindi ancak Excel dosyalarindaki Onay kutulari hala bos.\n"
-                    "Lutfen Excel'leri doldurup tekrar reply atin."
-                )
-
-        # 3. Reply olmadan da Excel kontrolu yap (kullanici doldurup reply atmayi unutmus olabilir)
-        excel_status = excel_checker.check_approval_status()
-        if excel_status["has_any_approval"]:
-            logger.info("Excel onay kutulari dolu bulundu (reply olmadan). Agent 3'e geciliyor.")
-            state_manager.update_approval_status(state, "approved_at")
-            state_manager.update_approval_status(state, "approval_method", "excel_only")
-            return True
-
-        # 4. Hatirlatma e-postasi (6 saat sonra)
-        if elapsed >= reminder_seconds and not session["approval"].get("reminder_sent_at"):
-            logger.info("6 saat gecti, hatirlatma e-postasi gonderiliyor...")
-            email_handler.send_reminder(session_id)
-            state_manager.update_approval_status(state, "reminder_sent_at")
-
-        # 5. Bekle
-        logger.info("Onay bekleniyor. Sonraki kontrol %d dk sonra.",
-                     config.APPROVAL_CHECK_INTERVAL_MINUTES)
-        time.sleep(interval_seconds)
-
-
-# ============================================================================
 # YARDIMCI FONKSIYONLAR
 # ============================================================================
 
@@ -965,13 +875,6 @@ def get_history(hesap_key=None, marketplace=None, limit=10):
                     "status": s["status"],
                 })
         return result
-
-
-def check_approval(hesap_key, marketplace):
-    """Manuel onay kontrolu."""
-    config.init_account(hesap_key, marketplace)
-    summary, status = excel_checker.get_approval_summary()
-    return summary, status
 
 
 # ============================================================================
@@ -1265,13 +1168,6 @@ def main():
         else:
             result = get_status()
         print(json.dumps(result, indent=2, ensure_ascii=False))
-
-    elif command == "check" or command == "check_approval":
-        if len(args) < 2:
-            print("Kullanim: maestro check <hesap_key> <marketplace>")
-            return
-        summary, _ = check_approval(args[0], args[1])
-        print(summary)
 
     elif command == "accounts":
         pipelines = config.get_active_pipelines()
