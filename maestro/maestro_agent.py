@@ -1,26 +1,15 @@
 """
-Maestro Agent — Ana Orkestrasyon Motoru (v2 Multi-Account)
-============================================================
-Tum hesap+marketplace kombinasyonlari icin pipeline calistirir.
+Maestro Agent — Watch Daemon + Agent 3/4 Orkestrator
+=======================================================
+Dashboard execution_queue'yu izler, onay gelince Agent 3+4 calistirir.
 
 Calisma Modlari:
-  - start     : Tum aktif hesaplar icin pipeline'i bastan baslatir
-  - start <hesap_key> <marketplace> : Tek hesap icin pipeline
-  - resume <hesap_key> <marketplace> : Hata sonrasi devam
-  - status    : Tum hesaplarin durumunu gosterir
+  - watch [dakika]                 : Execution queue izle (varsayilan 5dk)
+  - status                         : Pipeline durumu
   - status <hesap_key> <marketplace> : Tek hesap durumu
-  - log       : Son log dosyasini gosterir
-  - history   : Gecmis session'larin ozetini gosterir
-  - accounts  : Aktif hesap listesini gosterir
+  - accounts                       : Aktif hesap listesi
 
-Pipeline Akisi (her hesap+marketplace icin):
-  1. config.init_account(hesap_key, marketplace)
-  2. Agent 1 (Veri Toplama — parallel_collector subprocess)
-  3. Agent 2 (Analiz — Python script)
-  4. Onay bekleme (Dashboard execution_queue watch)
-  5. Agent 3 (Execution — Python script)
-  6. Agent 4 (Optimizer — Python script)
-  7. Ozet rapor e-postasi
+Agent 1+2 orkestrasyonu pipeline_runner.py tarafindan yapilir (cron).
 """
 
 import os
@@ -29,7 +18,7 @@ import json
 import time
 import logging
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 from . import config
@@ -132,381 +121,9 @@ def _rotate_old_logs():
 # PIPELINE — ANA AKIS
 # ============================================================================
 
-def start_pipeline(hesap_key, marketplace, force=False):
-    """
-    Tek hesap+marketplace icin pipeline baslatir.
-    """
-    config.init_account(hesap_key, marketplace)
-    account_label = config.CURRENT_ACCOUNT["label"]
-    state = state_manager.load_state()
-
-    # Log rotasyonu — 30 gunden eski dosyalari temizle
-    _rotate_old_logs()
-
-    # 1. Duplikasyon kontrolu
-    if not force and state_manager.is_already_run_today(state):
-        msg = (
-            f"Pipeline {account_label} bugun ({datetime.utcnow().strftime(config.DATE_FORMAT)}) zaten calistirildi. "
-            f"Tekrar calistirmak icin force=True kullanin."
-        )
-        logger.warning(msg)
-        return {"durum": "ENGELLENDI", "hesap": account_label, "mesaj": msg}
-
-    # 2. Yeni session olustur
-    session = state_manager.create_session(state)
-    session_id = session["session_id"]
-    log_path = state_manager.setup_session_log(session_id)
-
-    logger.info("Pipeline baslatiliyor — %s — Session: %s", account_label, session_id)
-
-    # Supabase pipeline_runs kaydi
-    sdb = _get_sdb()
-    if sdb:
-        try:
-            sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "starting", "running")
-        except Exception as e:
-            logger.warning("Supabase yazim hatasi: %s", e)
-    _save_log("info", f"Pipeline basladi: {hesap_key}/{marketplace}",
-              "maestro", hesap_key, marketplace, session_id)
-
-    try:
-        # 3. Agent 1 calistir
-        success = _run_agent1(state, session_id, hesap_key, marketplace)
-        if not success:
-            return _build_error_result(state, session_id, "Agent 1", account_label)
-
-        # 4. Agent 2 calistir
-        success = _run_agent2(state, session_id, hesap_key, marketplace)
-        if not success:
-            return _build_error_result(state, session_id, "Agent 2", account_label)
-
-    except Exception as exc:
-        # Beklenmeyen hata — pipeline'i "failed" olarak isaretle
-        logger.error("start_pipeline beklenmeyen hata: %s", exc, exc_info=True)
-        save_error_log("InternalError", f"Pipeline crash: {exc}", session_id=session_id,
-                       adim="start_pipeline", traceback_str=str(exc))
-        if sdb:
-            try:
-                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "pipeline_crash", "failed",
-                                        error_msg=str(exc)[:500])
-            except Exception as e:
-                logger.warning("Supabase yazim hatasi: %s", e)
-        return _build_error_result(state, session_id, "Pipeline", account_label)
-
-    # 5. Agent 2 tamamlandi — Dashboard onay bekleme + execution_queue watch
-    logger.info("Agent 2 tamamlandi. Dashboard'dan onay bekleniyor...")
-    state_manager.update_session_status(state, "waiting_approval")
-    _save_log("info", "Dashboard'dan onay bekleniyor — execution_queue izleniyor",
-              "maestro", hesap_key, marketplace, session_id)
-    if sdb:
-        try:
-            sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "waiting_approval", "running")
-        except Exception as e:
-            logger.warning("Supabase yazim hatasi: %s", e)
-
-    # ===== GUVENLIK KILIDI =====
-    # Agent 3'e gecis SADECE watch daemon (maestro watch) uzerinden yapilir.
-    # start_pipeline() Agent 2 bittikten sonra DURUR.
-    # Dashboard'dan onay geldiginde watch daemon execution_queue'yu algilayip
-    # _run_agent3_from_queue() cagirir.
-    logger.info("=" * 60)
-    logger.info("  PIPELINE DURUYOR — Agent 2 tamamlandi, dashboard onayi bekleniyor")
-    logger.info("  Watch daemon (maestro watch) execution_queue'yu izliyor")
-    logger.info("=" * 60)
-
-    _send_completion_email(state, session_id)
-
-    return {
-        "durum": "ONAY_BEKLIYOR",
-        "hesap": account_label,
-        "session_id": session_id,
-        "mesaj": f"Agent 1+2 tamamlandi. Dashboard'dan onay bekleniyor ({account_label}).",
-    }
-
-
-def run_all_pipelines(force=False):
-    """
-    Tum aktif hesaplar icin pipeline'i sirayla calistirir.
-    accounts.json'daki pipeline_ayarlari.calisma_sirasi kullanilir.
-    """
-    pipelines = config.get_active_pipelines()
-    logger.info("=" * 60)
-    logger.info("MAESTRO MULTI-ACCOUNT — %d pipeline baslatiliyor", len(pipelines))
-    logger.info("=" * 60)
-
-    results = []
-    for p in pipelines:
-        hesap_key = p["hesap_key"]
-        marketplace = p["marketplace"]
-        logger.info("\n--- Pipeline: %s/%s ---", hesap_key, marketplace)
-
-        result = start_pipeline(hesap_key, marketplace, force=force)
-        results.append({
-            "hesap_key": hesap_key,
-            "marketplace": marketplace,
-            "durum": result.get("durum", "?"),
-            "session_id": result.get("session_id", ""),
-        })
-
-        # Hata durumunda sonraki hesaba gec (pipeline durmasin)
-        if result.get("durum") == "HATA":
-            logger.warning("Pipeline %s/%s basarisiz — sonraki hesaba geciliyor",
-                          hesap_key, marketplace)
-
-    # Ozet
-    basarili = sum(1 for r in results if r["durum"] == "TAMAMLANDI")
-    hatali = sum(1 for r in results if r["durum"] == "HATA")
-    logger.info("\n" + "=" * 60)
-    logger.info("MAESTRO TAMAMLANDI — %d/%d basarili, %d hata",
-                basarili, len(results), hatali)
-    logger.info("=" * 60)
-
-    return {"pipelines": results, "basarili": basarili, "hatali": hatali}
-
-
-def resume_pipeline(hesap_key, marketplace, allow_agent3=False):
-    """
-    Hata sonrasi kaldigi yerden devam eder.
-    allow_agent3=True sadece watch daemon (_run_agent3_from_queue) tarafindan kullanilir.
-    """
-    config.init_account(hesap_key, marketplace)
-    account_label = config.CURRENT_ACCOUNT["label"]
-    state = state_manager.load_state()
-    session = state.get("current_session")
-
-    if not session:
-        return {"durum": "BOS", "hesap": account_label,
-                "mesaj": f"Devam edilecek aktif session yok ({account_label}). 'maestro start {hesap_key} {marketplace}' kullanin."}
-
-    session_id = session["session_id"]
-    state_manager.setup_session_log(session_id)
-    logger.info("Pipeline devam ettiriliyor — %s — Session: %s", account_label, session_id)
-
-    last_step = state_manager.get_last_completed_step(state)
-
-    if last_step is None:
-        logger.info("Agent 1'den baslaniyor...")
-        success = _run_agent1(state, session_id, hesap_key, marketplace)
-        if not success:
-            return _build_error_result(state, session_id, "Agent 1", account_label)
-        last_step = "agent1"
-
-    if last_step == "agent1":
-        success = _run_agent2(state, session_id, hesap_key, marketplace)
-        if not success:
-            return _build_error_result(state, session_id, "Agent 2", account_label)
-        last_step = "agent2"
-
-    if last_step == "agent2":
-        if not allow_agent3:
-            # Guvenlik kilidi: Agent 3'e gecis sadece watch daemon uzerinden yapilir
-            logger.info("Agent 2 tamamlanmis, allow_agent3=False — pipeline duruyor.")
-            return {
-                "durum": "ONAY_BEKLIYOR",
-                "hesap": account_label,
-                "session_id": session_id,
-                "mesaj": f"Agent 1+2 tamamlandi. Dashboard'dan onay bekleniyor ({account_label}).",
-            }
-        logger.info("Agent 2 tamamlandi. Onay icin dashboard execution_queue bekleniyor.")
-        return True
-
-    if session["agent3"]["status"] != "completed":
-        if not allow_agent3:
-            logger.info("Agent 3 henuz tamamlanmamis ama allow_agent3=False — pipeline duruyor.")
-            return {
-                "durum": "ONAY_BEKLIYOR",
-                "hesap": account_label,
-                "session_id": session_id,
-                "mesaj": f"Agent 3 icin onay gerekli. Dashboard'dan onay bekleniyor ({account_label}).",
-            }
-        success = _run_agent3(state, session_id, hesap_key, marketplace)
-        if not success:
-            return _build_error_result(state, session_id, "Agent 3", account_label)
-
-    state_manager.update_session_status(state, "completed")
-    logger.info("PIPELINE TAMAMLANDI (resume) — %s — Session: %s", account_label, session_id)
-    _send_completion_email(state, session_id)
-    state_manager.archive_session(state)
-
-    return {
-        "durum": "TAMAMLANDI",
-        "hesap": account_label,
-        "session_id": session_id,
-        "mesaj": f"Pipeline basariyla tamamlandi - resume ({account_label}).",
-    }
-
-
 # ============================================================================
 # AGENT CALISTIRICILARI
 # ============================================================================
-
-def _run_agent1(state, session_id, hesap_key, marketplace):
-    """Agent 1'i calistirir (parallel_collector subprocess)."""
-    logger.info("--- AGENT 1: Veri Toplama (%s/%s) ---", hesap_key, marketplace)
-    state_manager.update_agent_status(state, "agent1", "running")
-    _save_log("info", f"Agent 1 basliyor: {hesap_key}/{marketplace}",
-              "agent1", hesap_key, marketplace, session_id)
-    sdb = _get_sdb()
-    if sdb:
-        try:
-            sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "running")
-        except Exception as e:
-            logger.warning("Supabase yazim hatasi: %s", e)
-
-    today = datetime.utcnow().strftime(config.DATE_FORMAT)
-    data_dir = Path(config.ACCOUNT_DATA_DIR)
-    kritik_dosya = data_dir / f"{today}_sp_campaigns.json"
-
-    # Cache kontrolu — veriler zaten varsa atla
-    if kritik_dosya.exists():
-        logger.info("Agent 1 verileri zaten mevcut (tarih: %s). Devam ediliyor.", today)
-        state_manager.update_agent_status(state, "agent1", "completed",
-            summary=f"Veriler mevcut (tarih: {today})")
-        _save_log("info", "Agent 1 tamamlandi (cached)", "agent1", hesap_key, marketplace, session_id)
-        if sdb:
-            try:
-                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "completed")
-            except Exception as e:
-                logger.warning("Supabase yazim hatasi: %s", e)
-        return True
-
-    # parallel_collector.py'yi subprocess olarak calistir
-    logger.info("parallel_collector baslatiliyor: %s:%s", hesap_key, marketplace)
-
-    def run_collector():
-        env_vars = {**os.environ,
-                    "MAESTRO_SESSION_ID": session_id,
-                    "HESAP_KEY": hesap_key,
-                    "MARKETPLACE": marketplace}
-        result = subprocess.run(
-            [sys.executable, os.path.join(config.BASE_DIR, "parallel_collector.py"),
-             f"{hesap_key}:{marketplace}"],
-            capture_output=True, text=True, timeout=7200,
-            cwd=config.BASE_DIR, env=env_vars,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"parallel_collector hatasi (code {result.returncode}): {result.stderr[:500]}")
-        return result.stdout
-
-    success, result, error_info = retry_handler.execute_with_retry(run_collector, "Agent 1")
-
-    if success:
-        files = list(data_dir.glob(f"{today}_*.json"))
-        state_manager.update_agent_status(state, "agent1", "completed",
-            summary=f"{len(files)} dosya toplandi")
-        _save_log("info", f"Agent 1 tamamlandi: {len(files)} dosya",
-                  "agent1", hesap_key, marketplace, session_id)
-        if sdb:
-            try:
-                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "completed")
-                sdb.update_agent_status_detail("agent1", "completed", {"tasks": len(files)})
-            except Exception as e:
-                logger.warning("Supabase yazim hatasi: %s", e)
-        return True
-    else:
-        error_msg = error_info.get("error_message", "Bilinmeyen hata") if error_info else "Bilinmeyen hata"
-        error_type = error_info.get("error_type", "server_error") if error_info else "server_error"
-        state_manager.update_agent_status(state, "agent1", "failed", errors=[error_msg])
-        save_error_log("AgentFailure", error_msg, session_id=session_id, adim="run_agent1",
-                       extra={"agent": "agent1", "error_type": error_type})
-        _save_log("error", f"Agent 1 hatasi: {error_msg[:200]}",
-                  "agent1", hesap_key, marketplace, session_id, error_type="AgentFailure")
-        if sdb:
-            try:
-                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent1", "failed", error_msg=error_msg)
-            except Exception as e:
-                logger.warning("Supabase yazim hatasi: %s", e)
-        email_handler.send_error(session_id, "Agent 1", error_msg,
-            suggestion=retry_handler.get_error_suggestion(error_type))
-        return False
-
-
-def _run_agent2(state, session_id, hesap_key, marketplace):
-    """Agent 2'yi calistirir (Python script)."""
-    logger.info("--- AGENT 2: Analiz (%s/%s) ---", hesap_key, marketplace)
-    state_manager.update_agent_status(state, "agent2", "running")
-
-    _save_log("info", f"Agent 2 basliyor: {hesap_key}/{marketplace}",
-              "agent2", hesap_key, marketplace, session_id)
-    sdb = _get_sdb()
-    if sdb:
-        try:
-            sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent2", "running")
-        except Exception as e:
-            logger.warning("Supabase yazim hatasi: %s", e)
-
-    def run_agent2_script():
-        env = {**os.environ,
-               "MAESTRO_SESSION_ID": session_id,
-               "HESAP_KEY": hesap_key,
-               "MARKETPLACE": marketplace}
-        result = subprocess.run(
-            [sys.executable, config.AGENT2_SCRIPT, hesap_key, marketplace],
-            capture_output=True, text=True, timeout=600,
-            cwd=config.BASE_DIR, env=env,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Agent 2 hata ile cikti (code {result.returncode}): {result.stderr[:500]}")
-
-        # stdout'tan JSON sonucu parse et
-        output = result.stdout.strip()
-        # Son satirdan itibaren JSON bul
-        json_start, json_end = _extract_outer_json(output)
-        if json_start >= 0:
-            return json.loads(output[json_start:json_end+1])
-        raise RuntimeError(f"Agent 2 JSON ciktisi alinamadi. Output: {output[:500]}")
-
-    success, result, error_info = retry_handler.execute_with_retry(
-        run_agent2_script, "Agent 2"
-    )
-
-    if success:
-        summary = result if isinstance(result, dict) else {}
-        state_manager.update_agent_status(
-            state, "agent2", "completed",
-            summary=_format_agent2_summary(summary)
-        )
-
-        # Agent 2 summary'yi session'a kaydet (e-posta icin)
-        session = state.get("current_session", {})
-        session["_agent2_full_summary"] = summary
-
-        logger.info("Agent 2 tamamlandi: %s", state["current_session"]["agent2"]["summary"])
-        _save_log("info", f"Agent 2 tamamlandi: {summary.get('toplam_hedef', 0)} hedef analiz edildi",
-                  "agent2", hesap_key, marketplace, session_id)
-        if sdb:
-            try:
-                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent2", "completed")
-                sdb.update_agent_status_detail("agent2", "completed", {
-                    "tasks": summary.get("toplam_hedef", 0) if isinstance(summary, dict) else 0,
-                })
-            except Exception as e:
-                logger.warning("Supabase yazim hatasi: %s", e)
-        return True
-    else:
-        error_msg = error_info.get("error_message", "Bilinmeyen hata") if error_info else "Bilinmeyen hata"
-        error_type = error_info.get("error_type", "server_error") if error_info else "server_error"
-        attempts = error_info.get("attempts", 0) if error_info else 0
-        state_manager.update_agent_status(state, "agent2", "failed", errors=[error_msg])
-
-        save_error_log("AgentFailure", error_msg, session_id=session_id,
-                       adim="run_agent2",
-                       extra={"agent": "agent2", "error_type": error_type,
-                              "attempts": attempts})
-
-        _save_log("error", f"Agent 2 hatasi: {error_msg[:200]}",
-                  "agent2", hesap_key, marketplace, session_id, error_type=error_type)
-        if sdb:
-            try:
-                sdb.upsert_pipeline_run(session_id, hesap_key, marketplace, "agent2", "failed", error_msg=error_msg)
-                sdb.update_agent_status_detail("agent2", "failed")
-            except Exception as e:
-                logger.warning("Supabase yazim hatasi: %s", e)
-
-        suggestion = retry_handler.get_error_suggestion(error_type)
-        email_handler.send_error(session_id, "Agent 2", error_msg, suggestion)
-        return False
-
 
 def _run_agent3(state, session_id, hesap_key, marketplace):
     """Agent 3'u calistirir (dry-run + execute + verify)."""
@@ -703,92 +320,6 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
 
     logger.info("Agent 3 tamamlandi: %s", exec_summary)
     return True
-
-
-# ============================================================================
-# YARDIMCI FONKSIYONLAR
-# ============================================================================
-
-def _format_agent2_summary(summary):
-    """Agent 2 summary'sini okunabilir stringe cevirir."""
-    if not isinstance(summary, dict):
-        return str(summary)
-
-    parts = []
-    parts.append(f"Hedefleme: {summary.get('toplam_hedefleme', 0)}")
-    parts.append(f"Bid tavsiye: {summary.get('bid_tavsiye_sayisi', 0)}")
-    parts.append(f"Negatif: {summary.get('negatif_aday_sayisi', 0)}")
-    parts.append(f"Harvesting: {summary.get('harvesting_aday_sayisi', 0)}")
-    return " | ".join(parts)
-
-
-def _build_error_result(state, session_id, agent_name, account_label=""):
-    """Hata durumu icin sonuc dict'i olusturur + Supabase'de pipeline'i 'failed' olarak isaretler."""
-    session = state.get("current_session", {})
-
-    # Pipeline durumunu Supabase'de "failed" olarak guncelle
-    # (_run_agentX icinde agent adimi zaten "failed" yazilmis olabilir
-    #  ama pipeline seviyesinde de "failed" garantilemek icin tekrar yaziyoruz)
-    sdb = _get_sdb()
-    if sdb and session_id:
-        try:
-            current = config.CURRENT_ACCOUNT or {}
-            hk = current.get("hesap_key", "")
-            mp = current.get("marketplace", "")
-            error_msg = f"{agent_name} basarisiz oldu"
-            sdb.upsert_pipeline_run(session_id, hk, mp, agent_name.lower().replace(" ", ""), "failed",
-                                    error_msg=error_msg)
-        except Exception as e:
-            logger.warning("Supabase yazim hatasi: %s", e)
-
-    return {
-        "durum": "HATA",
-        "hesap": account_label,
-        "session_id": session_id,
-        "agent": agent_name,
-        "mesaj": f"{agent_name} basarisiz oldu ({account_label}). Detaylar icin log'a bakin.",
-        "hatalar": session.get("errors", []),
-    }
-
-
-def _build_waiting_result(state, session_id, account_label=""):
-    """Onay bekleme durumu icin sonuc dict'i olusturur."""
-    return {
-        "durum": "ONAY_BEKLENIYOR",
-        "hesap": account_label,
-        "session_id": session_id,
-        "mesaj": f"Pipeline onay bekliyor ({account_label}). Excel'leri doldurup e-postaya reply atin.",
-    }
-
-
-def _send_completion_email(state, session_id):
-    """Pipeline tamamlandi e-postasi gonderir."""
-    session = state.get("current_session", {})
-
-    def _calc_duration(agent_key):
-        a = session.get(agent_key, {})
-        start = a.get("started_at")
-        end = a.get("completed_at")
-        if start and end:
-            try:
-                s = datetime.fromisoformat(start)
-                e = datetime.fromisoformat(end)
-                delta = e - s
-                minutes = int(delta.total_seconds() // 60)
-                seconds = int(delta.total_seconds() % 60)
-                return f"{minutes}dk {seconds}sn"
-            except Exception as e:
-                logger.warning("Supabase yazim hatasi: %s", e)
-        return "-"
-
-    summary = {
-        "agent1_duration": _calc_duration("agent1"),
-        "agent2_duration": _calc_duration("agent2"),
-        "agent3_duration": _calc_duration("agent3"),
-        "agent3_summary": session.get("_agent3_exec_result", {}),
-    }
-
-    email_handler.send_completed(session_id, summary)
 
 
 # ============================================================================
@@ -1126,43 +657,16 @@ def main():
     if len(sys.argv) < 2:
         print("Kullanim: python -m maestro.maestro_agent <komut> [hesap_key marketplace]")
         print("Komutlar:")
-        print("  start                          : Tum hesaplar icin pipeline")
-        print("  start <hesap_key> <marketplace> : Tek hesap icin pipeline")
-        print("  resume <hesap_key> <marketplace> : Hata sonrasi devam")
+        print("  watch [dakika]                 : Dashboard execution queue izle (varsayilan 5dk)")
         print("  status                         : Tum hesaplarin durumu")
         print("  status <hesap_key> <marketplace> : Tek hesap durumu")
-        print("  check <hesap_key> <marketplace>  : Excel onay kontrolu")
         print("  accounts                       : Aktif hesap listesi")
-        print("  log                            : Son log dosyasi")
-        print("  history                        : Gecmis session ozeti")
-        print("  watch [dakika]                 : Dashboard execution queue izle (varsayilan 5dk)")
         return
 
     command = sys.argv[1].lower().replace("-", "_")
     args = sys.argv[2:]
 
-    if command == "start":
-        if len(args) >= 2:
-            result = start_pipeline(args[0], args[1])
-        else:
-            result = run_all_pipelines()
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-
-    elif command == "force_start":
-        if len(args) >= 2:
-            result = start_pipeline(args[0], args[1], force=True)
-        else:
-            result = run_all_pipelines(force=True)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-
-    elif command == "resume":
-        if len(args) < 2:
-            print("Kullanim: maestro resume <hesap_key> <marketplace>")
-            return
-        result = resume_pipeline(args[0], args[1])
-        print(json.dumps(result, indent=2, ensure_ascii=False))
-
-    elif command == "status":
+    if command == "status":
         if len(args) >= 2:
             result = get_status(args[0], args[1])
         else:
@@ -1176,30 +680,13 @@ def main():
             print(f"  {i:2d}. {p['hesap_key']}/{p['marketplace']}")
         print()
 
-    elif command == "log":
-        log_path = state_manager.get_latest_log_path()
-        if log_path and os.path.exists(log_path):
-            with open(log_path, "r", encoding="utf-8") as f:
-                print(f.read())
-        else:
-            print("Log dosyasi bulunamadi.")
-
-    elif command == "history":
-        if len(args) >= 2:
-            result = get_history(args[0], args[1])
-        else:
-            result = get_history()
-        for s in result:
-            hesap = s.get('hesap', '')
-            print(f"  {hesap:25s} | {s.get('session_id', '')} | {s.get('date', '')} | {s.get('status', '')}")
-
     elif command == "watch":
         interval = int(args[0]) if args else 5
         watch_queue(interval)
 
     else:
         print(f"Bilinmeyen komut: {command}")
-        print("Gecerli komutlar: start, resume, status, check, accounts, log, history, watch")
+        print("Gecerli komutlar: watch, status, accounts")
 
 
 if __name__ == "__main__":
