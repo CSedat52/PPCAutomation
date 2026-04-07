@@ -111,7 +111,7 @@ def _run_optimizer_impl(today, data_dir, config_dir, hesap_key, marketplace):
 
     # ---- 2. KPI GUNCELLEME ----
     logger.info("--- [2/6] KPI guncelleniyor ---")
-    kpi = KPICollector(hesap_key, marketplace, db)
+    kpi = KPICollector(hesap_key, marketplace)
     kpi_ozet = kpi.run(today)
     logger.info("KPI: %d yeni karar islendi, %d kpi_after dolduruldu",
                 kpi_ozet.get("yeni_karar", 0), kpi_ozet.get("kpi_after_doldurulan", 0))
