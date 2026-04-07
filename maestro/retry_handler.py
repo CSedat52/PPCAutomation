@@ -7,8 +7,15 @@ Hata tipine gore farkli strateji uygular.
 
 import time
 import logging
+import os
+import sys
 
 from . import config
+
+_base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _base not in sys.path:
+    sys.path.insert(0, _base)
+from log_utils import classify_error_type
 
 logger = logging.getLogger("maestro.retry")
 
@@ -27,38 +34,26 @@ def classify_error(error):
     Returns:
         (error_type: str, retry_config: dict)
     """
-    error_str = str(error).lower()
+    error_type = classify_error_type(str(error))
 
-    # Rate Limit (429)
-    if any(k in error_str for k in ["429", "rate limit", "too many requests", "throttl"]):
-        return "rate_limit", config.RETRY_CONFIG["rate_limit"]
-
-    # Auth/Token (401, 403)
-    if any(k in error_str for k in ["401", "403", "unauthorized", "forbidden", "token", "auth"]):
-        return "auth_error", config.RETRY_CONFIG["auth_error"]
-
-    # Network/Timeout
-    if any(k in error_str for k in ["timeout", "connection", "network", "dns", "refused",
-                                      "reset", "broken pipe", "eof", "ssl"]):
-        return "network", config.RETRY_CONFIG["network"]
-
-    # File Not Found
-    if any(k in error_str for k in ["not found", "no such file", "filenotfound", "dosya bulunamadi"]):
-        return "file_not_found", config.RETRY_CONFIG["file_not_found"]
-
-    # Data/Format Error (400)
-    if any(k in error_str for k in ["400", "bad request", "invalid", "malformed",
-                                      "validation", "format", "parse"]):
-        return "data_error", config.RETRY_CONFIG["data_error"]
-
-    # Server Error (500+)
-    if any(k in error_str for k in ["500", "502", "503", "504", "internal server",
-                                      "bad gateway", "service unavail", "gateway timeout"]):
-        return "server_error", config.RETRY_CONFIG["server_error"]
-
-    # Bilinmeyen hata — guvenli tarafta kal, retry yap
-    logger.warning("Bilinmeyen hata tipi, server_error olarak siniflandiriliyor: %s", error_str[:200])
-    return "server_error", config.RETRY_CONFIG["server_error"]
+    # log_utils taksonomisini retry config key'e maple
+    type_mapping = {
+        "RateLimit": "rate_limit",
+        "AuthError": "auth_error",
+        "NetworkError": "network",
+        "FileNotFound": "file_not_found",
+        "ApiError": "data_error",
+        "DataError": "data_error",
+        "ServerError": "server_error",
+        "InternalError": "server_error",
+        "ExecutionError": "server_error",
+        "VerificationError": "server_error",
+        "AgentFailure": "server_error",
+        "ReportFailed": "server_error",
+        "Preflight": "data_error",
+    }
+    config_key = type_mapping.get(error_type, "server_error")
+    return error_type, config.RETRY_CONFIG.get(config_key, config.RETRY_CONFIG["server_error"])
 
 
 def calculate_wait_time(retry_config, attempt):
