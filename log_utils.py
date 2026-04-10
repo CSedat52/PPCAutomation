@@ -212,13 +212,20 @@ def save_error_log(hata_tipi, hata_mesaji, log_dir=None,
                 sys.path.insert(0, _project_root)
             from supabase.db_client import SupabaseClient
             _sdb = SupabaseClient()
+            import json as _json
+            _details = {}
+            if adim:
+                _details["step"] = adim
+            if extra:
+                _details.update(extra)
             _sdb._execute(
                 """INSERT INTO agent_logs (agent_id, level, message, error_type,
-                    hesap_key, marketplace, session_id, traceback, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
+                    hesap_key, marketplace, session_id, traceback, details, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
                 (agent_name, "error", str(hata_mesaji)[:500], hata_tipi,
                  hesap_key, marketplace, session_id,
-                 str(traceback_str)[:1000] if traceback_str else None)
+                 str(traceback_str)[:1000] if traceback_str else None,
+                 _json.dumps(_details, ensure_ascii=False) if _details else None)
             )
             return True
         except Exception as e:
