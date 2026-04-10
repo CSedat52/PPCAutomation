@@ -110,7 +110,10 @@ class AmazonAdsClient:
 
     async def get_http(self):
         if self._http is None or self._http.is_closed:
-            self._http = httpx.AsyncClient(timeout=180)
+            self._http = httpx.AsyncClient(
+                timeout=180,
+                limits=httpx.Limits(keepalive_expiry=15)
+            )
         return self._http
 
     async def close(self):
