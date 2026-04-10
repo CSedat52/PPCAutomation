@@ -1717,7 +1717,8 @@ def run_analysis(hesap_key, marketplace):
         _dashboard_pipeline(_session_id, hesap_key, marketplace, "agent2", _final)
         _save_log("info" if _final == "completed" else "error",
                   f"Agent 2 {'tamamlandi' if _final == 'completed' else 'basarisiz'}: {result.get('durum', '')}",
-                  "agent2", hesap_key, marketplace, _session_id)
+                  "agent2", hesap_key, marketplace, _session_id,
+                  error_type=result.get("hata_tipi", "AgentFailure") if _final == "failed" else None)
         return result
     except Exception as e:
         tb = traceback.format_exc()
