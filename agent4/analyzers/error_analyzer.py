@@ -92,6 +92,23 @@ class ErrorAnalyzer:
             """, (self.hesap_key, self.marketplace, agent, sinir))
             son_30_tipler = {r[0]: r[1] for r in (son_30_tip_rows or [])}
 
+            sinir_7 = (datetime.utcnow() - timedelta(days=7)).isoformat()
+
+            son_7_row = sdb._fetch_one("""
+                SELECT COUNT(*) FROM agent_logs
+                WHERE hesap_key = %s AND marketplace = %s AND agent_id = %s
+                  AND level = 'error' AND created_at > %s
+            """, (self.hesap_key, self.marketplace, agent, sinir_7))
+            son_7 = son_7_row[0] if son_7_row else 0
+
+            son_7_tip_rows = sdb._fetch_all("""
+                SELECT error_type, COUNT(*) as cnt FROM agent_logs
+                WHERE hesap_key = %s AND marketplace = %s AND agent_id = %s
+                  AND level = 'error' AND created_at > %s
+                GROUP BY error_type ORDER BY cnt DESC LIMIT 5
+            """, (self.hesap_key, self.marketplace, agent, sinir_7))
+            son_7_tipler = {r[0]: r[1] for r in (son_7_tip_rows or [])}
+
             son_hata_row = sdb._fetch_one("""
                 SELECT created_at, error_type, message, details->>'step' as step
                 FROM agent_logs
@@ -114,6 +131,8 @@ class ErrorAnalyzer:
                 "tip_dagilimi":  tip_dagilimi,
                 "adim_dagilimi": adim_dagilimi,
                 "son_30_tipler": son_30_tipler,
+                "son_7_gun":     son_7,
+                "son_7_tipler":  son_7_tipler,
                 "en_son_hata":   en_son_hata,
             }
 

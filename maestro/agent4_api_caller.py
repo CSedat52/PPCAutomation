@@ -36,6 +36,11 @@ Format:
 {"oneriler": [{"kategori": "...", "ne": "...", "neden": "...", "kanit": "...", "risk": "...", "kazanim": "..."}]}
 
 Eger oneri yoksa: {"oneriler": []}
+KRITIK KURALLAR:
+- Eger bir hata tipi son_7_tipler'de YOKSA, bu sorun COZULMUS demektir — oneri URETME.
+- Ayni konu icin birden fazla oneri uretme — en iyi tek oneriyi sec.
+- Duplike oneri uretme — farkli kelimelerle ayni seyi soylemek yasak.
+
 Kategori tipleri: CONFIG, RETRY, TIMEOUT, BUGFIX, MONITORING, ARCHITECTURE"""
 
 
