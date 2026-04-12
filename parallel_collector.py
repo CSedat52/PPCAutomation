@@ -110,9 +110,13 @@ class AmazonAdsClient:
 
     async def get_http(self):
         if self._http is None or self._http.is_closed:
+            transport = httpx.AsyncHTTPTransport(
+                retries=3,
+                limits=httpx.Limits(keepalive_expiry=15),
+            )
             self._http = httpx.AsyncClient(
                 timeout=180,
-                limits=httpx.Limits(keepalive_expiry=15)
+                transport=transport,
             )
         return self._http
 
@@ -387,6 +391,23 @@ SD_CAMPAIGN_COLS = [
     "addToCartViews",
     "date",
 ]
+
+
+# ============================================================================
+# RAPOR TANIMLARI — retry-reports modu icin
+# ============================================================================
+
+REPORT_TASK_MAP = {
+    "sp_targeting_14d": ("sp_targeting_report", "SPONSORED_PRODUCTS", "spTargeting", ["targeting"], SP_TARGETING_COLS, 14, "SUMMARY"),
+    "sp_search_term_30d": ("sp_search_term_report", "SPONSORED_PRODUCTS", "spSearchTerm", ["searchTerm"], SP_SEARCH_TERM_COLS, 30, "SUMMARY"),
+    "sb_targeting_14d": ("sb_targeting_report", "SPONSORED_BRANDS", "sbTargeting", ["targeting"], SB_TARGETING_COLS, 14, "SUMMARY"),
+    "sb_search_term_30d": ("sb_search_term_report", "SPONSORED_BRANDS", "sbSearchTerm", ["searchTerm"], SB_SEARCH_TERM_COLS, 30, "SUMMARY"),
+    "sd_targeting_14d": ("sd_targeting_report", "SPONSORED_DISPLAY", "sdTargeting", ["targeting"], SD_TARGETING_COLS, 14, "SUMMARY"),
+    "sd_targeting_30d": ("sd_targeting_report", "SPONSORED_DISPLAY", "sdTargeting", ["targeting"], SD_TARGETING_COLS, 30, "SUMMARY"),
+    "sp_campaign_14d": ("sp_campaign_report", "SPONSORED_PRODUCTS", "spCampaigns", ["campaign"], SP_CAMPAIGN_COLS, 14, "DAILY"),
+    "sb_campaign_14d": ("sb_campaign_report", "SPONSORED_BRANDS", "sbCampaigns", ["campaign"], SB_CAMPAIGN_COLS, 14, "DAILY"),
+    "sd_campaign_14d": ("sd_campaign_report", "SPONSORED_DISPLAY", "sdCampaigns", ["campaign"], SD_CAMPAIGN_COLS, 14, "DAILY"),
+}
 
 
 # ============================================================================
@@ -1003,6 +1024,173 @@ async def run_account(hesap_key, hesap, lwa, mp_list, force=False):
     return results
 
 
+async def retry_specific_reports(report_targets):
+    """
+    Sadece belirtilen raporlari ceker. Entity collection YAPMAZ.
+    Smart-skip DEVREYE GIRMEZ.
+
+    Args:
+        report_targets: ["qmmp_na:US:sd_targeting_14d", "vigowood_eu:FR:sd_targeting_14d", ...]
+        Her eleman: "hesap_key:marketplace:rapor_key"
+        rapor_key: REPORT_TASK_MAP'teki key (ör: sd_targeting_14d, sp_search_term_30d)
+    """
+    accounts = load_accounts()
+    lwa = accounts["lwa_app"]
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Parse targets
+    tasks = []
+    for target in report_targets:
+        parts = target.split(":")
+        if len(parts) != 3:
+            logger.error("Gecersiz retry target formati: %s (beklenen: hesap_key:marketplace:rapor_key)", target)
+            continue
+        hk, mp, rapor_key = parts
+        if rapor_key not in REPORT_TASK_MAP:
+            logger.error("Bilinmeyen rapor key: %s (gecerli: %s)", rapor_key, ", ".join(REPORT_TASK_MAP.keys()))
+            continue
+        task_tuple = REPORT_TASK_MAP[rapor_key]
+        tasks.append((hk, mp, task_tuple))
+
+    if not tasks:
+        logger.info("Retry edilecek rapor yok.")
+        return {"basarili": 0, "basarisiz": 0}
+
+    logger.info("=" * 60)
+    logger.info("  RAPOR-SEVIYESI RETRY: %d rapor", len(tasks))
+    for hk, mp, (name, _, _, _, _, days, _) in tasks:
+        logger.info("    %s/%s: %s_%dd", hk, mp, name, days)
+    logger.info("=" * 60)
+
+    # API client cache
+    _clients = {}
+
+    async def _get_client(hk, mp):
+        cache_key = f"{hk}_{mp}"
+        if cache_key not in _clients:
+            hesap = accounts["hesaplar"][hk]
+            mp_config = hesap["marketplaces"][mp]
+            cfg = {
+                "client_id": lwa["client_id"],
+                "client_secret": lwa["client_secret"],
+                "refresh_token": hesap["refresh_token"],
+                "marketplace": mp,
+                "profile_id": mp_config["profile_id"],
+                "account_id": hesap["account_id"],
+                "api_endpoint": hesap["api_endpoint"],
+                "token_endpoint": hesap["token_endpoint"],
+            }
+            _clients[cache_key] = AmazonAdsClient(cfg)
+        return _clients[cache_key]
+
+    # FAZ 1: FIRE — tum create request'lerini paralel gonder
+    fire_coros = []
+    fire_meta = []
+
+    for hk, mp, (name, ap, rt, gb, cols, days, tunit) in tasks:
+        cl = await _get_client(hk, mp)
+        key = f"{name}_{days}d"
+        # Eski dosyayi sil
+        dd = get_data_dir(hk, mp)
+        old_file = dd / f"{today_str}_{key}.json"
+        if old_file.exists():
+            old_file.unlink()
+        payload = build_report_payload(ap, rt, gb, cols, days, tunit)
+        fire_coros.append(cl.create_report_request(payload))
+        fire_meta.append((hk, mp, key, (name, ap, rt, gb, cols, days, tunit)))
+
+    fire_results = await asyncio.gather(*fire_coros, return_exceptions=True)
+
+    pending = {}
+    basarisiz = 0
+
+    for (hk, mp, key, task_tuple), result in zip(fire_meta, fire_results):
+        if isinstance(result, Exception):
+            logger.error("[RAPOR-RETRY] Create exception: %s/%s — %s: %s", hk, mp, key, str(result)[:200])
+            basarisiz += 1
+        elif is_error(result):
+            logger.error("[RAPOR-RETRY] Create hata: %s/%s — %s: %s", hk, mp, key, result.get("error"))
+            basarisiz += 1
+        else:
+            report_id = result["reportId"]
+            logger.info("[RAPOR-RETRY] Create OK: %s/%s — %s → %s", hk, mp, key, report_id)
+            pending[key] = (report_id, hk, mp, task_tuple)
+
+    # FAZ 2: POLL — paralel poll et
+    basarili = 0
+
+    if pending:
+        async def _poll_save_sync(p_key, p_report_id, p_hk, p_mp, p_task_tuple):
+            """Poll + kaydet + Supabase sync."""
+            name, ap, rt, gb, cols, days, tunit = p_task_tuple
+            cl = await _get_client(p_hk, p_mp)
+            dd = get_data_dir(p_hk, p_mp)
+            try:
+                rows = await cl.poll_and_download_report(p_report_id)
+                if is_error(rows):
+                    return False
+                fname = f"{today_str}_{p_key}.json"
+                save_json(fname, rows, dd)
+
+                # Supabase sync (rapor tablosuna yaz)
+                if isinstance(rows, list) and len(rows) > 0:
+                    try:
+                        from supabase.db_client import SupabaseClient
+                        db = SupabaseClient()
+                        ad_type = ""
+                        if name.startswith("sp"):
+                            ad_type = "SP"
+                        elif name.startswith("sb"):
+                            ad_type = "SB"
+                        elif name.startswith("sd"):
+                            ad_type = "SD"
+
+                        period = f"{days}d"
+                        if "targeting" in name and "campaign" not in name:
+                            db.insert_targeting_reports(p_hk, p_mp, ad_type, period, today_str, rows)
+                        elif "search_term" in name:
+                            db.insert_search_term_reports(p_hk, p_mp, ad_type, today_str, rows)
+                        elif "campaign" in name:
+                            db.insert_campaign_reports(p_hk, p_mp, ad_type, period, today_str, rows)
+
+                        # KPI daily guncelle
+                        db.upsert_kpi_daily(p_hk, p_mp, today_str)
+                        logger.info("[RAPOR-RETRY] Supabase sync OK: %s/%s — %s (%d satir)", p_hk, p_mp, p_key, len(rows))
+                    except Exception as e:
+                        logger.warning("[RAPOR-RETRY] Supabase sync hatasi: %s/%s — %s: %s", p_hk, p_mp, p_key, e)
+
+                return True
+            except Exception as e:
+                logger.error("[RAPOR-RETRY] Poll hatasi: %s/%s — %s: %s", p_hk, p_mp, p_key, str(e)[:200])
+                return False
+
+        poll_coros = [
+            _poll_save_sync(key, report_id, hk, mp, task_tuple)
+            for key, (report_id, hk, mp, task_tuple) in pending.items()
+        ]
+        poll_results = await asyncio.gather(*poll_coros, return_exceptions=True)
+
+        for result in poll_results:
+            if isinstance(result, Exception) or result is False:
+                basarisiz += 1
+            else:
+                basarili += 1
+
+    # Client'lari kapat
+    for cl in _clients.values():
+        await cl.close()
+
+    logger.info("=" * 60)
+    logger.info("  RAPOR-SEVIYESI RETRY SONUC: %d basarili, %d basarisiz", basarili, basarisiz)
+    logger.info("=" * 60)
+
+    _save_log("info",
+              f"Rapor-seviyesi retry tamamlandi: {basarili} basarili, {basarisiz} basarisiz",
+              "maestro")
+
+    return {"basarili": basarili, "basarisiz": basarisiz}
+
+
 async def run_all(targets=None, force=False):
     """
     Hesaplari paralel calistirir.
@@ -1153,38 +1341,96 @@ async def run_all(targets=None, force=False):
                 _retry_clients[cache_key] = AmazonAdsClient(cfg)
             return _retry_clients[cache_key]
 
-        async def _retry_single_report(hk, mplace, name, ap, rt, gb, cols, days, tunit):
-            """Tek bir raporu retry et. Basarili ise True doner."""
-            cl = await _get_retry_client(hk, mplace)
-            dd = get_data_dir(hk, mplace)
+        async def _retry_reports_parallel(report_list, round_label=""):
+            """
+            Basarisiz raporlari fire-all-then-poll ile paralel retry eder.
+
+            Args:
+                report_list: [(hk, mplace, (name, ap, rt, gb, cols, days, tunit)), ...]
+                round_label: Log icin etiket (ör: "Deneme 1/3")
+
+            Returns:
+                (succeeded, still_failed) — iki liste
+            """
+            succeeded = []
+            still_failed_inner = []
             today_str = datetime.utcnow().strftime("%Y-%m-%d")
-            key = f"{name}_{days}d"
-            fname = f"{today_str}_{key}.json"
-            old_file = dd / fname
-            if old_file.exists():
-                old_file.unlink()
-            try:
+
+            # FAZ 1: FIRE — tum create request'lerini paralel gonder
+            fire_coros = []
+            fire_meta = []
+
+            for hk, mplace, (name, ap, rt, gb, cols, days, tunit) in report_list:
+                cl = await _get_retry_client(hk, mplace)
+                key = f"{name}_{days}d"
+                # Eski dosyayi sil (varsa)
+                dd = get_data_dir(hk, mplace)
+                old_file = dd / f"{today_str}_{key}.json"
+                if old_file.exists():
+                    old_file.unlink()
                 payload = build_report_payload(ap, rt, gb, cols, days, tunit)
-                rows = await cl.download_report(payload)
-                if is_error(rows):
-                    return False
-                save_json(fname, rows, dd)
-                return True
-            except Exception:
-                return False
+                fire_coros.append(cl.create_report_request(payload))
+                fire_meta.append((hk, mplace, key, (name, ap, rt, gb, cols, days, tunit)))
+
+            fire_results = await asyncio.gather(*fire_coros, return_exceptions=True)
+
+            pending = {}
+            for (hk, mplace, key, task_tuple), result in zip(fire_meta, fire_results):
+                if isinstance(result, Exception):
+                    logger.warning("[TOPLU-RETRY] %s Create exception: %s/%s — %s: %s",
+                                  round_label, hk, mplace, key, str(result)[:200])
+                    still_failed_inner.append((hk, mplace, task_tuple))
+                elif is_error(result):
+                    logger.warning("[TOPLU-RETRY] %s Create hata: %s/%s — %s: %s",
+                                  round_label, hk, mplace, key, result.get("error"))
+                    still_failed_inner.append((hk, mplace, task_tuple))
+                else:
+                    report_id = result["reportId"]
+                    logger.info("[TOPLU-RETRY] %s Create OK: %s/%s — %s → %s",
+                               round_label, hk, mplace, key, report_id)
+                    pending[key] = (report_id, hk, mplace, task_tuple)
+
+            # FAZ 2: POLL — tum raporlari paralel poll et
+            if pending:
+                async def _poll_and_save(p_key, p_report_id, p_hk, p_mplace, p_task_tuple):
+                    cl = await _get_retry_client(p_hk, p_mplace)
+                    try:
+                        rows = await cl.poll_and_download_report(p_report_id)
+                        if is_error(rows):
+                            return "FAIL", p_hk, p_mplace, p_key, p_task_tuple
+                        dd = get_data_dir(p_hk, p_mplace)
+                        fname = f"{today_str}_{p_key}.json"
+                        save_json(fname, rows, dd)
+                        return "OK", p_hk, p_mplace, p_key, p_task_tuple
+                    except Exception:
+                        return "FAIL", p_hk, p_mplace, p_key, p_task_tuple
+
+                poll_coros = [
+                    _poll_and_save(key, report_id, hk, mplace, task_tuple)
+                    for key, (report_id, hk, mplace, task_tuple) in pending.items()
+                ]
+                poll_results = await asyncio.gather(*poll_coros, return_exceptions=True)
+
+                for result in poll_results:
+                    if isinstance(result, Exception):
+                        logger.warning("[TOPLU-RETRY] %s Poll exception: %s", round_label, str(result)[:200])
+                        continue
+                    status, hk, mplace, key, task_tuple = result
+                    if status == "OK":
+                        logger.info("[TOPLU-RETRY] %s BASARILI: %s/%s — %s", round_label, hk, mplace, key)
+                        succeeded.append((hk, mplace, task_tuple))
+                    else:
+                        logger.warning("[TOPLU-RETRY] %s BASARISIZ: %s/%s — %s", round_label, hk, mplace, key)
+                        still_failed_inner.append((hk, mplace, task_tuple))
+
+            return succeeded, still_failed_inner
 
         # Bos raporlari 1 kez retry et (120s bekleme)
         if all_empty:
             logger.info("[TOPLU-RETRY] %d bos rapor 1 kez tekrar deneniyor (120s bekleme)...", len(all_empty))
             await asyncio.sleep(120)
-            for hk, mplace, (name, ap, rt, gb, cols, days, tunit) in all_empty:
-                key = f"{name}_{days}d"
-                ok = await _retry_single_report(hk, mplace, name, ap, rt, gb, cols, days, tunit)
-                if ok:
-                    logger.info("[TOPLU-RETRY] BOS BASARILI: %s/%s — %s", hk, mplace, key)
-                    toplam_basarili += 1
-                else:
-                    logger.info("[TOPLU-RETRY] BOS: %s/%s — %s yine bos/hata — gecerli kabul", hk, mplace, key)
+            ok_list, _ = await _retry_reports_parallel(all_empty, "BOS")
+            toplam_basarili += len(ok_list)
 
         # Basarisiz raporlari max 3 kez retry et (artan bekleme)
         if all_failed:
@@ -1198,19 +1444,10 @@ async def run_all(targets=None, force=False):
                             attempt + 1, len(RETRY_DELAYS), len(still_failed), delay)
                 await asyncio.sleep(delay)
 
-                next_round = []
-                for hk, mplace, (name, ap, rt, gb, cols, days, tunit) in still_failed:
-                    key = f"{name}_{days}d"
-                    ok = await _retry_single_report(hk, mplace, name, ap, rt, gb, cols, days, tunit)
-                    if ok:
-                        logger.info("[TOPLU-RETRY] Deneme %d BASARILI: %s/%s — %s", attempt + 1, hk, mplace, key)
-                        toplam_basarili += 1
-                        toplam_hata -= 1
-                    else:
-                        logger.warning("[TOPLU-RETRY] Deneme %d BASARISIZ: %s/%s — %s", attempt + 1, hk, mplace, key)
-                        next_round.append((hk, mplace, (name, ap, rt, gb, cols, days, tunit)))
-
-                still_failed = next_round
+                ok_list, still_failed = await _retry_reports_parallel(
+                    still_failed, f"Deneme {attempt + 1}/{len(RETRY_DELAYS)}")
+                toplam_basarili += len(ok_list)
+                toplam_hata -= len(ok_list)
 
             if still_failed:
                 logger.error("[TOPLU-RETRY] TUKENDI: %d rapor hala basarisiz", len(still_failed))
@@ -1246,10 +1483,20 @@ if __name__ == "__main__":
     # Kullanim:
     #   python parallel_collector.py                          → tum hesaplar
     #   python parallel_collector.py vigowood_eu              → tek hesabin tum mp'leri
-    #   python parallel_collector.py vigowood_na:US vigowood_eu:DE vigowood_eu:UK  → belirli kombinasyonlar
+    #   python parallel_collector.py vigowood_na:US vigowood_eu:DE  → belirli kombinasyonlar
     #   python parallel_collector.py --force vigowood_na:US   → Supabase ayni-gun kontrolunu atla
-    force_mode = "--force" in sys.argv
-    if force_mode:
-        sys.argv.remove("--force")
-    targets = sys.argv[1:] if len(sys.argv) > 1 else None
-    asyncio.run(run_all(targets, force=force_mode))
+    #   python parallel_collector.py --retry-reports qmmp_na:US:sd_targeting_14d vigowood_eu:FR:sd_targeting_14d
+    #                                                         → sadece belirtilen raporlari cek (entity collection YOK)
+
+    args = sys.argv[1:]
+
+    if "--retry-reports" in args:
+        args.remove("--retry-reports")
+        # Kalan argumanlar rapor hedefleri: hesap_key:marketplace:rapor_key
+        asyncio.run(retry_specific_reports(args))
+    else:
+        force_mode = "--force" in args
+        if force_mode:
+            args.remove("--force")
+        targets = args if args else None
+        asyncio.run(run_all(targets, force=force_mode))

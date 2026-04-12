@@ -298,28 +298,51 @@ def run(targets=None, force=False):
 
     elif report["genel_durum"] == "EKSIK":
         eksik_sayisi = len(report["eksik_raporlar"])
-        logger.info("Eksik rapor tespit edildi: %d rapor. Retry baslatiliyor...", eksik_sayisi)
+        logger.info("Eksik rapor tespit edildi: %d rapor. Rapor-seviyesi retry baslatiliyor...", eksik_sayisi)
 
-        # Eksik raporlar icin parallel_collector'i tekrar cagir (sadece eksik marketplace'ler)
-        eksik_targets = sorted(set(
-            f"{e['hesap_key']}:{e['marketplace']}" for e in report["eksik_raporlar"]
-        ))
-        logger.info("Eksik marketplace'ler: %s", ", ".join(eksik_targets))
+        # Eksik raporlardan rapor key'lerini olustur
+        def _eksik_to_rapor_key(rapor_name):
+            """eksik_raporlar formatindan REPORT_TASK_MAP key'ine donusturur."""
+            RAPOR_DAYS = {
+                "sp_targeting": 14,
+                "sp_search_term": 30,
+                "sb_targeting": 14,
+                "sb_search_term": 30,
+                "sd_targeting": 14,
+                "sp_campaign": 14,
+                "sb_campaign": 14,
+                "sd_campaign": 14,
+            }
+            days = RAPOR_DAYS.get(rapor_name, 14)
+            return f"{rapor_name}_{days}d"
 
-        retry_cmd = [sys.executable, str(BASE_DIR / "parallel_collector.py")] + eksik_targets
+        retry_targets = []
+        for eksik in report["eksik_raporlar"]:
+            hk = eksik["hesap_key"]
+            mp = eksik["marketplace"]
+            rapor_key = _eksik_to_rapor_key(eksik["rapor"])
+            retry_targets.append(f"{hk}:{mp}:{rapor_key}")
+
+        logger.info("Retry hedefleri: %s", ", ".join(retry_targets))
+
+        retry_cmd = [sys.executable, str(BASE_DIR / "parallel_collector.py"),
+                     "--retry-reports"] + retry_targets
         try:
             result = subprocess.run(
                 retry_cmd,
-                capture_output=True, text=True, timeout=7200,
+                capture_output=True, text=True, timeout=3600,
                 cwd=str(BASE_DIR),
                 env={**os.environ, "MAESTRO_SESSION_ID": session_id},
             )
             if result.returncode == 0:
-                logger.info("Retry basarili")
+                logger.info("Rapor-seviyesi retry basarili")
             else:
                 logger.error("Retry hatasi (exit %d): %s", result.returncode, result.stderr[-500:])
+            if result.stdout:
+                for line in result.stdout.strip().split("\n")[-10:]:
+                    logger.info("  [RETRY] %s", line.strip())
         except subprocess.TimeoutExpired:
-            logger.error("Retry timeout (2 saat)")
+            logger.error("Retry timeout (1 saat)")
         except Exception as e:
             logger.error("Retry basarisiz: %s", e)
 
