@@ -564,7 +564,7 @@ async def collect_marketplace(client, data_dir, label, force=False):
 
     async def collect_list(name, endpoint, state_filter, extract_key,
                            method="POST", content_type="application/json",
-                           accept="application/json", max_count=1000,
+                           accept="application/json", max_count=10000,
                            custom_body=None):
         fname = f"{today}_{name}.json"
         if file_exists_today(fname, data_dir):
@@ -685,22 +685,24 @@ async def collect_marketplace(client, data_dir, label, force=False):
                                content_type=SP_CT["negativeTargets"], accept=SP_CT["negativeTargets"]),
         # SB Entities (5)
         collect_list_throttled("sb_campaigns", "/sb/v4/campaigns/list", ["ENABLED", "PAUSED"], "campaigns",
-                               content_type=SB_CT["campaigns"], accept=SB_CT["campaigns"], max_count=100),
+                               content_type=SB_CT["campaigns"], accept=SB_CT["campaigns"], max_count=1000),
         collect_list_throttled("sb_ad_groups", "/sb/v4/adGroups/list", ["ENABLED", "PAUSED"], "adGroups",
-                               content_type=SB_CT["campaigns"], accept=SB_CT["campaigns"], max_count=100),
+                               content_type=SB_CT["campaigns"], accept=SB_CT["campaigns"], max_count=1000),
         collect_list_throttled("sb_keywords", "/sb/keywords", ["enabled", "paused"], "keywords",
                                method="GET", accept=SB_CT["keywords"]),
         collect_list_throttled("sb_targets", "/sb/targets/list", ["enabled", "paused"], "targets",
                                content_type="application/json", accept=SB_CT["targets"],
                                custom_body={"filters": [{"filterType": "TARGETING_STATE",
-                                                         "values": ["enabled", "paused"]}], "maxResults": 100}),
+                                                         "values": ["enabled", "paused"]}], "maxResults": 1000},
+                               max_count=1000),
         collect_list_throttled("sb_negative_keywords", "/sb/negativeKeywords", ["enabled"], "negativeKeywords",
                                method="GET", accept="application/vnd.sbnegativekeyword.v3.2+json"),
         # SB Themes (theme-based targeting: keywords-related-to-brand/landing-pages)
         collect_list_throttled("sb_themes", "/sb/themes/list", ["enabled", "paused"], "themes",
                                content_type="application/json",
                                accept="application/vnd.sbthemeslistresponse.v3+json",
-                               custom_body={"stateFilter": {"include": ["enabled", "paused"]}, "maxResults": 100}),
+                               custom_body={"stateFilter": {"include": ["enabled", "paused"]}, "maxResults": 1000},
+                               max_count=1000),
         # SD Entities (3)
         collect_list_throttled("sd_campaigns", "/sd/campaigns", ["enabled", "paused"], "campaigns", method="GET"),
         collect_list_throttled("sd_ad_groups", "/sd/adGroups", ["enabled", "paused"], "adGroups", method="GET"),
