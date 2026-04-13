@@ -27,7 +27,7 @@ def _ensure_dirs():
 
 
 def load_state():
-    """State'i Supabase'den yukler. Basarisizsa JSON dosyasina fallback."""
+    """State'i Supabase'den yukler. Basarisizsa bos state doner."""
     _ensure_dirs()
     acc = config.CURRENT_ACCOUNT
     if acc:
@@ -46,25 +46,12 @@ def load_state():
                 logger.debug("State Supabase'den yuklendi (%s)", acc["label"])
                 return data
         except Exception as e:
-            logger.debug("State Supabase'den okunamadi, dosyaya fallback: %s", e)
-
-    if not os.path.exists(config.STATE_FILE):
-        return _empty_state()
-    try:
-        with open(config.STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError) as e:
-        logger.error("State dosyasi okunamadi: %s — Bos state olusturuluyor.", e)
-        return _empty_state()
+            logger.warning("State Supabase'den okunamadi: %s — bos state olusturuluyor", e)
+    return _empty_state()
 
 
 def save_state(state):
-    """State'i hem Supabase'e hem JSON dosyasina kaydeder."""
-    _ensure_dirs()
-    # JSON dosyaya yaz (fallback)
-    with open(config.STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
-    # Supabase'e yaz
+    """State'i Supabase'e kaydeder. JSON fallback KALDIRILDI."""
     acc = config.CURRENT_ACCOUNT
     if acc:
         try:
@@ -82,7 +69,7 @@ def save_state(state):
             cur.close()
             conn.close()
         except Exception as e:
-            logger.debug("State Supabase'e yazilamadi: %s", e)
+            logger.error("State Supabase'e yazilamadi: %s", e)
 
 
 def _empty_state():
