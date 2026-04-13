@@ -57,10 +57,7 @@ from datetime import datetime
 from pathlib import Path
 from copy import deepcopy
 
-try:
-    from openpyxl import load_workbook
-except ImportError:
-    raise ImportError("openpyxl gerekli: pip install openpyxl --break-system-packages")
+# openpyxl import kaldirildi — Excel fallback artik kullanilmiyor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("agent3_executor")
@@ -231,42 +228,6 @@ def _load_portfolio_asin_campaigns_from_supabase():
         return {}
 
 
-# ============================================================================
-# EXCEL OKUMA
-# ============================================================================
-
-def _read_excel_sheet(filepath, sheet_name=None):
-    """
-    Excel dosyasindan satirlari okur. Header satiri 1, veri satiri 2'den baslar.
-    Her satir bir dict olarak donulur: {kolon_adi: deger}
-    """
-    wb = load_workbook(filepath, read_only=True, data_only=True)
-    ws = wb[sheet_name] if sheet_name else wb.active
-    rows = list(ws.iter_rows(values_only=True))
-    wb.close()
-    if len(rows) < 2:
-        return []
-    headers = [str(h).strip() if h else f"col_{i}" for i, h in enumerate(rows[0])]
-    data = []
-    for row in rows[1:]:
-        record = {}
-        for i, val in enumerate(row):
-            if i < len(headers):
-                record[headers[i]] = val
-        data.append(record)
-    return data
-
-
-def find_todays_excel(prefix, today=None):
-    """Bugunun tarihiyle baslayan Excel dosyasini bulur."""
-    if today is None:
-        today = datetime.utcnow().strftime("%Y-%m-%d")
-    pattern = f"{today}_{prefix}"
-    for f in ANALYSIS_DIR.iterdir():
-        if f.name.startswith(pattern) and f.suffix == ".xlsx":
-            return f
-    return None
-
 
 # ============================================================================
 # ONAY PARSE
@@ -329,60 +290,13 @@ def _parse_pct(value):
 # ============================================================================
 
 def parse_bid_recommendations(today=None):
-    """
-    Bid recommendations — onaylari Supabase'den okur, fallback olarak Excel kullanir.
-    """
-    # Oncelik 1: Supabase'den onaylari oku
+    """Bid recommendations — onaylari Supabase'den okur."""
     actions = _parse_bid_recommendations_from_supabase(today)
     if actions is not None:
         return actions
-
-    # Fallback: Excel'den oku
-    logger.info("Supabase'den bid onaylari alinamadi, Excel'e fallback yapiliyor...")
-    filepath = find_todays_excel("bid_recommendations", today)
-    if not filepath:
-        logger.warning("Bid recommendations Excel bulunamadi.")
-        return []
-
-    rows = _read_excel_sheet(filepath)
-    actions = []
-
-    for row in rows:
-        onay_raw = row.get("Onay", row.get("onay", None))
-        onay_type, custom_bid = parse_onay(onay_raw)
-
-        if onay_type == "SKIP":
-            continue
-
-        kampanya = row.get("Kampanya", row.get("kampanya", ""))
-        reklam_tipi = row.get("Reklam Tipi", row.get("reklam_tipi", ""))
-        hedefleme = row.get("Hedefleme", row.get("hedefleme", ""))
-        match_type = row.get("Match Type", row.get("match_type", ""))
-        mevcut_bid = _parse_currency(row.get("Bid", row.get("bid", 0)))
-        tavsiye_bid = _parse_currency(row.get("Tavsiye Bid", row.get("tavsiye_bid", 0)))
-        segment = row.get("Segment", row.get("segment", ""))
-
-        if onay_type == "CUSTOM":
-            yeni_bid = custom_bid
-        else:
-            yeni_bid = tavsiye_bid
-
-        actions.append({
-            "tip": "BID_DEGISIKLIGI",
-            "kampanya_adi": kampanya,
-            "reklam_tipi": reklam_tipi,
-            "portfolio": row.get("Portfolio", row.get("portfolio", "")),
-            "hedefleme": hedefleme,
-            "match_type": match_type,
-            "eski_bid": mevcut_bid,
-            "yeni_bid": yeni_bid,
-            "segment": segment,
-            "onay_tipi": onay_type,
-            "kaynak": "bid_recommendations",
-        })
-
-    logger.info("Bid recommendations (Excel): %d onaylanmis islem", len(actions))
-    return actions
+    # Supabase'den alinamadi — bos liste don (Excel fallback KALDIRILDI)
+    logger.warning("Supabase'den bid onaylari alinamadi — bos liste donuluyor")
+    return []
 
 
 def _parse_bid_recommendations_from_supabase(today=None):
@@ -450,55 +364,13 @@ def _parse_bid_recommendations_from_supabase(today=None):
 # ============================================================================
 
 def parse_negative_candidates(today=None):
-    """
-    Negatif keyword adaylari — onaylari Supabase'den okur, fallback olarak Excel kullanir.
-    """
+    """Negatif keyword adaylari — onaylari Supabase'den okur."""
     actions = _parse_negative_candidates_from_supabase(today)
     if actions is not None:
         return actions
-
-    logger.info("Supabase'den negatif onaylari alinamadi, Excel'e fallback yapiliyor...")
-    filepath = find_todays_excel("negative_candidates", today)
-    if not filepath:
-        logger.warning("Negative candidates Excel bulunamadi.")
-        return []
-
-    rows = _read_excel_sheet(filepath)
-    actions = []
-
-    for row in rows:
-        onay_raw = row.get("Onay", row.get("onay", None))
-        onay_type, _ = parse_onay(onay_raw)
-
-        if onay_type == "SKIP":
-            continue
-
-        hedefleme = row.get("Search Term", row.get("Hedefleme", row.get("hedefleme", "")))
-        kampanya = row.get("Kampanya", row.get("kampanya", ""))
-        reklam_tipi = row.get("Reklam Tipi", row.get("reklam_tipi", ""))
-        match_type = row.get("Match Type", row.get("match_type", ""))
-
-        if not hedefleme or str(hedefleme).strip() == "":
-            continue
-
-        is_asin = _is_asin_target(hedefleme)
-
-        actions.append({
-            "tip": "NEGATIF_ASIN" if is_asin else "NEGATIF_KEYWORD",
-            "kampanya_adi": kampanya,
-            "reklam_tipi": reklam_tipi,
-            "portfolio": row.get("Portfolio", row.get("portfolio", "")),
-            "hedefleme": hedefleme,
-            "match_type": match_type,
-            "negatif_match_type": "NEGATIVE_EXACT",
-            "harcama": _parse_currency(row.get("Spend", row.get("spend", 0))),
-            "satis": _parse_currency(row.get("Sales", row.get("sales", 0))),
-            "sebep": row.get("Sebep", row.get("sebep", "")),
-            "kaynak": "negative_candidates",
-        })
-
-    logger.info("Negatif adaylar (Excel): %d onaylanmis islem", len(actions))
-    return actions
+    # Supabase'den alinamadi — bos liste don (Excel fallback KALDIRILDI)
+    logger.warning("Supabase'den negatif onaylari alinamadi — bos liste donuluyor")
+    return []
 
 
 def _parse_negative_candidates_from_supabase(today=None):
@@ -588,66 +460,13 @@ def _format_asin(asin_text):
 # ============================================================================
 
 def parse_harvesting_candidates(today=None):
-    """
-    Harvesting adaylari — onaylari Supabase'den okur, fallback olarak Excel kullanir.
-    """
+    """Harvesting adaylari — onaylari Supabase'den okur."""
     actions = _parse_harvesting_candidates_from_supabase(today)
     if actions is not None:
         return actions
-
-    logger.info("Supabase'den harvesting onaylari alinamadi, Excel'e fallback yapiliyor...")
-    filepath = find_todays_excel("harvesting_candidates", today)
-    if not filepath:
-        logger.warning("Harvesting candidates Excel bulunamadi.")
-        return []
-
-    rows = _read_excel_sheet(filepath)
-    actions = []
-
-    for row in rows:
-        onay_raw = row.get("Onay", row.get("onay", None))
-        onay_type, _ = parse_onay(onay_raw)
-
-        if onay_type == "SKIP":
-            continue
-
-        hedefleme = row.get("Hedefleme", row.get("hedefleme", ""))
-        kaynak_kampanya = row.get("Kaynak Kampanya", row.get("kaynak_kampanya", ""))
-        reklam_tipi = row.get("Reklam Tipi", row.get("reklam_tipi", ""))
-        portfolio = row.get("Portfolio", row.get("portfolio", ""))
-        bid = _parse_currency(row.get("CPC", row.get("cpc", 0)))
-        if bid <= 0:
-            spend = _parse_currency(row.get("Spend", row.get("spend", 0)))
-            clicks = _parse_currency(row.get("Click", row.get("click", 0)))
-            if clicks > 0:
-                bid = round(spend / clicks, 2)
-
-        is_asin = _is_asin_target(hedefleme)
-
-        if is_asin:
-            actions.append({
-                "tip": "HARVEST_ASIN",
-                "kaynak_kampanya": kaynak_kampanya,
-                "reklam_tipi": reklam_tipi,
-                "portfolio": portfolio,
-                "hedefleme": hedefleme,
-                "bid": bid,
-                "kaynak": "harvesting_candidates",
-            })
-        else:
-            actions.append({
-                "tip": "HARVEST_KEYWORD",
-                "kaynak_kampanya": kaynak_kampanya,
-                "reklam_tipi": reklam_tipi,
-                "portfolio": portfolio,
-                "hedefleme": hedefleme,
-                "match_type": row.get("Match Type", ""),
-                "bid": bid,
-                "kaynak": "harvesting_candidates",
-            })
-
-    logger.info("Harvesting (Excel): %d onaylanmis islem", len(actions))
-    return actions
+    # Supabase'den alinamadi — bos liste don (Excel fallback KALDIRILDI)
+    logger.warning("Supabase'den harvesting onaylari alinamadi — bos liste donuluyor")
+    return []
 
 
 def _parse_harvesting_candidates_from_supabase(today=None):
@@ -2941,13 +2760,17 @@ def run_verification_cycle(rollback_log_path, actual_data, config, campaign_look
 
 def preflight_check(today):
     """
-    Agent 2'nin bugun icin Excel raporlarini olusturup olusturamadigini kontrol eder.
-    En az 1 rapor olmadan Agent 3 calismaz.
-    
+    Agent 2'nin bugun icin Supabase'e veri yazip yazmadigini kontrol eder.
+    En az bid_recommendations olmadan Agent 3 calismaz.
+
     Returns:
-        (bool, list, list): (gecti_mi, bulunan_dosyalar, eksik_dosyalar)
+        (bool, list, list): (gecti_mi, bulunan_veriler, eksik_veriler)
     """
-    ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
+    hk = HESAP_KEY or ""
+    mp = MARKETPLACE or ""
+    if not hk or not mp:
+        logger.error("ON KONTROL BASARISIZ: HESAP_KEY/MARKETPLACE belirlenmedi.")
+        return False, [], []
 
     raporlar = {
         "bid_recommendations": {"zorunlu": True, "aciklama": "Bid tavsiyeleri"},
@@ -2958,50 +2781,49 @@ def preflight_check(today):
     bulunan = []
     eksik = []
 
-    for prefix, info in raporlar.items():
-        dosya = find_todays_excel(prefix, today)
-        if dosya:
-            bulunan.append({"rapor": prefix, "dosya": str(dosya), "aciklama": info["aciklama"]})
-            logger.info("  [OK] %s: %s", prefix, dosya.name)
-        else:
-            eksik.append({"rapor": prefix, "zorunlu": info["zorunlu"], "aciklama": info["aciklama"]})
-            seviye = "KRITIK" if info["zorunlu"] else "OPSIYONEL"
-            logger.warning("  [EKSIK] %s: BULUNAMADI [%s]", prefix, seviye)
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
 
-    # Agent 1 veri dosyalari da kontrol et (kampanya lookup icin gerekli)
-    agent1_kritik = ["sp_campaigns"]
-    agent1_eksik = []
-    for prefix in agent1_kritik:
-        fpath = DATA_DIR / f"{today}_{prefix}.json"
-        if not fpath.exists():
-            # Dunku dosyayi kontrol et (gece yarisi gecis durumu)
-            from datetime import timedelta
-            dun = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-            fpath_dun = DATA_DIR / f"{dun}_{prefix}.json"
-            if fpath_dun.exists():
-                logger.info("  [OK] Agent 1 verisi dunku tarihle bulundu: %s_%s.json", dun, prefix)
+        for tablo, info in raporlar.items():
+            row = db._fetch_one(
+                f"SELECT COUNT(*) FROM {tablo} WHERE hesap_key = %s AND marketplace = %s AND analysis_date = %s",
+                (hk, mp, today))
+            count = row[0] if row else 0
+            if count > 0:
+                bulunan.append({"rapor": tablo, "kayit_sayisi": count, "aciklama": info["aciklama"]})
+                logger.info("  [OK] %s: %d kayit (Supabase)", tablo, count)
             else:
-                agent1_eksik.append(prefix)
-                logger.warning("  [EKSIK] Agent 1 verisi eksik: %s_%s.json", today, prefix)
+                eksik.append({"rapor": tablo, "zorunlu": info["zorunlu"], "aciklama": info["aciklama"]})
+                seviye = "KRITIK" if info["zorunlu"] else "OPSIYONEL"
+                logger.warning("  [EKSIK] %s: Supabase'de kayit yok [%s]", tablo, seviye)
+
+        # Agent 1 verisi: kampanya sayisi kontrol
+        camp_row = db._fetch_one(
+            "SELECT COUNT(*) FROM campaigns WHERE hesap_key = %s AND marketplace = %s",
+            (hk, mp))
+        camp_count = camp_row[0] if camp_row else 0
+        if camp_count == 0:
+            logger.error("ON KONTROL BASARISIZ: Supabase'de kampanya verisi yok (%s/%s).", hk, mp)
+            return False, bulunan, eksik
+
+    except Exception as e:
+        logger.error("ON KONTROL BASARISIZ: Supabase erisim hatasi: %s", e)
+        return False, [], []
 
     # Karar: en az bid_recommendations olmali
     zorunlu_eksik = [e for e in eksik if e["zorunlu"]]
 
     if zorunlu_eksik:
-        logger.error("ON KONTROL BASARISIZ: Zorunlu raporlar eksik.")
-        logger.error("Once Agent 2'yi calistirin: python agent2_analyst.py")
-        return False, bulunan, eksik
-
-    if agent1_eksik:
-        logger.error("ON KONTROL BASARISIZ: Agent 1 verileri eksik (%s).", ", ".join(agent1_eksik))
-        logger.error("Once Agent 1'i calistirin.")
+        logger.error("ON KONTROL BASARISIZ: Zorunlu veriler eksik (Supabase).")
+        logger.error("Once Agent 2'yi calistirin.")
         return False, bulunan, eksik
 
     if not bulunan:
-        logger.error("ON KONTROL BASARISIZ: Hicbir Excel raporu bulunamadi.")
+        logger.error("ON KONTROL BASARISIZ: Hicbir Agent 2 verisi bulunamadi (Supabase).")
         return False, bulunan, eksik
 
-    logger.info("On kontrol gecti: %d rapor bulundu, %d opsiyonel eksik.",
+    logger.info("On kontrol gecti: %d veri bulundu, %d opsiyonel eksik.",
                 len(bulunan), len([e for e in eksik if not e["zorunlu"]]))
     return True, bulunan, eksik
 

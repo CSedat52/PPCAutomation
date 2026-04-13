@@ -1223,319 +1223,6 @@ def sort_bid_results(bid_results):
 
 
 # ============================================================================
-# EXCEL RAPOR OLUSTURUCU — TAMAMEN YENIDEN YAZILDI
-# ============================================================================
-
-def create_excel_reports(bid_results, negative_candidates, harvesting_candidates,
-                          today, settings, currency="$"):
-    """3 Excel dosyasi olusturur. Formatlama kurallari:
-    - ACoS: % sembol ile (orn: 24.25%)
-    - Tutarlar: Para birimi ile (orn: $1,234.56)
-    - Ondalik: 2 basamak
-    - ASIN ve Orders sutunlari YOK
-    - Sutun sirasi: Kampanya, Reklam Tipi, Portfolio, Hedefleme, Match Type,
-      Impression, CVR, Click, Spend, Sales, ACoS, CPC, Bid, Tavsiye Bid, Degisim, Sebep, Segment
-    """
-    try:
-        import openpyxl
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, numbers
-    except ImportError:
-        logger.error("openpyxl kurulu degil! pip install openpyxl")
-        return {}
-
-    ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
-    files = {}
-
-    header_fill = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type="solid")
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    segment_colors = {
-        "GORUNMEZ": PatternFill(start_color="E0E0E0", fill_type="solid"),
-        "YETERSIZ_VERI": PatternFill(start_color="F5F5F5", fill_type="solid"),
-        "KAN_KAYBEDEN": PatternFill(start_color="FFCDD2", fill_type="solid"),
-        "SUPER_STAR": PatternFill(start_color="C8E6C9", fill_type="solid"),
-        "TUZAK": PatternFill(start_color="FFF9C4", fill_type="solid"),
-        "KAZANAN": PatternFill(start_color="A5D6A7", fill_type="solid"),
-        "OPTIMIZE_ET": PatternFill(start_color="FFE0B2", fill_type="solid"),
-        "ZARAR": PatternFill(start_color="EF9A9A", fill_type="solid"),
-        "IMPRESSION_BEKLE": PatternFill(start_color="B3E5FC", fill_type="solid"),
-    }
-    thin_border = Border(
-        left=Side(style="thin"), right=Side(style="thin"),
-        top=Side(style="thin"), bottom=Side(style="thin"),
-    )
-
-    def style_header(ws, cols):
-        for col_idx, col_name in enumerate(cols, 1):
-            cell = ws.cell(row=1, column=col_idx, value=col_name)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(horizontal="center")
-            cell.border = thin_border
-
-    def write_cell(ws, row, col, value, fmt=None, is_segment=False, segment_name=""):
-        cell = ws.cell(row=row, column=col, value=value)
-        cell.border = thin_border
-        cell.alignment = Alignment(horizontal="center")
-        if fmt:
-            cell.number_format = fmt
-        if is_segment:
-            cell.fill = segment_colors.get(segment_name, PatternFill())
-        return cell
-
-    def fmt_currency(val):
-        """Para birimi formati: $1,234.56"""
-        return f"{currency}{val:,.2f}"
-
-    def fmt_pct(val):
-        """Yuzde formati: 24.25%"""
-        return f"{val:.2f}%"
-
-    # ---- LISTE 1: BID TAVSIYELERI ----
-    # Siralama uygula
-    sorted_results = sort_bid_results(bid_results)
-
-    wb1 = openpyxl.Workbook()
-    ws1 = wb1.active
-    ws1.title = "Bid Tavsiyeleri"
-
-    # Yeni sutun sirasi (ASIN ve Orders YOK)
-    cols1 = [
-        "Kampanya", "Reklam Tipi", "Portfolio", "Hedefleme", "Match Type",
-        "Impression", "CVR %", "Click", "Spend", "Sales",
-        "ACoS %", "CPC", "Bid", "Tavsiye Bid", "Degisim %",
-        "Sebep", "Segment", "Onay",
-    ]
-    style_header(ws1, cols1)
-
-    # Satir renklendirme — ACoS durumuna gore
-    row_fill_green = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")   # hedef alti — iyi
-    row_fill_yellow = PatternFill(start_color="FFF8E1", end_color="FFF8E1", fill_type="solid")   # hedef ustu, orta
-    row_fill_red = PatternFill(start_color="FFEBEE", end_color="FFEBEE", fill_type="solid")      # zarar / satissiz
-
-    def get_row_fill(r):
-        """Satirin ACoS durumuna gore arka plan rengini belirler."""
-        hedef = r.get("hedef_acos", 25)
-        if r["sales"] == 0 and r["spend"] > 0:
-            return row_fill_red  # Harcayan ama satissiz → kirmizi
-        if r["sales"] == 0 and r["spend"] == 0:
-            return None  # Harcamayan → renk yok
-        if r["acos"] <= hedef:
-            return row_fill_green  # Hedef ACoS altinda → yesil
-        if r["acos"] <= hedef * 1.5:
-            return row_fill_yellow  # Hedef ustu ama 1.5x altinda → sari
-        return row_fill_red  # Hedef x1.5 ustu → kirmizi
-
-    for idx, r in enumerate(sorted_results, 2):
-        row_color = get_row_fill(r)
-        c = 1
-        cell = write_cell(ws1, idx, c, r["kampanya_adi"]); c += 1
-        cell = write_cell(ws1, idx, c, r["reklam_tipi"]); c += 1
-        cell = write_cell(ws1, idx, c, r.get("portfolio_id", "")); c += 1
-        cell = write_cell(ws1, idx, c, r["hedefleme"]); c += 1
-        cell = write_cell(ws1, idx, c, r["match_type"]); c += 1
-        cell = write_cell(ws1, idx, c, r["impressions"], "#,##0"); c += 1
-        cell = write_cell(ws1, idx, c, fmt_pct(r["cvr"])); c += 1
-        cell = write_cell(ws1, idx, c, r["clicks"], "#,##0"); c += 1
-        cell = write_cell(ws1, idx, c, fmt_currency(r["spend"])); c += 1
-        cell = write_cell(ws1, idx, c, fmt_currency(r["sales"])); c += 1
-        cell = write_cell(ws1, idx, c, fmt_pct(r["acos"])); c += 1
-        cell = write_cell(ws1, idx, c, fmt_currency(r["cpc"])); c += 1
-        cell = write_cell(ws1, idx, c, fmt_currency(r["mevcut_bid"])); c += 1
-        cell = write_cell(ws1, idx, c, fmt_currency(r["yeni_bid"])); c += 1
-        cell = write_cell(ws1, idx, c, f"{r['degisim_yuzde']:+.1f}%"); c += 1
-        cell = write_cell(ws1, idx, c, r["sebep"]); c += 1
-        cell = write_cell(ws1, idx, c, r["segment"], is_segment=True, segment_name=r["segment"]); c += 1
-        cell = write_cell(ws1, idx, c, "")  # Onay kolonu — bos (kullanici Y yazacak)
-
-        # Satir rengi uygula (segment ve onay hucresine segment/bos rengi kalir)
-        if row_color:
-            for col_idx in range(1, 17):  # A-P sutunlari (segment ve onay haric)
-                ws1.cell(row=idx, column=col_idx).fill = row_color
-
-    # Kolon genislikleri
-    col_widths = {
-        "A": 35, "B": 12, "C": 20, "D": 30, "E": 12,
-        "F": 12, "G": 10, "H": 10, "I": 14, "J": 14,
-        "K": 10, "L": 10, "M": 10, "N": 14, "O": 10,
-        "P": 50, "Q": 18, "R": 8,
-    }
-    for col_letter, width in col_widths.items():
-        ws1.column_dimensions[col_letter].width = width
-
-    path1 = str(ANALYSIS_DIR / f"{today}_bid_recommendations.xlsx")
-    wb1.save(path1)
-    files["bid_recommendations"] = path1
-    logger.info("Bid tavsiyeleri kaydedildi: %s (%d satir)", path1, len(sorted_results))
-
-    # ---- LISTE 2: NEGATIF ADAYLAR ----
-    wb2 = openpyxl.Workbook()
-    ws2 = wb2.active
-    ws2.title = "Negatif Adaylar"
-    cols2 = [
-        "Kampanya", "Reklam Tipi", "Portfolio", "Search Term", "Match Type",
-        "Kaynak", "Impression", "Click", "Spend", "Sales", "CVR %", "CPC",
-        "Sebep", "Onay",
-    ]
-    style_header(ws2, cols2)
-
-    # Negatif adaylar icin kirmizinin 2 tonu
-    # Koyu kirmizi: Satis=0 VE harcama var (tamamen israf)
-    # Acik kirmizi: Satis var ama ACoS cok yuksek / CVR cok dusuk
-    neg_fill_dark = PatternFill(start_color="FFCDD2", end_color="FFCDD2", fill_type="solid")   # koyu kirmizi
-    neg_fill_light = PatternFill(start_color="FFEBEE", end_color="FFEBEE", fill_type="solid")   # acik kirmizi
-
-    def get_neg_fill(r):
-        """Negatif adayin siddetine gore renk."""
-        sales = float(r.get("sales", 0))
-        spend = float(r.get("spend", 0))
-        if sales == 0 and spend > 0:
-            return neg_fill_dark   # Tamamen israf — koyu kirmizi
-        return neg_fill_light      # Kotu performans ama satis var — acik kirmizi
-
-    for idx, r in enumerate(negative_candidates, 2):
-        neg_color = get_neg_fill(r)
-        c = 1
-        write_cell(ws2, idx, c, r["kampanya_adi"]); c += 1
-        write_cell(ws2, idx, c, r["reklam_tipi"]); c += 1
-        write_cell(ws2, idx, c, r.get("portfolio_id", "")); c += 1
-        write_cell(ws2, idx, c, r["hedefleme"]); c += 1
-        write_cell(ws2, idx, c, r["match_type"]); c += 1
-        write_cell(ws2, idx, c, r.get("kaynak", "")); c += 1
-        write_cell(ws2, idx, c, r["impressions"], "#,##0"); c += 1
-        write_cell(ws2, idx, c, r["clicks"], "#,##0"); c += 1
-        write_cell(ws2, idx, c, fmt_currency(r["spend"])); c += 1
-        write_cell(ws2, idx, c, fmt_currency(r["sales"])); c += 1
-        write_cell(ws2, idx, c, fmt_pct(r["cvr"])); c += 1
-        write_cell(ws2, idx, c, fmt_currency(r["cpc"])); c += 1
-        write_cell(ws2, idx, c, r.get("sebep", "")); c += 1
-        write_cell(ws2, idx, c, "")  # Onay kolonu
-
-        # Renk uygula (Onay kolonu haric)
-        if neg_color:
-            for col_idx in range(1, 14):  # A-M sutunlari
-                ws2.cell(row=idx, column=col_idx).fill = neg_color
-
-    ws2.column_dimensions["A"].width = 35
-    ws2.column_dimensions["C"].width = 20
-    ws2.column_dimensions["D"].width = 30
-    ws2.column_dimensions["F"].width = 20
-    ws2.column_dimensions["M"].width = 50
-    ws2.column_dimensions["N"].width = 8
-
-    path2 = str(ANALYSIS_DIR / f"{today}_negative_candidates.xlsx")
-    wb2.save(path2)
-    files["negative_candidates"] = path2
-
-    # ---- LISTE 3: HARVESTING ADAYLAR ----
-    wb3 = openpyxl.Workbook()
-    ws3 = wb3.active
-    ws3.title = "Harvesting Adaylar"
-    cols3 = [
-        "Kaynak Kampanya", "Reklam Tipi", "Portfolio", "Hedefleme", "Match Type",
-        "Kaynak", "Impression", "Click", "Spend", "Sales", "ACoS %", "CVR %",
-        "Oneri", "Onay",
-    ]
-    style_header(ws3, cols3)
-
-    # Harvesting adaylari icin yesilin 2 tonu
-    # Koyu yesil: ACoS cok dusuk (hedef ACoS'un yarisi veya altinda) — mukemmel performans
-    # Acik yesil: ACoS iyi ama hedef ACoS'a yakin — iyi performans
-    harvest_fill_dark = PatternFill(start_color="C8E6C9", end_color="C8E6C9", fill_type="solid")    # koyu yesil
-    harvest_fill_light = PatternFill(start_color="E8F5E9", end_color="E8F5E9", fill_type="solid")   # acik yesil
-
-    harvest_max_acos = settings.get("yeni_keyword_kurali", {}).get("max_acos", 15)
-
-    def get_harvest_fill(r):
-        """Harvesting adayinin performansina gore renk."""
-        acos = r.get("acos", 0)
-        if acos <= harvest_max_acos / 2:
-            return harvest_fill_dark   # ACoS hedefin yarisi veya alti — koyu yesil
-        return harvest_fill_light      # ACoS iyi ama yuksek tarafta — acik yesil
-
-    for idx, r in enumerate(harvesting_candidates, 2):
-        h_color = get_harvest_fill(r)
-        c = 1
-        write_cell(ws3, idx, c, r["kaynak_kampanya"]); c += 1
-        write_cell(ws3, idx, c, r["reklam_tipi"]); c += 1
-        write_cell(ws3, idx, c, r.get("portfolio_id", "")); c += 1
-        write_cell(ws3, idx, c, r["hedefleme"]); c += 1
-        write_cell(ws3, idx, c, r["match_type"]); c += 1
-        write_cell(ws3, idx, c, r.get("kaynak", "")); c += 1
-        write_cell(ws3, idx, c, r["impressions"], "#,##0"); c += 1
-        write_cell(ws3, idx, c, r["clicks"], "#,##0"); c += 1
-        write_cell(ws3, idx, c, fmt_currency(r["spend"])); c += 1
-        write_cell(ws3, idx, c, fmt_currency(r["sales"])); c += 1
-        write_cell(ws3, idx, c, fmt_pct(r["acos"])); c += 1
-        write_cell(ws3, idx, c, fmt_pct(r["cvr"])); c += 1
-        write_cell(ws3, idx, c, r.get("oneri", "")); c += 1
-        write_cell(ws3, idx, c, "")  # Onay kolonu
-
-        # Renk uygula (Onay kolonu haric)
-        if h_color:
-            for col_idx in range(1, 14):  # A-M sutunlari
-                ws3.cell(row=idx, column=col_idx).fill = h_color
-
-    ws3.column_dimensions["A"].width = 35
-    ws3.column_dimensions["C"].width = 20
-    ws3.column_dimensions["D"].width = 30
-    ws3.column_dimensions["F"].width = 20
-    ws3.column_dimensions["M"].width = 50
-    ws3.column_dimensions["N"].width = 8
-
-    path3 = str(ANALYSIS_DIR / f"{today}_harvesting_candidates.xlsx")
-    wb3.save(path3)
-    files["harvesting_candidates"] = path3
-
-    return files
-
-
-# ============================================================================
-# JSON → EXCEL DONUSTURUCU (Ham Veri)
-# ============================================================================
-
-def convert_raw_data_to_excel(data, today):
-    try:
-        import openpyxl
-    except ImportError:
-        return {}
-
-    ANALYSIS_DIR.mkdir(parents=True, exist_ok=True)
-    files = {}
-
-    datasets = [
-        ("sp_campaigns", data["sp"]["campaigns"]),
-        ("sp_keywords", data["sp"]["keywords"]),
-        ("sp_targets", data["sp"]["targets"]),
-        ("sb_campaigns", data["sb"]["campaigns"]),
-        ("sb_keywords", data["sb"]["keywords"]),
-        ("sb_targets", data["sb"]["targets"]),
-        ("sd_campaigns", data["sd"]["campaigns"]),
-        ("sd_targets", data["sd"]["targets"]),
-    ]
-
-    for data_key, items in datasets:
-        if not items:
-            continue
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = data_key
-
-        if isinstance(items[0], dict):
-            headers = list(items[0].keys())
-            for col, h in enumerate(headers, 1):
-                ws.cell(row=1, column=col, value=h)
-            for row_idx, item in enumerate(items, 2):
-                for col, h in enumerate(headers, 1):
-                    ws.cell(row=row_idx, column=col, value=str(item.get(h, "")))
-
-        path = str(ANALYSIS_DIR / f"{today}_{data_key}.xlsx")
-        wb.save(path)
-        files[data_key] = path
-
-    return files
-
-
-# ============================================================================
 # KARAR GECMISI KAYIT
 # ============================================================================
 
@@ -1760,25 +1447,21 @@ def _run_analysis_impl(today, hesap_key="", marketplace=""):
     data = load_all_agent1_data()
     logger.info("Agent 1 verileri yuklendi.")
 
-    # 3. JSON → Excel
-    raw_excel = convert_raw_data_to_excel(data, today)
-    logger.info("JSON → Excel: %d dosya", len(raw_excel))
-
-    # 4. Hedefleme listesi (aktif kampanyalar, dogru kolon isimleri)
+    # 3. Hedefleme listesi (aktif kampanyalar, dogru kolon isimleri)
     targets = build_targeting_list(data, settings)
     logger.info("Hedefleme listesi: %d hedefleme", len(targets))
 
-    # 5. Bid fallback eslestirme (raporda bid=0 kalanlar icin)
+    # 4. Bid fallback eslestirme (raporda bid=0 kalanlar icin)
     targets = enrich_with_bid_data(targets, data)
 
-    # 6. ASIN
+    # 5. ASIN
     targets = enrich_with_asin(targets, data)
 
-    # 7. Onceki kararlar
+    # 6. Onceki kararlar
     prev_decisions = load_previous_decisions()
     logger.info("Onceki kararlar: %d kayit", len(prev_decisions))
 
-    # 8. Segmentasyon + Bid hesaplama
+    # 7. Segmentasyon + Bid hesaplama
     bid_results = []
     segment_counts = {}
 
@@ -1799,23 +1482,18 @@ def _run_analysis_impl(today, hesap_key="", marketplace=""):
 
     logger.info("Segmentasyon: %s", json.dumps(segment_counts, indent=2))
 
-    # 9. Negatif adaylar (search term bazli — 30d)
+    # 8. Negatif adaylar (search term bazli — 30d)
     neg_candidates = find_negative_candidates(data, settings)
     logger.info("Negatif adaylar: %d", len(neg_candidates))
 
-    # 10. Harvesting
+    # 9. Harvesting
     harvest_candidates = find_harvesting_candidates(data, settings)
     logger.info("Harvesting adaylari: %d", len(harvest_candidates))
 
-    # 11. Excel raporlari (siralama dahil)
-    excel_files = create_excel_reports(bid_results, neg_candidates, harvest_candidates,
-                                        today, settings, currency=currency)
-    logger.info("Excel raporlari: %s", list(excel_files.keys()))
-
-    # 12. Karar gecmisi
+    # 10. Karar gecmisi
     decisions_file = save_decisions(bid_results, today)
 
-    # 13. Ozet
+    # 11. Ozet
     summary = {
         "tarih": today,
         "durum": "TAMAMLANDI",
@@ -1833,11 +1511,8 @@ def _run_analysis_impl(today, hesap_key="", marketplace=""):
         },
         "para_birimi": currency,
         "dosyalar": {
-            "bid_tavsiyeleri": excel_files.get("bid_recommendations", ""),
-            "negatif_adaylar": excel_files.get("negative_candidates", ""),
-            "harvesting_adaylar": excel_files.get("harvesting_candidates", ""),
             "karar_gecmisi": decisions_file,
-            "ham_veri_excel": raw_excel,
+            "cikti": "supabase",
         },
     }
 
