@@ -286,7 +286,7 @@ def load_previous_decisions():
                        bid_change_pct, segment, analysis_date, ad_type
                 FROM bid_recommendations
                 WHERE hesap_key = %s AND marketplace = %s
-                ORDER BY analysis_date DESC LIMIT 5000
+                ORDER BY analysis_date DESC LIMIT 50000
             """, (hk, mp))
             rows = cur.fetchall()
             cur.close()

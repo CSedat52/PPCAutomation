@@ -79,7 +79,7 @@ class SupabaseClient:
         conn = self._conn()
         try:
             cur = conn.cursor()
-            execute_values(cur, sql, values, template=template, page_size=500)
+            execute_values(cur, sql, values, template=template, page_size=1000)
             count = cur.rowcount
             cur.close()
             return count
@@ -102,7 +102,7 @@ class SupabaseClient:
         conn = self._conn()
         try:
             cur = conn.cursor()
-            execute_values(cur, sql, values, template=template, page_size=500)
+            execute_values(cur, sql, values, template=template, page_size=1000)
             count = cur.rowcount
             cur.close()
             return count
@@ -1186,7 +1186,7 @@ class SupabaseClient:
             placeholders = ", ".join(["%s"] * len(cols))
             template = f"({placeholders})"
             sql = f"INSERT INTO bid_param_regression_data ({', '.join(cols)}) VALUES %s"
-            execute_values(cur, sql, values, template=template, page_size=500)
+            execute_values(cur, sql, values, template=template, page_size=1000)
             cur.close()
         finally:
             conn.close()
@@ -1534,7 +1534,7 @@ class SupabaseClient:
             """
             execute_values(cur, sql, agg_rows,
                            template="(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())",
-                           page_size=500)
+                           page_size=1000)
             count = cur.rowcount
             cur.close()
             logger.info("KPI: %d satir upsert (%s/%s)", count, hesap_key, mp)

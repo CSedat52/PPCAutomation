@@ -344,7 +344,7 @@ def check_report_exists(hesap_key, marketplace, table, ad_type, date):
 # MAESTRO STATE (pipeline_runs Supabase-first)
 # ============================================================================
 
-def load_pipeline_sessions(hesap_key, marketplace, limit=50):
+def load_pipeline_sessions(hesap_key, marketplace, limit=500):
     """Pipeline session geçmişini Supabase'den yükle."""
     try:
         sdb = _get_sdb()

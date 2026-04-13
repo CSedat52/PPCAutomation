@@ -134,7 +134,7 @@ def _write_json_fallback(kayit, agent_name=None, log_dir=None):
     Supabase basarisiz olunca lokal JSON dosyasina yaz.
     Dosya: {log_dir}/{agent_name}_errors_fallback.json veya
            logs/error_fallback/{agent_name}_errors.json
-    max 500 kayit, FIFO.
+    max 5000 kayit, FIFO.
     """
     try:
         if log_dir:
@@ -157,9 +157,9 @@ def _write_json_fallback(kayit, agent_name=None, log_dir=None):
 
         kayitlar.append(kayit)
 
-        # Max 500 kayit tut
-        if len(kayitlar) > 500:
-            kayitlar = kayitlar[-500:]
+        # Max 5000 kayit tut
+        if len(kayitlar) > 5000:
+            kayitlar = kayitlar[-5000:]
 
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(kayitlar, f, indent=2, ensure_ascii=False)
@@ -177,7 +177,7 @@ def _write_json_fallback(kayit, agent_name=None, log_dir=None):
 def save_error_log(hata_tipi, hata_mesaji, log_dir=None,
                    traceback_str=None, adim=None, extra=None,
                    session_id=None, agent_name=None,
-                   max_kayit=200,
+                   max_kayit=5000,
                    hesap_key=None, marketplace=None):
     """
     Tum agentlar icin birlesik hata log fonksiyonu.
@@ -200,7 +200,7 @@ def save_error_log(hata_tipi, hata_mesaji, log_dir=None,
         "session_id":  session_id,
     }
     if traceback_str:
-        kayit["traceback"] = str(traceback_str)[:1000]
+        kayit["traceback"] = str(traceback_str)[:3000]
     if extra:
         kayit["extra"] = extra
 
@@ -224,7 +224,7 @@ def save_error_log(hata_tipi, hata_mesaji, log_dir=None,
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
                 (agent_name, "error", str(hata_mesaji)[:500], hata_tipi,
                  hesap_key, marketplace, session_id,
-                 str(traceback_str)[:1000] if traceback_str else None,
+                 str(traceback_str)[:3000] if traceback_str else None,
                  _json.dumps(_details, ensure_ascii=False) if _details else None)
             )
             return True
@@ -262,7 +262,7 @@ def save_log(level, message, agent_name, hesap_key=None, marketplace=None,
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())""",
             (agent_name, level, str(message)[:500], error_type,
              hesap_key, marketplace, session_id,
-             str(traceback_str)[:1000] if traceback_str else None)
+             str(traceback_str)[:3000] if traceback_str else None)
         )
     except Exception as e:
         # Sessiz yutma DEGIL — stderr'e yaz

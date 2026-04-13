@@ -197,9 +197,9 @@ def archive_session(state):
     if not session:
         return
     state["history"].append(session)
-    # Son 50 session'i tut
-    if len(state["history"]) > 50:
-        state["history"] = state["history"][-50:]
+    # Son 500 session'i tut
+    if len(state["history"]) > 500:
+        state["history"] = state["history"][-500:]
     state["current_session"] = None
     save_state(state)
 
