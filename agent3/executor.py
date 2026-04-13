@@ -158,7 +158,7 @@ def get_agent3_config(settings):
         "dry_run": True,
         "max_bid_limiti": 5.00,
         "min_bid_limiti": 0.15,
-        "gunluk_max_islem": 200,
+        "gunluk_max_islem": 3000,
         "yeni_kampanya_butcesi": 10.00,
         "para_birimi": "$",
         "negatif_match_type": "NEGATIVE_EXACT",
