@@ -11,9 +11,9 @@ Cron bu dosyayi cagirmali:
 
 Pipeline akisi:
   1. parallel_collector.py (Agent 1) — veri toplama
-  2. parallel_analyzer.py (Agent 2) — analiz
-  3. Eksik rapor kontrolu (Supabase) → varsa retry
-  4. Durum raporu + e-posta
+  2. Eksik rapor kontrolu (Supabase) → varsa retry
+  3. parallel_analyzer.py (Agent 2) — analiz
+  4. Son durum raporu + e-posta
   5. Agent 3+4 icin watch daemon bekler (ayri process)
 """
 
@@ -254,50 +254,12 @@ def run(targets=None, force=False):
     except Exception as e:
         logger.error("Agent 1 calistirilamadi: %s", e)
 
-    # ===== AGENT 2: Analiz =====
-    logger.info("\n--- AGENT 2: Analiz (parallel_analyzer) ---")
+    # ===== EKSIK RAPOR KONTROLU (Agent 2'den ONCE) =====
+    logger.info("\n--- EKSIK RAPOR KONTROLU ---")
+    pre_report = _build_status_report(collect_ok, False, session_id, targets)
 
-    cmd_agent2 = [sys.executable, str(BASE_DIR / "parallel_analyzer.py")]
-    if targets:
-        cmd_agent2.extend(targets)
-
-    analyze_ok = False
-    try:
-        result = subprocess.run(
-            cmd_agent2,
-            capture_output=True, text=True, timeout=1800,
-            cwd=str(BASE_DIR),
-            env={**os.environ, "MAESTRO_SESSION_ID": session_id},
-        )
-        if result.returncode == 0:
-            analyze_ok = True
-            logger.info("Agent 2 basarili (exit code 0)")
-        else:
-            logger.error("Agent 2 hata (exit code %d): %s", result.returncode, result.stderr[-500:])
-        if result.stdout:
-            for line in result.stdout.strip().split("\n")[-10:]:
-                logger.info("  [A2] %s", line.strip())
-    except subprocess.TimeoutExpired:
-        logger.error("Agent 2 timeout (30 dakika)")
-    except Exception as e:
-        logger.error("Agent 2 calistirilamadi: %s", e)
-
-    # ===== DURUM RAPORU =====
-    logger.info("\n--- DURUM RAPORU ---")
-    report = _build_status_report(collect_ok, analyze_ok, session_id, targets)
-    rapor_path = _save_status_report(report)
-
-    if report["genel_durum"] == "TEMIZ":
-        logger.info("Pipeline temiz tamamlandi. Dashboard'dan onay bekleniyor.")
-        _send_email(
-            f"[PPC Pipeline] TEMIZ — {PIPELINE_DATE}",
-            f"Agent 1+2 basariyla tamamlandi.\n"
-            f"Session: {session_id}\n\n"
-            f"Dashboard'dan Agent 3 onayi bekleniyor."
-        )
-
-    elif report["genel_durum"] == "EKSIK":
-        eksik_sayisi = len(report["eksik_raporlar"])
+    if pre_report["eksik_raporlar"]:
+        eksik_sayisi = len(pre_report["eksik_raporlar"])
         logger.info("Eksik rapor tespit edildi: %d rapor. Rapor-seviyesi retry baslatiliyor...", eksik_sayisi)
 
         # Eksik raporlardan rapor key'lerini olustur
@@ -317,7 +279,7 @@ def run(targets=None, force=False):
             return f"{rapor_name}_{days}d"
 
         retry_targets = []
-        for eksik in report["eksik_raporlar"]:
+        for eksik in pre_report["eksik_raporlar"]:
             hk = eksik["hesap_key"]
             mp = eksik["marketplace"]
             rapor_key = _eksik_to_rapor_key(eksik["rapor"])
@@ -346,30 +308,69 @@ def run(targets=None, force=False):
         except Exception as e:
             logger.error("Retry basarisiz: %s", e)
 
-        # Retry sonrasi raporu tekrar olustur
-        report2 = _build_status_report(collect_ok, analyze_ok, session_id, targets)
-        _save_status_report(report2)
-
-        if report2["eksik_raporlar"]:
-            logger.warning("Retry sonrasi hala %d eksik rapor var.", len(report2["eksik_raporlar"]))
-            eksik_detay = "\n".join(
-                f"  {e['hesap_key']}/{e['marketplace']}: {e['rapor']}"
-                for e in report2["eksik_raporlar"]
-            )
-            _send_email(
-                f"[PPC Pipeline] UYARI: {len(report2['eksik_raporlar'])} eksik rapor — {PIPELINE_DATE}",
-                f"Retry sonrasi hala eksik raporlar var:\n\n{eksik_detay}\n\n"
-                f"Session: {session_id}\n"
-                f"Manuel kontrol gerekebilir."
-            )
+        # Retry sonrasi tekrar kontrol
+        post_retry = _build_status_report(collect_ok, False, session_id, targets)
+        if post_retry["eksik_raporlar"]:
+            logger.warning("Retry sonrasi hala %d eksik rapor var. Agent 2'ye devam ediliyor.",
+                           len(post_retry["eksik_raporlar"]))
         else:
             logger.info("Retry sonrasi tum raporlar tamamlandi!")
-            _send_email(
-                f"[PPC Pipeline] TEMIZ (retry sonrasi) — {PIPELINE_DATE}",
-                f"Eksik raporlar retry ile tamamlandi.\n"
-                f"Session: {session_id}\n\n"
-                f"Dashboard'dan Agent 3 onayi bekleniyor."
-            )
+    else:
+        logger.info("Eksik rapor yok — Agent 2'ye devam ediliyor.")
+
+    # ===== AGENT 2: Analiz =====
+    logger.info("\n--- AGENT 2: Analiz (parallel_analyzer) ---")
+
+    cmd_agent2 = [sys.executable, str(BASE_DIR / "parallel_analyzer.py")]
+    if targets:
+        cmd_agent2.extend(targets)
+
+    analyze_ok = False
+    try:
+        result = subprocess.run(
+            cmd_agent2,
+            capture_output=True, text=True, timeout=1800,
+            cwd=str(BASE_DIR),
+            env={**os.environ, "MAESTRO_SESSION_ID": session_id},
+        )
+        if result.returncode == 0:
+            analyze_ok = True
+            logger.info("Agent 2 basarili (exit code 0)")
+        else:
+            logger.error("Agent 2 hata (exit code %d): %s", result.returncode, result.stderr[-500:])
+        if result.stdout:
+            for line in result.stdout.strip().split("\n")[-10:]:
+                logger.info("  [A2] %s", line.strip())
+    except subprocess.TimeoutExpired:
+        logger.error("Agent 2 timeout (30 dakika)")
+    except Exception as e:
+        logger.error("Agent 2 calistirilamadi: %s", e)
+
+    # ===== SON DURUM RAPORU =====
+    logger.info("\n--- SON DURUM RAPORU ---")
+    report = _build_status_report(collect_ok, analyze_ok, session_id, targets)
+    rapor_path = _save_status_report(report)
+
+    if report["genel_durum"] == "TEMIZ":
+        logger.info("Pipeline temiz tamamlandi. Dashboard'dan onay bekleniyor.")
+        _send_email(
+            f"[PPC Pipeline] TEMIZ — {PIPELINE_DATE}",
+            f"Agent 1+2 basariyla tamamlandi.\n"
+            f"Session: {session_id}\n\n"
+            f"Dashboard'dan Agent 3 onayi bekleniyor."
+        )
+
+    elif report["genel_durum"] == "EKSIK":
+        eksik_detay = "\n".join(
+            f"  {e['hesap_key']}/{e['marketplace']}: {e['rapor']}"
+            for e in report["eksik_raporlar"]
+        )
+        _send_email(
+            f"[PPC Pipeline] UYARI: {len(report['eksik_raporlar'])} eksik rapor — {PIPELINE_DATE}",
+            f"Retry sonrasi hala eksik raporlar var:\n\n{eksik_detay}\n\n"
+            f"Session: {session_id}\n"
+            f"Manuel kontrol gerekebilir."
+        )
 
     elif report["genel_durum"] == "KISMI":
         logger.warning("Pipeline kismi tamamlandi.")
