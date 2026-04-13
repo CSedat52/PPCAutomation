@@ -89,13 +89,9 @@ def run_agent4_phase2(hesap_key: str, marketplace: str, base_dir) -> bool:
         return False
 
     user_content = json.dumps(error_data, ensure_ascii=False)
-    # Token tasarrufu: cok buyukse kes
-    if len(user_content) > 15000:
-        user_content = user_content[:15000] + "\n...(kesildi)"
-
     payload = {
         "model": MODEL,
-        "max_tokens": 1000,
+        "max_tokens": 4096,
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": user_content}],
     }
