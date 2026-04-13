@@ -1,3 +1,6 @@
+# NOT: E-posta gondermek icin VPS'te outbound 587/tcp acik olmali:
+#   sudo ufw allow out 587/tcp
+
 """
 Pipeline Runner — Saf Python Orkestrasyon ($0 maliyet)
 ========================================================
@@ -51,9 +54,11 @@ def _send_email(subject, body):
         if ok:
             logger.info("E-posta gonderildi: %s", subject)
         else:
-            logger.warning("E-posta gonderilemedi: %s", err)
+            logger.error("E-posta gonderilemedi: %s", err)
+    except ImportError as e:
+        logger.error("email_handler import hatasi: %s", e)
     except Exception as e:
-        logger.warning("E-posta hatasi: %s", e)
+        logger.error("E-posta gonderim hatasi (detay): %s — %s", type(e).__name__, e)
 
 
 # ============================================================================

@@ -17,6 +17,12 @@ from . import config
 
 logger = logging.getLogger("maestro.email")
 
+# Baslangicta env var kontrolu
+if not config.GMAIL_ADDRESS:
+    logger.warning("MAESTRO_GMAIL_ADDRESS tanimli degil — e-posta gonderilemez")
+if not config.GMAIL_APP_PASSWORD:
+    logger.warning("MAESTRO_GMAIL_APP_PASSWORD tanimli degil — e-posta gonderilemez")
+
 
 # ============================================================================
 # SMTP — E-POSTA GONDERIM
