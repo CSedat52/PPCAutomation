@@ -160,7 +160,7 @@ def test_execution_queue(db, hesap_key, marketplace):
     print(f"\n--- Execution Queue: {hesap_key}/{marketplace} ---")
     try:
         rows = db._fetch_all(
-            "SELECT id, status, command FROM execution_queue WHERE hesap_key = %s AND marketplace = %s ORDER BY created_at DESC LIMIT 5",
+            "SELECT id, status, command FROM execution_queue WHERE hesap_key = %s AND marketplace = %s ORDER BY requested_at DESC LIMIT 5",
             (hesap_key, marketplace))
         print(f"  [OK] execution_queue erisilebilir ({len(rows or [])} son kayit)")
         return True
@@ -173,10 +173,10 @@ def test_agent_status(db):
     """6. Agent status tablosu kontrol et."""
     print(f"\n--- Agent Status ---")
     try:
-        rows = db._fetch_all("SELECT agent_id, status, updated_at FROM agent_status ORDER BY agent_id")
+        rows = db._fetch_all("SELECT agent_name, status, updated_at FROM agent_status ORDER BY agent_name")
         if rows:
-            for agent_id, status, updated_at in rows:
-                print(f"  [OK] {agent_id}: {status} (son guncelleme: {updated_at})")
+            for agent_name, status, updated_at in rows:
+                print(f"  [OK] {agent_name}: {status} (son guncelleme: {updated_at})")
         else:
             print("  [WARN] agent_status tablosu bos")
         return True
