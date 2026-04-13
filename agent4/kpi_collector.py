@@ -47,7 +47,7 @@ class KPICollector:
                   AND decision_status = 'APPLIED'
                   AND kpi_after IS NULL
                 ORDER BY decision_date ASC
-                LIMIT 100
+                LIMIT 5000
             """, (self.hesap_key, self.marketplace))
         except Exception as e:
             logger.warning("decision_history okunamadi: %s", e)
@@ -57,7 +57,7 @@ class KPICollector:
             logger.info("Doldurulacak kpi_after yok.")
             return ozet
 
-        logger.info("kpi_after bos kayit: %d (max 100)", len(rows))
+        logger.info("kpi_after bos kayit: %d (max 5000)", len(rows))
 
         # 2. Tum targeting_id'leri topla ve batch sorgu yap
         id_map = {}
