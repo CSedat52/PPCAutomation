@@ -205,65 +205,24 @@ def load_json_file(filepath):
 
 def load_all_agent1_data():
     """
-    Agent 1'in tum dosyalarini yukler ve organize eder.
-    Supabase-first: data_loader uzerinden Supabase raw_data'dan okur.
-    JSON fallback: Supabase basarisiz olursa JSON dosyalarina doner.
+    Agent 1'in tum verilerini Supabase'den yukler.
+    JSON fallback KALDIRILDI — Supabase basarisiz olursa hata firlatir.
     """
     hk = os.environ.get("HESAP_KEY", "")
     mp = os.environ.get("MARKETPLACE", "")
 
-    if hk and mp:
-        try:
-            from data_loader import load_all_agent1_data as _load_supabase
-            today = datetime.utcnow().strftime("%Y-%m-%d")
-            data = _load_supabase(hk, mp, str(DATA_DIR), today)
-            # Kritik kontrol: SP kampanya verisi var mi?
-            if data.get("sp", {}).get("campaigns"):
-                logger.info("Agent 1 verileri Supabase'den yuklendi (data_loader)")
-                return data
-            logger.warning("Supabase'den SP kampanya verisi bos, JSON fallback")
-        except Exception as e:
-            logger.warning("data_loader basarisiz, JSON fallback: %s", e)
+    if not hk or not mp:
+        raise RuntimeError("Agent 1 verileri yuklenemedi: HESAP_KEY/MARKETPLACE tanimli degil")
 
-    # JSON fallback (eski yontem)
-    data = {
-        "portfolios": load_json_file(find_latest_data_file("portfolios")),
-        "sp": {
-            "campaigns": load_json_file(find_latest_data_file("sp_campaigns")),
-            "keywords": load_json_file(find_latest_data_file("sp_keywords")),
-            "targets": load_json_file(find_latest_data_file("sp_targets")),
-            "negative_keywords": load_json_file(find_latest_data_file("sp_negative_keywords")),
-            "campaign_negative_keywords": load_json_file(find_latest_data_file("sp_campaign_negative_keywords")),
-            "negative_targets": load_json_file(find_latest_data_file("sp_negative_targets")),
-        },
-        "sb": {
-            "campaigns": load_json_file(find_latest_data_file("sb_campaigns")),
-            "keywords": load_json_file(find_latest_data_file("sb_keywords")),
-            "targets": load_json_file(find_latest_data_file("sb_targets")),
-            "negative_keywords": load_json_file(find_latest_data_file("sb_negative_keywords")),
-        },
-        "sd": {
-            "campaigns": load_json_file(find_latest_data_file("sd_campaigns")),
-            "targets": load_json_file(find_latest_data_file("sd_targets")),
-        },
-        "reports": {},
-    }
-
-    report_files = [
-        ("sp_targeting_report", 14),
-        ("sp_search_term_report", 30),
-        ("sb_targeting_report", 14),
-        ("sb_search_term_report", 30),
-        ("sd_targeting_report", 14),
-        ("sd_targeting_report", 30),
-    ]
-
-    for report_name, days in report_files:
-        key = f"{report_name}_{days}d"
-        filepath = find_latest_data_file(f"{report_name}_{days}d")
-        data["reports"][key] = load_json_file(filepath)
-
-    return data
+    try:
+        from data_loader import load_all_agent1_data as _load_supabase
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        data = _load_supabase(hk, mp, str(DATA_DIR), today)
+        logger.info("Agent 1 verileri Supabase'den yuklendi (data_loader)")
+        return data
+    except Exception as e:
+        logger.error("Agent 1 verileri Supabase'den yuklenemedi: %s", e)
+        raise RuntimeError(f"Agent 1 verileri Supabase'den yuklenemedi: {e}")
 
 
 # ============================================================================
@@ -271,55 +230,49 @@ def load_all_agent1_data():
 # ============================================================================
 
 def load_previous_decisions():
-    """Onceki kararlari Supabase'den yukler. Fallback: JSON dosyasindan."""
+    """Onceki kararlari Supabase'den yukler. JSON fallback KALDIRILDI."""
     hk = os.environ.get("HESAP_KEY", "")
     mp = os.environ.get("MARKETPLACE", "")
-    if hk and mp:
-        try:
-            from supabase.db_client import SupabaseClient
-            db = SupabaseClient()
-            conn = db._conn()
-            cur = conn.cursor()
-            # Son analiz tarihinden kararlari al
-            cur.execute("""
-                SELECT keyword_id, keyword_text, campaign_name, current_bid, recommended_bid,
-                       bid_change_pct, segment, analysis_date, ad_type
-                FROM bid_recommendations
-                WHERE hesap_key = %s AND marketplace = %s
-                ORDER BY analysis_date DESC LIMIT 50000
-            """, (hk, mp))
-            rows = cur.fetchall()
-            cur.close()
-            conn.close()
-            if rows:
-                result = {}
-                for row in rows:
-                    hid = str(row[0] or "")
-                    if hid and hid not in result:
-                        result[hid] = {
-                            "hedefleme_id": hid,
-                            "hedefleme": row[1] or "",
-                            "kampanya": row[2] or "",
-                            "onceki_bid": float(row[3] or 0),
-                            "yeni_bid": float(row[4] or 0),
-                            "degisim_yuzde": float(row[5] or 0),
-                            "segment": row[6] or "",
-                            "tarih": str(row[7] or ""),
-                            "reklam_tipi": row[8] or "",
-                        }
-                logger.info("Onceki kararlar Supabase'den yuklendi: %d kayit", len(result))
-                return result
-        except Exception as e:
-            logger.warning("Onceki kararlar Supabase'den okunamadi, dosyaya fallback: %s", e)
-
-    if not DECISIONS_DIR or not DECISIONS_DIR.exists():
+    if not hk or not mp:
+        logger.warning("Onceki kararlar yuklenemedi: HESAP_KEY/MARKETPLACE tanimli degil")
         return {}
-    candidates = sorted(DECISIONS_DIR.glob("*_decisions.json"), reverse=True)
-    if not candidates:
+    try:
+        from supabase.db_client import SupabaseClient
+        db = SupabaseClient()
+        conn = db._conn()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT keyword_id, keyword_text, campaign_name, current_bid, recommended_bid,
+                   bid_change_pct, segment, analysis_date, ad_type
+            FROM bid_recommendations
+            WHERE hesap_key = %s AND marketplace = %s
+            ORDER BY analysis_date DESC LIMIT 50000
+        """, (hk, mp))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        if rows:
+            result = {}
+            for row in rows:
+                hid = str(row[0] or "")
+                if hid and hid not in result:
+                    result[hid] = {
+                        "hedefleme_id": hid,
+                        "hedefleme": row[1] or "",
+                        "kampanya": row[2] or "",
+                        "onceki_bid": float(row[3] or 0),
+                        "yeni_bid": float(row[4] or 0),
+                        "degisim_yuzde": float(row[5] or 0),
+                        "segment": row[6] or "",
+                        "tarih": str(row[7] or ""),
+                        "reklam_tipi": row[8] or "",
+                    }
+            logger.info("Onceki kararlar Supabase'den yuklendi: %d kayit", len(result))
+            return result
         return {}
-    with open(candidates[0], "r", encoding="utf-8") as f:
-        decisions = json.load(f)
-    return {d["hedefleme_id"]: d for d in decisions}
+    except Exception as e:
+        logger.warning("Onceki kararlar Supabase'den okunamadi: %s — bos dict donuluyor", e)
+        return {}
 
 
 # ============================================================================
@@ -1296,71 +1249,16 @@ def preflight_check(today):
                     uyarilar.append("SD kampanya yok — SD analizi kisitli olabilir.")
                 return True, f"On kontrol gecti (Supabase). SP={sp_camp} kampanya. Tarih: {today}", uyarilar
 
+            if sp_camp == 0 and sp_report is None:
+                return False, f"Preflight Supabase: SP kampanya ve rapor bulunamadi ({hk}/{mp}). Agent 1 calistirilmis mi?", []
             if sp_camp == 0:
-                logger.warning("Preflight Supabase: SP kampanya=0, JSON fallback deneniyor")
+                return False, f"Preflight Supabase: SP kampanya=0 ({hk}/{mp}). Agent 1 calistirilmis mi?", []
             if not sp_report:
-                logger.warning("Preflight Supabase: SP targeting raporu yok, JSON fallback deneniyor")
+                return False, f"Preflight Supabase: SP targeting raporu yok ({hk}/{mp}). Agent 1 calistirilmis mi?", []
         except Exception as e:
-            logger.warning("Preflight Supabase basarisiz, JSON fallback: %s", e)
+            return False, f"Preflight Supabase erisim hatasi: {e}", []
 
-    # JSON fallback
-    kritik_dosyalar = [
-        f"{today}_sp_campaigns.json",
-        f"{today}_sp_targeting_report_14d.json",
-    ]
-    opsiyonel_dosyalar = [
-        f"{today}_portfolios.json",
-        f"{today}_sp_keywords.json",
-        f"{today}_sp_targets.json",
-        f"{today}_sp_negative_keywords.json",
-        f"{today}_sp_campaign_negative_keywords.json",
-        f"{today}_sp_negative_targets.json",
-        f"{today}_sp_search_term_report_30d.json",
-        f"{today}_sb_campaigns.json",
-        f"{today}_sb_keywords.json",
-        f"{today}_sb_negative_keywords.json",
-        f"{today}_sb_targeting_report_14d.json",
-        f"{today}_sb_search_term_report_30d.json",
-        f"{today}_sd_campaigns.json",
-        f"{today}_sd_targeting_report_14d.json",
-        f"{today}_sd_targeting_report_30d.json",
-    ]
-
-    eksik_kritik = []
-    eksik_opsiyonel = []
-
-    for fname in kritik_dosyalar:
-        if not (DATA_DIR / fname).exists():
-            eksik_kritik.append(fname)
-
-    for fname in opsiyonel_dosyalar:
-        if not (DATA_DIR / fname).exists():
-            eksik_opsiyonel.append(fname)
-
-    uyarilar = []
-
-    if eksik_kritik:
-        mesaj = (
-            f"HATA: Agent 1 bugun ({today}) henuz calistirilmamis veya kritik dosyalar eksik.\n"
-            f"Eksik kritik dosyalar: {', '.join(eksik_kritik)}\n"
-            f"Lutfen once Agent 1'i calistirin."
-        )
-        return False, mesaj, []
-
-    if eksik_opsiyonel:
-        for f in eksik_opsiyonel:
-            if "sb_" in f:
-                uyarilar.append(f"SB dosyasi eksik: {f} — SB analizi kisitli olabilir.")
-            elif "sd_" in f:
-                uyarilar.append(f"SD dosyasi eksik: {f} — SD analizi kisitli olabilir.")
-            else:
-                uyarilar.append(f"Opsiyonel dosya eksik: {f}")
-
-    mevcut = len(kritik_dosyalar) + len(opsiyonel_dosyalar) - len(eksik_opsiyonel)
-    toplam = len(kritik_dosyalar) + len(opsiyonel_dosyalar)
-    mesaj = f"On kontrol gecti (JSON fallback). {mevcut}/{toplam} dosya mevcut. Tarih: {today}"
-
-    return True, mesaj, uyarilar
+    return False, f"Preflight: HESAP_KEY/MARKETPLACE tanimli degil", []
 
 
 # ============================================================================
