@@ -788,6 +788,9 @@ def build_targeting_lookup(today=None):
                         if (cid_s, rapor_adi, "TARGETING") not in lookup:
                             lookup[(cid_s, rapor_adi, "TARGETING")] = entity_info
                         lookup[(cid_s, agid_s, rapor_adi)] = entity_info
+                    full_expr_str = _build_sd_expression_string(expr)
+                    if full_expr_str and full_expr_str != expr_value:
+                        lookup[(cid_s, full_expr_str, "TARGETING")] = entity_info
                 elif isinstance(expr, str) and expr:
                     lookup[(cid_s, expr.lower(), "TARGETING")] = entity_info
 
@@ -850,6 +853,9 @@ def build_targeting_lookup(today=None):
                         if (cid, rapor_adi, "TARGETING") not in lookup:
                             lookup[(cid, rapor_adi, "TARGETING")] = entity_info
                         lookup[(cid, agid, rapor_adi)] = entity_info
+                    full_expr_str = _build_sd_expression_string(expression)
+                    if full_expr_str and full_expr_str != expr_value:
+                        lookup[(cid, full_expr_str, "TARGETING")] = entity_info
                 elif isinstance(expression, str) and expression:
                     lookup[(cid, (expression or "").lower(), "TARGETING")] = entity_info
 
@@ -892,6 +898,53 @@ def build_targeting_lookup(today=None):
 
     logger.info("Targeting lookup: %d entity (keyword + target + auto-targeting)", len(lookup))
     return lookup
+
+
+def _camel_to_kebab(s):
+    """camelCase'i kebab-case'e donusturur: similarProduct -> similar-product"""
+    return re.sub(r'([a-z])([A-Z])', r'\1-\2', s).lower()
+
+
+def _build_sd_expression_string(expr_list):
+    """
+    SD targeting expression JSON'unu rapor format stringine donusturur.
+
+    Ornek:
+      [{"type": "views", "value": [{"type": "similarProduct"}, {"type": "lookback", "value": "30"}]}]
+      -> "views=(similar-product lookback=30)"
+
+      [{"type": "asinCategorySameAs", "value": "12345"}]
+      -> 'asincategorysameas="12345"'
+
+    Returns: lowercase string veya None
+    """
+    if not isinstance(expr_list, list) or not expr_list:
+        return None
+
+    first = expr_list[0] if isinstance(expr_list[0], dict) else {}
+    main_type = first.get("type", "")
+    if not main_type:
+        return None
+
+    value = first.get("value", "")
+
+    if isinstance(value, list):
+        parts = []
+        for sub in value:
+            if not isinstance(sub, dict):
+                continue
+            sub_type = _camel_to_kebab(sub.get("type", ""))
+            sub_val = sub.get("value", "")
+            if sub_val and not isinstance(sub_val, (list, dict)):
+                parts.append(f"{sub_type}={sub_val}")
+            elif sub_type:
+                parts.append(sub_type)
+        if parts:
+            return f"{main_type}=({' '.join(parts)})".lower()
+    elif isinstance(value, str) and value:
+        return f'{main_type}="{value}"'.lower()
+
+    return main_type.lower()
 
 
 def _extract_value_from_targeting(targeting_text):
