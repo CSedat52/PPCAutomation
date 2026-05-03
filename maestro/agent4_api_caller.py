@@ -16,7 +16,7 @@ from pathlib import Path
 logger = logging.getLogger("agent4.api_caller")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-4-6"
 
 SYSTEM_PROMPT = """Sen Amazon PPC otomasyon sisteminin hata analiz asistanisin.
 Sana pipeline hata verileri verilecek. Gorevlerin:
