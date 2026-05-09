@@ -67,9 +67,19 @@ def _send_email(subject, body):
 
 def _build_status_report(collect_ok, analyze_ok, session_id, targets):
     """
-    Maestro'nun okuyacagi ozet rapor.
-    collect_ok: bool (Agent 1 basarili mi)
-    analyze_ok: bool (Agent 2 basarili mi)
+    Maestro'nun okuyacagi 3-kova durum raporu.
+
+    Kovalar:
+      - structural_yok: O ad_type icin marketplace'te kampanya yok (smart-skip)
+      - dormant_raporlar: Toplu retry sonrasi bos kalan raporlar (kampanya var,
+        14 gun 0 impression). Marker dosyasindan okunur.
+      - eksik_raporlar: Gercek API hatalari (sadece bunlar alarm uretir)
+
+    genel_durum:
+      - TEMIZ: hicbir sey yok
+      - DORMANT_VAR: sadece dormant var, gercek hata yok (alarm yok)
+      - EKSIK: gercek hata var
+      - KISMI: collect_ok veya analyze_ok False
     """
     report = {
         "session_id": session_id,
@@ -77,11 +87,12 @@ def _build_status_report(collect_ok, analyze_ok, session_id, targets):
         "timestamp": datetime.utcnow().isoformat(),
         "agent1": {"status": "completed" if collect_ok else "failed"},
         "agent2": {"status": "completed" if analyze_ok else "failed"},
+        "structural_yok": [],
+        "dormant_raporlar": [],
         "eksik_raporlar": [],
         "genel_durum": "TEMIZ",
     }
 
-    # Eksik raporlari Supabase'den kontrol et
     try:
         from supabase.db_client import SupabaseClient
         db = SupabaseClient()
@@ -89,7 +100,6 @@ def _build_status_report(collect_ok, analyze_ok, session_id, targets):
         from maestro.config import get_active_pipelines
         pipelines = get_active_pipelines()
 
-        # Sadece hedeflenen marketplace'leri kontrol et
         if targets:
             target_set = set()
             for t in targets:
@@ -106,47 +116,54 @@ def _build_status_report(collect_ok, analyze_ok, session_id, targets):
         for p in pipelines:
             hk = p["hesap_key"]
             mp = p["marketplace"]
-
-            # Smart-skip: Supabase-first kampanya sayisi kontrolu
             data_dir = BASE_DIR / "data" / f"{hk}_{mp}"
+
+            # CANLI KAMPANYA SAYIMI (state filter ile, eski/silinmis haric)
             try:
-                from data_loader import count_campaigns as _count_camp
-                sp_count = _count_camp(hk, mp, "SP", str(data_dir), PIPELINE_DATE)
-                sb_count = _count_camp(hk, mp, "SB", str(data_dir), PIPELINE_DATE)
-                sd_count = _count_camp(hk, mp, "SD", str(data_dir), PIPELINE_DATE)
-            except Exception:
-                # data_loader import basarisiz — guvenli tarafta kal
-                sp_count = -1
-                sb_count = -1
-                sd_count = -1
+                sp_count = _count_active_campaigns(db, hk, mp, "SP")
+                sb_count = _count_active_campaigns(db, hk, mp, "SB")
+                sd_count = _count_active_campaigns(db, hk, mp, "SD")
+            except Exception as e:
+                logger.warning("[%s/%s] Aktif kampanya sayimi hatasi: %s", hk, mp, e)
+                sp_count = sb_count = sd_count = -1
 
+            # STRUCTURAL_YOK
+            for ad_type, count in [("SP", sp_count), ("SB", sb_count), ("SD", sd_count)]:
+                if count == 0:
+                    report["structural_yok"].append({
+                        "hesap_key": hk,
+                        "marketplace": mp,
+                        "ad_type": ad_type,
+                        "sebep": f"{ad_type} kampanya yok (entity sayim=0)",
+                    })
+                    logger.info("[%s/%s] %s kampanya=0 → STRUCTURAL_YOK", hk, mp, ad_type)
+
+            # DORMANT MARKER
+            dormant_marker = _load_dormant_marker(data_dir, PIPELINE_DATE)
+            dormant_ad_types = set(dormant_marker.get("ad_types", [])) if dormant_marker else set()
+            dormant_report_keys = set(dormant_marker.get("raporlar", [])) if dormant_marker else set()
+
+            # RAPOR EKSIK KONTROL
             beklenen_mp = []
-            if sp_count != 0:  # -1 (dosya yok) durumunda da bekle (guvenli taraf)
-                beklenen_mp.append(("sp_targeting", "targeting_reports", "SP"))
-                beklenen_mp.append(("sp_search_term", "search_term_reports", "SP"))
-            else:
-                logger.info("[%s/%s] SP kampanya=0 → SP raporlari smart-skip", hk, mp)
-
+            if sp_count != 0:
+                beklenen_mp.append(("sp_targeting", "targeting_reports", "SP", "sp_targeting_report_14d"))
+                beklenen_mp.append(("sp_search_term", "search_term_reports", "SP", "sp_search_term_report_30d"))
             if sb_count != 0:
-                beklenen_mp.append(("sb_targeting", "targeting_reports", "SB"))
-                beklenen_mp.append(("sb_search_term", "search_term_reports", "SB"))
-            else:
-                logger.info("[%s/%s] SB kampanya=0 → SB raporlari smart-skip", hk, mp)
-
+                beklenen_mp.append(("sb_targeting", "targeting_reports", "SB", "sb_targeting_report_14d"))
+                beklenen_mp.append(("sb_search_term", "search_term_reports", "SB", "sb_search_term_report_30d"))
             if sd_count != 0:
-                beklenen_mp.append(("sd_targeting", "targeting_reports", "SD"))
-            else:
-                logger.info("[%s/%s] SD kampanya=0 → SD raporlari smart-skip", hk, mp)
+                beklenen_mp.append(("sd_targeting", "targeting_reports", "SD", "sd_targeting_report_14d"))
 
-            for rapor_adi, tablo, ad_type in beklenen_mp:
-                date_col = "collection_date"
+            for rapor_adi, tablo, ad_type, report_key in beklenen_mp:
                 rows = db._fetch_all(
                     f"SELECT 1 FROM {tablo} WHERE hesap_key = %s AND marketplace = %s "
-                    f"AND {date_col} = %s AND ad_type = %s LIMIT 1",
+                    f"AND collection_date = %s AND ad_type = %s LIMIT 1",
                     (hk, mp, PIPELINE_DATE, ad_type)
                 )
                 if not rows:
-                    report["eksik_raporlar"].append({
+                    is_dormant = (report_key in dormant_report_keys or ad_type in dormant_ad_types)
+                    bucket = "dormant_raporlar" if is_dormant else "eksik_raporlar"
+                    report[bucket].append({
                         "hesap_key": hk,
                         "marketplace": mp,
                         "rapor": rapor_adi,
@@ -160,10 +177,47 @@ def _build_status_report(collect_ok, analyze_ok, session_id, targets):
         report["genel_durum"] = "EKSIK"
     elif not collect_ok or not analyze_ok:
         report["genel_durum"] = "KISMI"
+    elif report["dormant_raporlar"]:
+        report["genel_durum"] = "DORMANT_VAR"
     else:
         report["genel_durum"] = "TEMIZ"
 
     return report
+
+
+def _count_active_campaigns(db, hk, mp, ad_type):
+    """
+    Sadece ENABLED veya PAUSED state'indeki kampanyalari sayar.
+    archived/silinmis kampanyalari haric tutar.
+
+    NOT: Calistirmadan once Supabase'de campaigns tablosundaki state
+    degerlerini dogrula:
+      SELECT DISTINCT state, COUNT(*) FROM campaigns GROUP BY state;
+    Eger ARCHIVED/DELETED disinda baska "pasif" state varsa bu listeye ekle.
+    """
+    try:
+        row = db._fetch_one(
+            """SELECT COUNT(*) FROM campaigns
+               WHERE hesap_key = %s AND marketplace = %s AND ad_type = %s
+                 AND COALESCE(UPPER(state), '') NOT IN ('ARCHIVED', 'DELETED')""",
+            (hk, mp, ad_type)
+        )
+        return row[0] if row else 0
+    except Exception:
+        return -1
+
+
+def _load_dormant_marker(data_dir, date_str):
+    """parallel_collector.py'nin yazdigi DORMANT marker dosyasini oku."""
+    marker_path = data_dir / f"dormant_{date_str}.json"
+    if not marker_path.exists():
+        return None
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.warning("DORMANT marker okunamadi (%s): %s", marker_path, e)
+        return None
 
 
 def _save_status_report(report):
@@ -356,37 +410,57 @@ def run(targets=None, force=False):
     report = _build_status_report(collect_ok, analyze_ok, session_id, targets)
     rapor_path = _save_status_report(report)
 
-    if report["genel_durum"] == "TEMIZ":
-        logger.info("Pipeline temiz tamamlandi. Dashboard'dan onay bekleniyor.")
-        _send_email(
-            f"[PPC Pipeline] TEMIZ — {PIPELINE_DATE}",
-            f"Agent 1+2 basariyla tamamlandi.\n"
-            f"Session: {session_id}\n\n"
-            f"Dashboard'dan Agent 3 onayi bekleniyor."
-        )
+    # E-posta govdesi: 3 bolum (EKSIK / DORMANT / STRUCTURAL_YOK)
+    body_parts = []
 
-    elif report["genel_durum"] == "EKSIK":
-        eksik_detay = "\n".join(
-            f"  {e['hesap_key']}/{e['marketplace']}: {e['rapor']}"
-            for e in report["eksik_raporlar"]
-        )
-        _send_email(
-            f"[PPC Pipeline] UYARI: {len(report['eksik_raporlar'])} eksik rapor — {PIPELINE_DATE}",
-            f"Retry sonrasi hala eksik raporlar var:\n\n{eksik_detay}\n\n"
-            f"Session: {session_id}\n"
-            f"Manuel kontrol gerekebilir."
-        )
+    durum_etiketi = {
+        "TEMIZ": "TEMIZ",
+        "DORMANT_VAR": "TEMIZ (dormant var)",
+        "EKSIK": "UYARI (eksik rapor)",
+        "KISMI": "KISMI",
+    }.get(report["genel_durum"], report["genel_durum"])
 
+    body_parts.append(f"Pipeline durumu: {durum_etiketi}")
+    body_parts.append(f"Session: {session_id}")
+    body_parts.append(f"Tarih: {PIPELINE_DATE}")
+    body_parts.append(f"Agent 1: {report['agent1']['status']} | Agent 2: {report['agent2']['status']}")
+    body_parts.append("")
+
+    if report["eksik_raporlar"]:
+        body_parts.append(f"[!] EKSIK RAPORLAR ({len(report['eksik_raporlar'])} adet) — manuel kontrol gerekebilir:")
+        for e in report["eksik_raporlar"]:
+            body_parts.append(f"  - {e['hesap_key']}/{e['marketplace']}: {e['rapor']} ({e['ad_type']})")
+        body_parts.append("")
+
+    if report["dormant_raporlar"]:
+        body_parts.append(f"[i] DORMANT RAPORLAR ({len(report['dormant_raporlar'])} adet) — alarm degil:")
+        body_parts.append("    Bu marketplace'lerde kampanya AKTIF ama 14 gun 0 impression aldi.")
+        body_parts.append("    Agent 2 entity'lerden suni hedefleme uretip GORUNMEZ segmentinde")
+        body_parts.append("    bid artis onerisi cikaracak.")
+        for d in report["dormant_raporlar"]:
+            body_parts.append(f"  - {d['hesap_key']}/{d['marketplace']}: {d['rapor']} ({d['ad_type']})")
+        body_parts.append("")
+
+    if report["structural_yok"]:
+        body_parts.append(f"[i] YAPISAL OLARAK YOK ({len(report['structural_yok'])} adet) — alarm degil:")
+        body_parts.append("    Bu marketplace'lerde ilgili reklam tipi icin hic kampanya yok.")
+        for s in report["structural_yok"]:
+            body_parts.append(f"  - {s['hesap_key']}/{s['marketplace']}: {s['ad_type']} (kampanya yok)")
+        body_parts.append("")
+
+    if report["genel_durum"] in ("TEMIZ", "DORMANT_VAR"):
+        body_parts.append("Dashboard'dan Agent 3 onayi bekleniyor.")
+
+    if report["genel_durum"] == "EKSIK":
+        subject = f"[PPC Pipeline] UYARI: {len(report['eksik_raporlar'])} eksik rapor — {PIPELINE_DATE}"
     elif report["genel_durum"] == "KISMI":
-        logger.warning("Pipeline kismi tamamlandi.")
-        _send_email(
-            f"[PPC Pipeline] KISMI — {PIPELINE_DATE}",
-            f"Pipeline kismi tamamlandi.\n"
-            f"Agent 1: {report['agent1']['status']}\n"
-            f"Agent 2: {report['agent2']['status']}\n"
-            f"Session: {session_id}\n\n"
-            f"Manuel kontrol gerekebilir."
-        )
+        subject = f"[PPC Pipeline] KISMI — {PIPELINE_DATE}"
+    elif report["genel_durum"] == "DORMANT_VAR":
+        subject = f"[PPC Pipeline] TEMIZ ({len(report['dormant_raporlar'])} dormant) — {PIPELINE_DATE}"
+    else:
+        subject = f"[PPC Pipeline] TEMIZ — {PIPELINE_DATE}"
+
+    _send_email(subject, "\n".join(body_parts))
 
     _save_log("info", f"Pipeline runner tamamlandi: {report['genel_durum']}", "pipeline_runner",
               session_id=session_id)
