@@ -392,6 +392,153 @@ def build_targeting_list(data, settings):
     return targets
 
 
+# ============================================================================
+# DORMANT ZOMBI HEDEFLEME ENJEKSIYONU
+# ============================================================================
+
+def inject_dormant_targets(targets, data, dormant_ad_types, settings):
+    """
+    DORMANT ad_type'lar icin entity listesinden suni hedefleme uretir.
+
+    Mantik:
+      - Rapor satiri yok (kampanya 14 gun 0 impression aldi)
+      - Ama entity listesi var (campaigns + keywords/targets, AKTIF state'te)
+      - Her aktif keyword/target icin sifir-metrikli bir target_row olustur
+      - segmentize() impressions=0 < gosterim_esik (300) gorup GORUNMEZ donecek
+      - calculate_new_bid() GORUNMEZ icin +%10 bid artis onerisi uretecek
+
+    Returns:
+        Yeni eklenen zombi hedefleme sayisi (int)
+    """
+    if not dormant_ad_types:
+        return 0
+
+    existing_ids = {t["hedefleme_id"] for t in targets}
+    camp_names, camp_portfolios = build_campaign_maps(data, settings)
+    eklenen = 0
+
+    for ad_type in dormant_ad_types:
+        if ad_type not in ("SP", "SB", "SD"):
+            continue
+
+        ad_data = data.get(ad_type.lower(), {})
+        active_camp_ids = get_active_campaign_ids(ad_data.get("campaigns", []))
+
+        # KEYWORDS (SP, SB)
+        for kw in ad_data.get("keywords", []):
+            cid = str(kw.get("campaignId", ""))
+            if cid not in active_camp_ids:
+                continue
+            state = (kw.get("state") or "").upper()
+            if state and state not in ("ENABLED", "DELIVERING"):
+                continue
+
+            kid = str(kw.get("keywordId", ""))
+            if not kid:
+                continue
+
+            text = kw.get("keywordText", "")
+            mt = (kw.get("matchType") or "").upper()
+            agid = str(kw.get("adGroupId", ""))
+
+            bid_val = kw.get("bid", 0)
+            if isinstance(bid_val, dict):
+                bid_val = bid_val.get("amount", bid_val.get("value", 0))
+            mevcut_bid = float(bid_val or 0)
+
+            hedefleme_id = f"{ad_type}_{cid}_{kid}_{mt}"
+            if hedefleme_id in existing_ids:
+                continue
+
+            zombie_row = {
+                "hedefleme_id": hedefleme_id,
+                "reklam_tipi": ad_type,
+                "kampanya_adi": camp_names.get(cid, ""),
+                "kampanya_id": cid,
+                "portfolio_id": camp_portfolios.get(cid, ""),
+                "ad_group_name": "",
+                "ad_group_id": agid,
+                "hedefleme": str(text),
+                "match_type": mt,
+                "keyword_id": kid,
+                "impressions": 0,
+                "clicks": 0,
+                "spend": 0.0,
+                "sales": 0.0,
+                "orders": 0,
+                "acos": 0,
+                "cvr": 0,
+                "cpc": 0,
+                "mevcut_bid": mevcut_bid,
+                "kaynak": "DORMANT_ZOMBI",
+            }
+            targets.append(zombie_row)
+            existing_ids.add(hedefleme_id)
+            eklenen += 1
+
+        # TARGETS (SP product targets, SB targets, SD targets)
+        for tgt in ad_data.get("targets", []):
+            cid = str(tgt.get("campaignId", ""))
+            if cid not in active_camp_ids:
+                continue
+            state = (tgt.get("state") or "").upper()
+            if state and state not in ("ENABLED", "DELIVERING"):
+                continue
+
+            tid = str(tgt.get("targetId", ""))
+            if not tid:
+                continue
+
+            expr = tgt.get("expression", [])
+            if isinstance(expr, list) and expr:
+                expr_str = ", ".join(
+                    f"{e.get('type', '')}={e.get('value', '')}"
+                    for e in expr if isinstance(e, dict)
+                )
+            else:
+                expr_str = str(tgt.get("targetingExpression", tid))
+
+            tt = (tgt.get("expressionType") or tgt.get("targetingType") or "").upper()
+            agid = str(tgt.get("adGroupId", ""))
+
+            bid_val = tgt.get("bid", 0)
+            if isinstance(bid_val, dict):
+                bid_val = bid_val.get("amount", bid_val.get("value", 0))
+            mevcut_bid = float(bid_val or 0)
+
+            hedefleme_id = f"{ad_type}_{cid}_{tid}_{tt}"
+            if hedefleme_id in existing_ids:
+                continue
+
+            zombie_row = {
+                "hedefleme_id": hedefleme_id,
+                "reklam_tipi": ad_type,
+                "kampanya_adi": camp_names.get(cid, ""),
+                "kampanya_id": cid,
+                "portfolio_id": camp_portfolios.get(cid, ""),
+                "ad_group_name": "",
+                "ad_group_id": agid,
+                "hedefleme": expr_str,
+                "match_type": tt,
+                "keyword_id": tid,
+                "impressions": 0,
+                "clicks": 0,
+                "spend": 0.0,
+                "sales": 0.0,
+                "orders": 0,
+                "acos": 0,
+                "cvr": 0,
+                "cpc": 0,
+                "mevcut_bid": mevcut_bid,
+                "kaynak": "DORMANT_ZOMBI",
+            }
+            targets.append(zombie_row)
+            existing_ids.add(hedefleme_id)
+            eklenen += 1
+
+    return eklenen
+
+
 def _build_target_row(ad_type, row, camp_name, camp_id, portfolio_id,
                        sales_key="sales14d", orders_key="purchases14d"):
     """Tek hedefleme satirini standart formata donusturur.
@@ -574,6 +721,9 @@ def segmentize(target, settings, previous_decisions):
 
     # ADIM 1: Gosterim Kontrolu
     if imp < gosterim_esik:
+        if target.get("kaynak") == "DORMANT_ZOMBI":
+            return "GORUNMEZ", hedef_acos, \
+                f"DORMANT: 14 gun 0 impression. Bid +%10 ile gosterim denenecek."
         return "GORUNMEZ", hedef_acos, \
             f"Impression ({imp}) < esik ({gosterim_esik}). Bid artirarak gosterim kazandirilacak."
 
@@ -1222,38 +1372,68 @@ def save_decisions(bid_results, today):
 # ON KONTROL
 # ============================================================================
 
+# ============================================================================
+# DORMANT MARKER YARDIMCI
+# ============================================================================
+
+def _load_dormant_marker(today):
+    """parallel_collector.py'nin yazdigi DORMANT marker dosyasini oku."""
+    if DATA_DIR is None:
+        return None
+    marker_path = DATA_DIR / f"dormant_{today}.json"
+    if not marker_path.exists():
+        return None
+    try:
+        with open(marker_path, "r", encoding="utf-8") as f:
+            marker = json.load(f)
+        logger.info("DORMANT marker bulundu: %d rapor, ad_types=%s",
+                    len(marker.get("raporlar", [])), marker.get("ad_types", []))
+        return marker
+    except Exception as e:
+        logger.warning("DORMANT marker okunamadi: %s", e)
+        return None
+
+
 def preflight_check(today):
     """
-    Supabase-first: Önce Supabase'de kritik veriler var mı kontrol et.
-    Fallback: JSON dosyalarını kontrol et.
+    Supabase-first: Once Supabase'de kritik veriler var mi kontrol et.
+    DORMANT marker varsa rapor zorunlulugu esnetilir (rapor yok ama beklenen
+    durumu tolere edilir).
     """
     hk = os.environ.get("HESAP_KEY", "")
     mp = os.environ.get("MARKETPLACE", "")
 
-    # Supabase-first kontrol
+    dormant_marker = _load_dormant_marker(today)
+    sp_dormant = bool(dormant_marker and "SP" in dormant_marker.get("ad_types", []))
+
     if hk and mp:
         try:
             from data_loader import _fetch_count, check_report_exists
             sp_camp = _fetch_count("campaigns", hk, mp, "AND ad_type = 'SP'")
             sp_report = check_report_exists(hk, mp, "targeting_reports", "SP", today)
 
-            if sp_camp > 0 and sp_report:
-                logger.info("Preflight Supabase: SP kampanya=%d, targeting rapor=VAR", sp_camp)
+            # SP DORMANT ise rapor olmamasi normal — devam et
+            if sp_camp > 0 and (sp_report or sp_dormant):
+                if sp_dormant and not sp_report:
+                    logger.info("Preflight: SP kampanya=%d, rapor YOK ama DORMANT marker VAR → tolere edildi", sp_camp)
+                else:
+                    logger.info("Preflight Supabase: SP kampanya=%d, targeting rapor=VAR", sp_camp)
                 uyarilar = []
-                # Opsiyonel kontroller
                 sb_camp = _fetch_count("campaigns", hk, mp, "AND ad_type = 'SB'")
                 sd_camp = _fetch_count("campaigns", hk, mp, "AND ad_type = 'SD'")
                 if sb_camp == 0:
                     uyarilar.append("SB kampanya yok — SB analizi kisitli olabilir.")
                 if sd_camp == 0:
                     uyarilar.append("SD kampanya yok — SD analizi kisitli olabilir.")
-                return True, f"On kontrol gecti (Supabase). SP={sp_camp} kampanya. Tarih: {today}", uyarilar
+                if sp_dormant:
+                    uyarilar.append("SP DORMANT — entity'lerden suni hedefleme uretilecek.")
+                return True, f"On kontrol gecti. SP={sp_camp} kampanya. Tarih: {today}", uyarilar
 
             if sp_camp == 0 and sp_report is None:
                 return False, f"Preflight Supabase: SP kampanya ve rapor bulunamadi ({hk}/{mp}). Agent 1 calistirilmis mi?", []
             if sp_camp == 0:
                 return False, f"Preflight Supabase: SP kampanya=0 ({hk}/{mp}). Agent 1 calistirilmis mi?", []
-            if not sp_report:
+            if not sp_report and not sp_dormant:
                 return False, f"Preflight Supabase: SP targeting raporu yok ({hk}/{mp}). Agent 1 calistirilmis mi?", []
         except Exception as e:
             return False, f"Preflight Supabase erisim hatasi: {e}", []
@@ -1348,6 +1528,20 @@ def _run_analysis_impl(today, hesap_key="", marketplace=""):
     # 3. Hedefleme listesi (aktif kampanyalar, dogru kolon isimleri)
     targets = build_targeting_list(data, settings)
     logger.info("Hedefleme listesi: %d hedefleme", len(targets))
+
+    # 3b. DORMANT ENJEKSIYONU — rapor satiri olmayan ama kampanya aktif olan
+    # entity'ler icin suni hedefleme ekle (sifir metriklerle).
+    # segmentize() bunlari GORUNMEZ olarak isaretler, +%10 bid onerisi cikar.
+    dormant_marker = _load_dormant_marker(today)
+    if dormant_marker:
+        dormant_ad_types = dormant_marker.get("ad_types", [])
+        eklenen = inject_dormant_targets(targets, data, dormant_ad_types, settings)
+        if eklenen > 0:
+            logger.info("DORMANT enjeksiyon: %d zombi hedefleme eklendi (ad_types=%s)",
+                        eklenen, dormant_ad_types)
+            _save_log("info",
+                      f"DORMANT zombi enjeksiyon: {eklenen} hedefleme, ad_types={dormant_ad_types}",
+                      "agent2", hesap_key, marketplace, MAESTRO_SESSION_ID)
 
     # 4. Bid fallback eslestirme (raporda bid=0 kalanlar icin)
     targets = enrich_with_bid_data(targets, data)
