@@ -1417,6 +1417,10 @@ async def run_all(targets=None, force=False):
                         dd = get_data_dir(p_hk, p_mplace)
                         fname = f"{today_str}_{p_key}.json"
                         save_json(fname, rows, dd)
+                        # Amazon API basarili dondu ama rapor BOS (0 kayit) — DORMANT adayi.
+                        # OK degil, FAIL degil — ayri bir status: EMPTY.
+                        if isinstance(rows, list) and len(rows) == 0:
+                            return "EMPTY", p_hk, p_mplace, p_key, p_task_tuple
                         return "OK", p_hk, p_mplace, p_key, p_task_tuple
                     except Exception:
                         return "FAIL", p_hk, p_mplace, p_key, p_task_tuple
@@ -1435,7 +1439,12 @@ async def run_all(targets=None, force=False):
                     if status == "OK":
                         logger.info("[TOPLU-RETRY] %s BASARILI: %s/%s — %s", round_label, hk, mplace, key)
                         succeeded.append((hk, mplace, task_tuple))
-                    else:
+                    elif status == "EMPTY":
+                        # Amazon basarili dondu ama 0 kayit — DORMANT adayi.
+                        # still_failed_inner'a koy ki ust seviyede dormant_list'e dussun.
+                        logger.info("[TOPLU-RETRY] %s EMPTY (dormant adayi): %s/%s — %s", round_label, hk, mplace, key)
+                        still_failed_inner.append((hk, mplace, task_tuple))
+                    else:  # FAIL
                         logger.warning("[TOPLU-RETRY] %s BASARISIZ: %s/%s — %s", round_label, hk, mplace, key)
                         still_failed_inner.append((hk, mplace, task_tuple))
 
