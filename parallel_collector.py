@@ -1259,6 +1259,20 @@ async def run_all(targets=None, force=False):
     _dashboard_status("maestro", "running")
     _save_log("info", f"Parallel collector basladi: {len(account_tasks)} hesap", "maestro")
 
+    # 7 gunden eski DORMANT marker dosyalarini temizle
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=7)
+        for marker in (BASE_DIR / "data").glob("*/dormant_*.json"):
+            try:
+                date_str = marker.stem.replace("dormant_", "")
+                if datetime.strptime(date_str, "%Y-%m-%d") < cutoff:
+                    marker.unlink()
+                    logger.info("Eski DORMANT marker silindi: %s", marker.name)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning("DORMANT marker temizleme hatasi: %s", e)
+
     start_time = time.time()
 
     # Her hesap icin paralel task olustur
@@ -1428,10 +1442,13 @@ async def run_all(targets=None, force=False):
             return succeeded, still_failed_inner
 
         # Bos raporlari 1 kez retry et (120s bekleme)
+        # NOT: dormant_list = retry sonrasi hala bos kalan raporlar.
+        #      Bunlar gercek hata DEGIL — kampanya 14 gun 0 impression aldi.
+        dormant_list = []
         if all_empty:
             logger.info("[TOPLU-RETRY] %d bos rapor 1 kez tekrar deneniyor (120s bekleme)...", len(all_empty))
             await asyncio.sleep(120)
-            ok_list, _ = await _retry_reports_parallel(all_empty, "BOS")
+            ok_list, dormant_list = await _retry_reports_parallel(all_empty, "BOS")
             toplam_basarili += len(ok_list)
 
         # Basarisiz raporlari max 3 kez retry et (artan bekleme)
@@ -1455,6 +1472,60 @@ async def run_all(targets=None, force=False):
                 logger.error("[TOPLU-RETRY] TUKENDI: %d rapor hala basarisiz", len(still_failed))
                 for hk, mplace, (name, _, _, _, _, days, _) in still_failed:
                     logger.error("  — %s/%s: %s_%dd", hk, mplace, name, days)
+
+        # ====================================================================
+        # DORMANT MARKER YAZIMI
+        # ====================================================================
+        # Toplu retry SONRASI hala bos kalan raporlar = DORMANT.
+        # Status report bunu "EKSIK" yerine "DORMANT" kovasina koyacak.
+        # Agent 2 marker'i okuyup entity'lerden suni hedefleme uretecek
+        # (GORUNMEZ segmenti +%10 bid artis onerisi cikarir).
+        if dormant_list:
+            dormant_by_mp = {}
+            for hk_, mplace_, task_ in dormant_list:
+                name_, _, _, _, _, days_, _ = task_
+                rkey = f"{name_}_{days_}d"
+                ad_type_ = name_.split("_")[0].upper() if "_" in name_ else ""
+                entry = dormant_by_mp.setdefault((hk_, mplace_), {
+                    "raporlar": [],
+                    "ad_types": set(),
+                })
+                entry["raporlar"].append(rkey)
+                if ad_type_ in ("SP", "SB", "SD"):
+                    entry["ad_types"].add(ad_type_)
+
+            today_str = datetime.utcnow().strftime("%Y-%m-%d")
+            for (hk_, mplace_), entry in dormant_by_mp.items():
+                marker_path = BASE_DIR / "data" / f"{hk_}_{mplace_}" / f"dormant_{today_str}.json"
+                marker_path.parent.mkdir(parents=True, exist_ok=True)
+                marker_data = {
+                    "tarih": today_str,
+                    "hesap_key": hk_,
+                    "marketplace": mplace_,
+                    "raporlar": sorted(set(entry["raporlar"])),
+                    "ad_types": sorted(entry["ad_types"]),
+                    "olusturma": datetime.utcnow().isoformat() + "Z",
+                    "aciklama": (
+                        "Toplu retry sonrasi hala bos kalan raporlar. "
+                        "14 gun 0 impression alan kampanyalar (DORMANT). "
+                        "Agent 2 entity'lerden suni hedefleme uretip GORUNMEZ "
+                        "segmentinde +%10 bid artis onerisi uretecek."
+                    ),
+                }
+                try:
+                    with open(marker_path, "w", encoding="utf-8") as f:
+                        json.dump(marker_data, f, indent=2, ensure_ascii=False)
+                    logger.info("[DORMANT] %s/%s: %d rapor isaretlendi (%s) → %s",
+                                hk_, mplace_, len(entry["raporlar"]),
+                                ", ".join(sorted(entry["ad_types"])), marker_path.name)
+                    _save_log("info",
+                              f"DORMANT marker yazildi: {len(entry['raporlar'])} rapor, "
+                              f"ad_types={sorted(entry['ad_types'])}",
+                              "agent1", hk_, mplace_,
+                              session_id=os.environ.get("MAESTRO_SESSION_ID"))
+                except Exception as e:
+                    logger.warning("[DORMANT] Marker yazilamadi (%s/%s): %s",
+                                   hk_, mplace_, e)
 
         # Retry client'larini kapat
         for cl in _retry_clients.values():
