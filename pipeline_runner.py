@@ -162,6 +162,29 @@ def _build_status_report(collect_ok, analyze_ok, session_id, targets):
                 )
                 if not rows:
                     is_dormant = (report_key in dormant_report_keys or ad_type in dormant_ad_types)
+
+                    # FALLBACK: Marker'da yoksa bile cache dosyasi BOS (<=5 byte = "[]")
+                    # ise DORMANT olarak isaretle ve marker'i geriye-dolu (backfill).
+                    # Sebep: pipeline_runner'in --retry-reports mode'u bos rapor
+                    # geldiginde dosyaya 2 byte yazar ama marker yazmaz.
+                    if not is_dormant:
+                        cache_file = data_dir / f"{PIPELINE_DATE}_{report_key}.json"
+                        if cache_file.exists():
+                            try:
+                                size = cache_file.stat().st_size
+                                if size <= 5:  # '[]' veya '[ ]' vs.
+                                    is_dormant = True
+                                    _ensure_dormant_marker(data_dir, PIPELINE_DATE,
+                                                            hk, mp, ad_type, report_key)
+                                    # In-memory set'leri de guncelle ki sonraki
+                                    # rapor kontrolleri tutarli olsun
+                                    dormant_report_keys.add(report_key)
+                                    dormant_ad_types.add(ad_type)
+                            except Exception as e:
+                                logger.warning(
+                                    "Cache dosyasi okunamadi (%s/%s/%s): %s",
+                                    hk, mp, report_key, e)
+
                     bucket = "dormant_raporlar" if is_dormant else "eksik_raporlar"
                     report[bucket].append({
                         "hesap_key": hk,
@@ -218,6 +241,50 @@ def _load_dormant_marker(data_dir, date_str):
     except Exception as e:
         logger.warning("DORMANT marker okunamadi (%s): %s", marker_path, e)
         return None
+
+
+def _ensure_dormant_marker(data_dir, date_str, hk, mp, ad_type, report_key):
+    """
+    Mevcut DORMANT marker'a rapor ekler veya yeni marker olusturur.
+
+    Pipeline_runner'in --retry-reports mode'u bos rapor aldiginda
+    parallel_collector'in TOPLU RETRY bloku calismadigi icin marker
+    yazilmaz. Bu fonksiyon status report sirasinda bos cache dosyasi
+    tespit edilince geriye-doluyum (backfill) olarak marker'i yazar/gunceller.
+    """
+    marker_path = data_dir / f"dormant_{date_str}.json"
+    try:
+        if marker_path.exists():
+            with open(marker_path, "r", encoding="utf-8") as f:
+                marker = json.load(f)
+            raporlar = set(marker.get("raporlar", []))
+            raporlar.add(report_key)
+            ad_types = set(marker.get("ad_types", []))
+            ad_types.add(ad_type)
+            marker["raporlar"] = sorted(raporlar)
+            marker["ad_types"] = sorted(ad_types)
+        else:
+            marker = {
+                "tarih": date_str,
+                "hesap_key": hk,
+                "marketplace": mp,
+                "raporlar": [report_key],
+                "ad_types": [ad_type],
+                "olusturma": datetime.utcnow().isoformat() + "Z",
+                "aciklama": (
+                    "Status report sirasinda backfill yapildi: cache dosyasi "
+                    "bos (0 kayit). Pipeline_runner retry sonrasi marker "
+                    "eksik kalmisti. Agent 2 bu marker ile zombi hedefleme uretir."
+                ),
+            }
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(marker_path, "w", encoding="utf-8") as f:
+            json.dump(marker, f, indent=2, ensure_ascii=False)
+        logger.info("[DORMANT-BACKFILL] %s/%s: marker eklendi/guncellendi → %s",
+                    hk, mp, report_key)
+    except Exception as e:
+        logger.warning("[DORMANT-BACKFILL] Marker yazimi basarisiz (%s/%s): %s",
+                       hk, mp, e)
 
 
 def _save_status_report(report):
