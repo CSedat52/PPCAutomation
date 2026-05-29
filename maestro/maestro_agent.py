@@ -223,7 +223,7 @@ def _run_agent3(state, session_id, hesap_key, marketplace):
                "MARKETPLACE": marketplace}
         result = subprocess.run(
             [sys.executable, config.AGENT3_SCRIPT, hesap_key, marketplace, "--execute"],
-            capture_output=True, text=True, timeout=600,
+            capture_output=True, text=True, timeout=1200,
             cwd=config.BASE_DIR, env=env,
         )
         if result.returncode != 0:
