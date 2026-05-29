@@ -3150,70 +3150,200 @@ async def apply_execution_plan(hesap_key, marketplace, plan_path):
         except Exception as e:
             return False, {}, f"Exception: {str(e)[:300]}"
 
-    # --- BID DEGISIKLIKLERI ---
-    logger.info("--- Faz 1: Bid Degisiklikleri (%d islem) ---", len(plan.get("bid_islemleri", [])))
-    for op in plan.get("bid_islemleri", []):
-        if op.get("status") != "HAZIR":
-            results["ozet"]["atlanan"] += 1
-            continue
+    # Tek API cagrisinda gonderilecek max item sayisi.
+    # Amazon SP/SB/SD v3 endpoint'leri request basina yuzlerce item kabul eder;
+    # 100 guvenli ve yanit boyutunu makul tutar.
+    BATCH_CHUNK = 100
 
-        ep_name = op.get("api_endpoint", "")
+    def _parse_batch_response(resp, wrapper, chunk_len):
+        """Batch API yanitini index -> (basarili_mi, hata_mesaji) sozlugune cevirir.
+
+        Amazon SP v3 formati: {wrapper: {"success": [{"index": i, ...}], "error": [{"index": i, "errors": [...]}]}}
+        SB/SD (wrapper=None) formati: genelde [{...}, {...}] sirali liste veya {"<wrapper>": [...]}.
+
+        Donus: (sonuc_map, belirsiz_mi)
+          sonuc_map: {index: (True/False, error_str_or_None)}
+          belirsiz_mi: True ise yaniti guvenle eslestiremedik -> cagiran tek-tek fallback yapmali.
+        """
+        sonuc = {}
+
+        # --- SP v3: wrapper'li, success/error index'li ---
+        if wrapper and isinstance(resp, dict):
+            inner = resp.get(wrapper, resp)
+            if isinstance(inner, dict) and ("success" in inner or "error" in inner):
+                for s in inner.get("success", []) or []:
+                    if isinstance(s, dict) and "index" in s:
+                        sonuc[int(s["index"])] = (True, None)
+                for e in inner.get("error", []) or []:
+                    if isinstance(e, dict) and "index" in e:
+                        emsg = json.dumps(e.get("errors", e), ensure_ascii=False)[:300]
+                        sonuc[int(e["index"])] = (False, f"API error: {emsg}")
+                # Tum index'ler kapsandi mi?
+                if len(sonuc) == chunk_len:
+                    return sonuc, False
+                # Bazi index'ler eksik -> kismi belirsizlik; eksikleri belirsiz birak
+                return sonuc, (len(sonuc) != chunk_len)
+
+        # --- Duz liste (SB/SD bazi durumlar) ---
+        if isinstance(resp, list) and len(resp) == chunk_len:
+            for i, item in enumerate(resp):
+                if isinstance(item, dict):
+                    code = str(item.get("code", item.get("status", ""))).upper()
+                    if "error" in item or (code and code not in ("SUCCESS", "200", "")):
+                        sonuc[i] = (False, f"API error: {json.dumps(item, ensure_ascii=False)[:300]}")
+                    else:
+                        sonuc[i] = (True, None)
+                else:
+                    sonuc[i] = (True, None)
+            return sonuc, False
+
+        # Eslestiremedik -> belirsiz, cagiran tek-tek denesin
+        return {}, True
+
+    async def execute_batch(ep_name, ops):
+        """Ayni endpoint'e ait islem listesini chunk'lar halinde toplu gonderir.
+
+        ops: [{"op": <plan op dict>, "payload": <api_payload>}, ...]
+        Donus: ops ile ayni sirada [(success_bool, error_str_or_None), ...]
+        Batch yaniti belirsizse o chunk tek-tek (execute_single) ile yeniden denenir.
+        """
+        ep = WRITE_ENDPOINTS.get(ep_name)
+        if not ep:
+            return [(False, f"Bilinmeyen endpoint: {ep_name}")] * len(ops)
+        wrapper = ep["wrapper_key"]
+
+        sonuclar = [None] * len(ops)
+
+        for start in range(0, len(ops), BATCH_CHUNK):
+            chunk = ops[start:start + BATCH_CHUNK]
+            payloads = [c["payload"] for c in chunk]
+            body = {wrapper: payloads} if wrapper else payloads
+
+            try:
+                resp = await client._request_with_retry(
+                    ep["method"], ep["path"], body,
+                    content_type=ep["content_type"], accept=ep["accept"]
+                )
+            except Exception as e:
+                # Tum chunk basarisiz — ama veri kaybetmemek icin tek-tek fallback dene
+                logger.warning("  Batch cagri hatasi (%s), chunk tek-tek deneniyor: %s",
+                               ep_name, str(e)[:200])
+                for i, c in enumerate(chunk):
+                    ok, _r, err = await execute_single(ep_name, c["payload"])
+                    sonuclar[start + i] = (ok, err)
+                    await asyncio.sleep(EXECUTE_DELAY)
+                continue
+
+            sonuc_map, belirsiz = _parse_batch_response(resp, wrapper, len(chunk))
+
+            if belirsiz:
+                logger.warning("  Batch yaniti eslestirilemedi (%s) — chunk tek-tek dogrulaniyor", ep_name)
+                for i, c in enumerate(chunk):
+                    # Index sonuc_map'te varsa onu kullan, yoksa tek-tek dene
+                    if i in sonuc_map:
+                        sonuclar[start + i] = sonuc_map[i]
+                    else:
+                        ok, _r, err = await execute_single(ep_name, c["payload"])
+                        sonuclar[start + i] = (ok, err)
+                        await asyncio.sleep(EXECUTE_DELAY)
+            else:
+                for i in range(len(chunk)):
+                    sonuclar[start + i] = sonuc_map.get(i, (False, "Yanitta index bulunamadi"))
+
+            # Chunk'lar arasi kisa bekleme (rate limit koruma)
+            if start + BATCH_CHUNK < len(ops):
+                await asyncio.sleep(EXECUTE_DELAY)
+
+        return sonuclar
+
+    def _bid_rollback_entry(op):
+        """Basarili bid islemi icin rollback_log kaydi olusturur."""
         payload = op.get("api_payload", {})
-        success, resp, error = await execute_single(ep_name, payload)
-
-        if success:
-            results["ozet"]["basarili"] += 1
-            _entity_id, _entity_type, _ad_type = "", "", ""
-            if "keywordId" in payload: _entity_id, _entity_type = str(payload["keywordId"]), "KEYWORD"
-            elif "targetId" in payload: _entity_id, _entity_type = str(payload["targetId"]), "TARGET"
-            elif "themeId" in payload: _entity_id, _entity_type = str(payload["themeId"]), "THEME"
-            if ep_name.startswith("sp_"): _ad_type = "SP"
-            elif ep_name.startswith("sb_"): _ad_type = "SB"
-            elif ep_name.startswith("sd_"): _ad_type = "SD"
-
-            results["rollback_log"].append({
-                "tip": "BID_DEGISIKLIGI",
-                "kampanya": op.get("kampanya", ""), "hedefleme": op.get("hedefleme", ""),
-                "eski_bid": op.get("eski_bid"), "yeni_bid": op.get("yeni_bid"),
-                "entity_id": _entity_id, "entity_type": _entity_type,
-                "ad_type": _ad_type, "campaign_id": str(payload.get("campaignId", "")),
-                "api_endpoint": ep_name, "api_payload": payload,
-                "rollback": f"Bid'i {op.get('eski_bid')} olarak geri al",
-            })
-            logger.info("  BASARILI: %s -- %s (%.2f)", op.get("kampanya",""), op.get("hedefleme",""), payload.get("bid",0))
-        else:
-            results["ozet"]["basarisiz"] += 1
-            results["hatalar"].append({"faz": "BID", "hata": error})
-            logger.error("  BASARISIZ: %s -- %s", op.get("hedefleme",""), error)
-
-        await asyncio.sleep(EXECUTE_DELAY)
-
-    # --- NEGATIF EKLEMELER ---
-    logger.info("--- Faz 2: Negatif Eklemeler (%d islem) ---", len(plan.get("negatif_islemleri", [])))
-    for op in plan.get("negatif_islemleri", []):
-        if op.get("status") != "HAZIR":
-            results["ozet"]["atlanan"] += 1
-            continue
-
         ep_name = op.get("api_endpoint", "")
-        payload = op.get("api_payload", {})
-        success, resp, error = await execute_single(ep_name, payload)
+        _entity_id, _entity_type, _ad_type = "", "", ""
+        if "keywordId" in payload: _entity_id, _entity_type = str(payload["keywordId"]), "KEYWORD"
+        elif "targetId" in payload: _entity_id, _entity_type = str(payload["targetId"]), "TARGET"
+        elif "themeId" in payload: _entity_id, _entity_type = str(payload["themeId"]), "THEME"
+        if ep_name.startswith("sp_"): _ad_type = "SP"
+        elif ep_name.startswith("sb_"): _ad_type = "SB"
+        elif ep_name.startswith("sd_"): _ad_type = "SD"
+        return {
+            "tip": "BID_DEGISIKLIGI",
+            "kampanya": op.get("kampanya", ""), "hedefleme": op.get("hedefleme", ""),
+            "eski_bid": op.get("eski_bid"), "yeni_bid": op.get("yeni_bid"),
+            "entity_id": _entity_id, "entity_type": _entity_type,
+            "ad_type": _ad_type, "campaign_id": str(payload.get("campaignId", "")),
+            "api_endpoint": ep_name, "api_payload": payload,
+            "rollback": f"Bid'i {op.get('eski_bid')} olarak geri al",
+        }
 
-        if success:
-            results["ozet"]["basarili"] += 1
-            results["rollback_log"].append({
-                "tip": op.get("tip", "NEGATIF"),
-                "kampanya": op.get("kampanya", ""), "hedefleme": op.get("hedefleme", ""),
-                "campaign_id": str(payload.get("campaignId", "")),
-                "api_endpoint": ep_name, "api_payload": payload,
-            })
-            logger.info("  BASARILI: %s -- %s", op.get("kampanya",""), op.get("hedefleme",""))
-        else:
-            results["ozet"]["basarisiz"] += 1
-            results["hatalar"].append({"faz": "NEGATIF", "hata": error})
-            logger.error("  BASARISIZ: %s -- %s", op.get("hedefleme",""), error)
+    # --- FAZ 1: BID DEGISIKLIKLERI (BATCH) ---
+    bid_hazir = [op for op in plan.get("bid_islemleri", []) if op.get("status") == "HAZIR"]
+    bid_atlanan = len(plan.get("bid_islemleri", [])) - len(bid_hazir)
+    results["ozet"]["atlanan"] += bid_atlanan
+    logger.info("--- Faz 1: Bid Degisiklikleri (%d islem, %d atlandi) ---", len(bid_hazir), bid_atlanan)
 
-        await asyncio.sleep(EXECUTE_DELAY)
+    # Endpoint bazinda grupla (sirayi koru)
+    bid_gruplar = {}
+    for op in bid_hazir:
+        ep_name = op.get("api_endpoint", "")
+        bid_gruplar.setdefault(ep_name, []).append(op)
+
+    for ep_name, ops in bid_gruplar.items():
+        if not ep_name:
+            for op in ops:
+                results["ozet"]["basarisiz"] += 1
+                results["hatalar"].append({"faz": "BID", "hata": "api_endpoint bos"})
+            continue
+        batch_ops = [{"op": op, "payload": op.get("api_payload", {})} for op in ops]
+        logger.info("  [BATCH] %s -- %d islem", ep_name, len(batch_ops))
+        sonuclar = await execute_batch(ep_name, batch_ops)
+        for op, (success, error) in zip(ops, sonuclar):
+            if success:
+                results["ozet"]["basarili"] += 1
+                results["rollback_log"].append(_bid_rollback_entry(op))
+                logger.info("  BASARILI: %s -- %s (%.2f)",
+                            op.get("kampanya", ""), op.get("hedefleme", ""),
+                            op.get("api_payload", {}).get("bid", 0))
+            else:
+                results["ozet"]["basarisiz"] += 1
+                results["hatalar"].append({"faz": "BID", "hedefleme": op.get("hedefleme", ""), "hata": error})
+                logger.error("  BASARISIZ: %s -- %s", op.get("hedefleme", ""), error)
+
+    # --- FAZ 2: NEGATIF EKLEMELER (BATCH) ---
+    neg_hazir = [op for op in plan.get("negatif_islemleri", []) if op.get("status") == "HAZIR"]
+    neg_atlanan = len(plan.get("negatif_islemleri", [])) - len(neg_hazir)
+    results["ozet"]["atlanan"] += neg_atlanan
+    logger.info("--- Faz 2: Negatif Eklemeler (%d islem, %d atlandi) ---", len(neg_hazir), neg_atlanan)
+
+    neg_gruplar = {}
+    for op in neg_hazir:
+        ep_name = op.get("api_endpoint", "")
+        neg_gruplar.setdefault(ep_name, []).append(op)
+
+    for ep_name, ops in neg_gruplar.items():
+        if not ep_name:
+            for op in ops:
+                results["ozet"]["basarisiz"] += 1
+                results["hatalar"].append({"faz": "NEGATIF", "hata": "api_endpoint bos"})
+            continue
+        batch_ops = [{"op": op, "payload": op.get("api_payload", {})} for op in ops]
+        logger.info("  [BATCH] %s -- %d islem", ep_name, len(batch_ops))
+        sonuclar = await execute_batch(ep_name, batch_ops)
+        for op, (success, error) in zip(ops, sonuclar):
+            if success:
+                results["ozet"]["basarili"] += 1
+                results["rollback_log"].append({
+                    "tip": op.get("tip", "NEGATIF"),
+                    "kampanya": op.get("kampanya", ""), "hedefleme": op.get("hedefleme", ""),
+                    "campaign_id": str(op.get("api_payload", {}).get("campaignId", "")),
+                    "api_endpoint": ep_name, "api_payload": op.get("api_payload", {}),
+                })
+                logger.info("  BASARILI: %s -- %s", op.get("kampanya", ""), op.get("hedefleme", ""))
+            else:
+                results["ozet"]["basarisiz"] += 1
+                results["hatalar"].append({"faz": "NEGATIF", "hedefleme": op.get("hedefleme", ""), "hata": error})
+                logger.error("  BASARISIZ: %s -- %s", op.get("hedefleme", ""), error)
 
     # --- FAZ 3: HARVESTING (sub_operations with chain dependency) ---
     logger.info("--- Faz 3: Harvesting (%d islem) ---", len(plan.get("harvesting_islemleri", [])))
