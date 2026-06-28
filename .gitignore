@@ -63,3 +63,8 @@ profile_results.json
 accounts_result.json
 IpverseBot/
 data/
+
+# Backups (manuel yedekler)
+*-yedek.py
+*_yedek.py
+*.bak
