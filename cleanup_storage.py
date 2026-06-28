@@ -111,7 +111,7 @@ def main():
     ap = argparse.ArgumentParser(description="Supabase depolama temizligi")
     ap.add_argument("--apply", action="store_true",
                     help="Gercekten sil + VACUUM (varsayilan: dry-run)")
-    ap.add_argument("--report-days", type=int, default=30)
+    ap.add_argument("--report-days", type=int, default=14)
     ap.add_argument("--log-days", type=int, default=90)
     ap.add_argument("--verify-days", type=int, default=7)
     ap.add_argument("--no-vacuum", action="store_true",
@@ -131,12 +131,24 @@ def main():
           f"verify={args.verify_days}g")
     print("=" * 64)
 
-    opts = "-c statement_timeout=1800000"  # 30 dk
-    if not args.apply:
-        opts += " -c default_transaction_read_only=on"
-    conn = psycopg2.connect(DB_URL, connect_timeout=20, options=opts)
+    conn = psycopg2.connect(DB_URL, connect_timeout=20)
     conn.autocommit = True
     cur = conn.cursor()
+    # NOT: Supabase pooler baglanti-seviyesi 'options'i yok sayiyor.
+    # Session mode'da runtime SET kalici olur ve backend'e iletilir.
+    try:
+        cur.execute("SET statement_timeout = 0")               # sinirsiz (VACUUM FULL icin)
+        cur.execute("SET idle_in_transaction_session_timeout = 0")
+    except Exception:
+        try:
+            cur.execute("SET statement_timeout = '3600000'")   # 60 dk (fallback)
+        except Exception as e:
+            print(f"  (uyari: statement_timeout ayarlanamadi: {repr(e)[:100]})")
+    if not args.apply:
+        try:
+            cur.execute("SET default_transaction_read_only = on")
+        except Exception:
+            pass
 
     print(f"\nTOPLAM DB BOYUTU (oncesi): {db_size(cur)}   [free limit: 500 MB]")
     print("\nEn buyuk tablolar:")
@@ -176,19 +188,35 @@ def main():
         return
 
     # ---- APPLY ----
-    print(f"\n--- SILINIYOR ({total_del} satir) ---")
+    # Buyuk DELETE'leri batch'le: her statement kisa kalir (timeout yok),
+    # autocommit ile her batch hemen commit olur (uzun kilit yok).
+    BATCH = 25000
+    print(f"\n--- SILINIYOR (~{total_del} satir, {BATCH}'lik batch'ler) ---")
     for table, dcol, days, old in affected:
-        cur.execute(sql.SQL(
-            "DELETE FROM {} WHERE {} < CURRENT_DATE - %s::int"
-        ).format(sql.Identifier(table), sql.Identifier(dcol)), (days,))
-        print(f"  {table}: {cur.rowcount} satir silindi")
+        done = 0
+        while True:
+            cur.execute(sql.SQL(
+                "DELETE FROM {t} WHERE ctid IN ("
+                "SELECT ctid FROM {t} WHERE {d} < CURRENT_DATE - %s::int LIMIT %s)"
+            ).format(t=sql.Identifier(table), d=sql.Identifier(dcol)),
+                (days, BATCH))
+            n = cur.rowcount
+            done += n
+            if n:
+                print(f"  {table}: {done}/{old} ...", flush=True)
+            if n < BATCH:
+                break
+        print(f"  {table}: TOPLAM {done} satir silindi")
 
     if not args.no_vacuum:
         print("\n--- VACUUM FULL ANALYZE (disk geri kazanimi) ---")
         for table, _, _, _ in affected:
             print(f"  VACUUM FULL {table} ...", flush=True)
-            cur.execute(sql.SQL("VACUUM (FULL, ANALYZE) {}").format(
-                sql.Identifier(table)))
+            try:
+                cur.execute(sql.SQL("VACUUM (FULL, ANALYZE) {}").format(
+                    sql.Identifier(table)))
+            except Exception as e:
+                print(f"    UYARI: {table} VACUUM hatasi: {repr(e)[:150]}")
 
     print(f"\nTOPLAM DB BOYUTU (sonrasi): {db_size(cur)}")
     cur.close(); conn.close()
