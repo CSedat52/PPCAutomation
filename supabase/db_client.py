@@ -27,10 +27,15 @@ DB_URL = os.getenv("SUPABASE_DB_URL")
 
 
 def _get_conn():
-    """Yeni DB baglantisi olustur."""
+    """Transaction pooler (6543) — cok sayida kisa baglanti icin; session havuzunun
+    (5432) tukenmesini (ECHECKOUTTIMEOUT) onler. 6543 kapaliysa otomatik 5432'ye duser."""
     if not DB_URL:
         raise RuntimeError("SUPABASE_DB_URL .env'de tanimli degil")
-    conn = psycopg2.connect(DB_URL)
+    tx_url = DB_URL.replace("pooler.supabase.com:5432", "pooler.supabase.com:6543")
+    try:
+        conn = psycopg2.connect(tx_url, connect_timeout=15)
+    except psycopg2.OperationalError:
+        conn = psycopg2.connect(DB_URL, connect_timeout=15)  # 6543 kapali -> 5432
     conn.autocommit = True
     return conn
 
@@ -39,7 +44,7 @@ class SupabaseClient:
     """Amazon PPC Supabase client. Her islem kendi baglantisini acar/kapatir."""
 
     def __init__(self):
-        self._test_connection()
+        pass  # her instance'ta gereksiz connect/disconnect YAPMA (havuz baskisi)
 
     def _test_connection(self):
         try:
